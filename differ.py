@@ -21,14 +21,23 @@ SPECIAL_CONST_MAP = {
         "cloud_liquid_water_mixing_ratio_wrt_moist_air_and_condensed_water",
     "CLDICE":
         "cloud_ice_mixing_ratio_wrt_moist_air_and_condensed_water",
-    "NUMLIQ": "mass_number_concentration_of_cloud_liquid_wrt_moist_air"
-              "_and_condensed_water",
+    "RAINQM": "rain_mixing_ratio_wrt_moist_air_and_condensed_water",
+    "SNOWQM": "snow_mixing_ratio_wrt_moist_air_and_condensed_water",
+    "GRAUQM": "graupel_water_mixing_ratio_wrt_moist_air_and_condensed_water",
+    "NUMLIQ": "mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water",
+    "NUMRAI": "mass_number_concentration_of_rain_wrt_moist_air_and_condensed_water",
     "NUMICE":
         "mass_number_concentration_of_ice_wrt_moist_air_and_condensed_water",
+    "NUMSNO": "mass_number_concentration_of_snow_wrt_moist_air_and_condensed_water",
+    "NUMGRA": "mass_number_concentration_of_graupel_wrt_moist_air_and_condensed_water"
 }
 
 TYPECODE = {"f8": "d", "f4": "f", "i8": "q", "i4": "i", "i2": "h", "i1": "b"}
 ELSIZE = {"f8": 8, "f4": 4, "i8": 8, "i4": 4, "i2": 2, "i1": 1}
+
+# Not compared: uninitialized at entry on the CAM side (callers pass
+# stack garbage), and any nonzero errflg aborts the run instantly anyway.
+SKIP_ARGS = {"errmsg", "errflg"}
 
 
 def load_role(outdir, role):
@@ -156,26 +165,45 @@ class Reporter(object):
         print("  [note] " + text)
 
 
+def kdesc(info):
+    why = info.get("why")
+    k = info.get("kind")
+    return "{} ({})".format(k, why) if why else str(k)
+
+
 def compare_hit(srec, crec, sman, cman, const_ctx, rep):
     """Compare one aligned hit pair; entry args first, then exit."""
-    scheme = srec["scheme"]
-    hit = srec["hit"]
+    bucket = srec.get("_bucket", "<toplevel>")
+    label = srec["scheme"]
+    if bucket != "<toplevel>":
+        label += " via " + bucket
+    label += " [step {}]".format(srec.get("step", "?"))
+    hit = srec.get("_occ", srec["hit"])
     cam_names, sima_names, pairs = const_ctx
     for phase, fkey, vkey in (("entry", "entry_file", "entry_value"),
                               ("exit", "exit_file", "exit_value")):
         for arg, sinfo in srec["args"].items():
+            if arg in SKIP_ARGS:
+                continue
             cinfo = crec["args"].get(arg)
             if cinfo is None:
                 if phase == "entry":
                     rep.note("{} (hit {}): arg {} absent on CAM side".format(
-                        scheme, hit, arg))
+                        label, hit, arg))
                 continue
             kind = sinfo.get("kind")
             if kind != cinfo.get("kind"):
                 if phase == "entry":
-                    rep.diff(scheme, hit, phase, arg,
+                    rep.diff(label, hit, phase, arg,
                              "argument kind mismatch: sima {} vs cam "
-                             "{}".format(kind, cinfo.get("kind")))
+                             "{}".format(kdesc(sinfo), kdesc(cinfo)))
+                continue
+            if kind == "error":
+                if phase == "entry":
+                    rep.note("{} (hit {}): arg {} capture errored on both "
+                             "sides: sima {} / cam {}".format(
+                                 label, hit, arg, kdesc(sinfo),
+                                 kdesc(cinfo)))
                 continue
 
             if kind == "array":
@@ -186,7 +214,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep):
                 dt = sinfo["dtype"]
                 if dt != cinfo.get("dtype"):
                     if phase == "entry":
-                        rep.diff(scheme, hit, phase, arg,
+                        rep.diff(label, hit, phase, arg,
                                  "dtype mismatch: sima {} vs cam {}".format(
                                      dt, cinfo.get("dtype")))
                     continue
@@ -211,20 +239,20 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep):
                         if txt:
                             lines.append("{} <-> {}: {}".format(cn, sn, txt))
                     if lines:
-                        rep.diff(scheme, hit, phase, arg,
+                        rep.diff(label, hit, phase, arg,
                                  "constituent-indexed array, {} mapped "
                                  "species differ".format(len(lines)), lines)
                     continue
 
                 if sext != cext:
                     if phase == "entry":
-                        rep.diff(scheme, hit, phase, arg,
+                        rep.diff(label, hit, phase, arg,
                                  "shape mismatch: sima {} vs cam {}".format(
                                      sext, cext))
                     continue
                 txt = array_diff_text(sdata, cdata, dt, sext, sinfo["los"])
                 if txt:
-                    rep.diff(scheme, hit, phase, arg, txt)
+                    rep.diff(label, hit, phase, arg, txt)
 
             elif kind in ("scalar", "char"):
                 sv = sinfo.get(vkey)
@@ -232,7 +260,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep):
                 if sv is None or cv is None:
                     continue
                 if sv != cv:
-                    rep.diff(scheme, hit, phase, arg,
+                    rep.diff(label, hit, phase, arg,
                              "sima={} cam={}".format(fmt_val(sv),
                                                      fmt_val(cv)))
         if phase == "entry" and not rep.first_pair_seen:
@@ -241,11 +269,39 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep):
                 rep.alignment_suspect = True
 
 
-def group_hits(man):
-    by = {}
+def shared_caller_map(cam, sima):
+    """Per scheme, caller names seen in BOTH models. A scheme called from
+    inside another scheme (shared atmospheric_physics code) has the same
+    caller symbol in both binaries; suite-level call sites (CCPP cap vs
+    CAM driver) never match and bucket to '<toplevel>'."""
+    maps = []
+    for man in (cam, sima):
+        d = {}
+        for rec in man["hits"]:
+            c = rec.get("caller", "?")
+            if c != "?":
+                d.setdefault(rec["scheme"], set()).add(c)
+        maps.append(d)
+    shared = {}
+    for s in set(maps[0]) | set(maps[1]):
+        shared[s] = maps[0].get(s, set()) & maps[1].get(s, set())
+    return shared
+
+
+def tag_hits(man, shared):
+    """Group hits by (scheme, step, bucket); annotate each rec with its
+    bucket and occurrence index within the group. Returns the groups."""
+    groups = {}
     for rec in man["hits"]:
-        by.setdefault(rec["scheme"], []).append(rec)
-    return by
+        s = rec["scheme"]
+        c = rec.get("caller", "?")
+        b = c if c in shared.get(s, set()) else "<toplevel>"
+        key = (s, rec.get("step", 0), b)
+        lst = groups.setdefault(key, [])
+        rec["_bucket"] = b
+        rec["_occ"] = len(lst)
+        lst.append(rec)
+    return groups
 
 
 def report(outdir, suite_order, steps):
@@ -261,6 +317,12 @@ def report(outdir, suite_order, steps):
         print("ERROR: no manifest for: {} (gdb run failed? see gdb.log)"
               .format(", ".join(missing)))
         return False
+
+    for man, role in ((cam, "cam"), (sima, "sima")):
+        for note_ in man.get("notes", []):
+            if "FAILED" in note_ or "WARNING" in note_:
+                print("  {} gdb note: {}".format(
+                    role, note_.splitlines()[0]))
 
     uniq = []
     for s in suite_order:
@@ -312,30 +374,51 @@ def report(outdir, suite_order, steps):
     const_ctx = (cam_names, sima_names, pairs)
 
     # --- alignment ------------------------------------------------------
-    cam_by = group_hits(cam)
-    sima_by = group_hits(sima)
-    skip = {}
+    # Hits are tagged with the timestep (cam_run1 sentinel) and bucketed
+    # by caller: sima step t pairs with cam step t+1, occurrence-by-
+    # occurrence within each (scheme, step, bucket).
+    if not any(r.get("step", 0) >= 1 for r in sima["hits"]):
+        print("")
+        print("ERROR: no timestep tags on SIMA hits -- the cam_run1 "
+              "sentinel did not resolve or never fired (see gdb.log).")
+        return False
+    if not any(r.get("step", 0) >= 1 for r in cam["hits"]):
+        print("")
+        print("ERROR: no timestep tags on CAM hits -- the cam_run1 "
+              "sentinel did not resolve or never fired (see gdb.log).")
+        return False
+
+    shared = shared_caller_map(cam, sima)
+    cam_g = tag_hits(cam, shared)
+    sima_g = tag_hits(sima, shared)
     print("")
-    print("alignment (CAM skips its first timestep):")
+    print("alignment (sima step t <=> cam step t+1; nested calls "
+          "bucketed by caller):")
     for s in compared:
-        n_c = len(cam_by.get(s, []))
-        n_s = len(sima_by.get(s, []))
-        if n_s == 0 or n_c == 0:
-            print("  {}: never called (cam {} hits, sima {})".format(
-                s, n_c, n_s))
+        per_bucket = {}
+        problems = []
+        for t in range(1, steps + 1):
+            buckets = set(b for (ss, tt, b) in sima_g
+                          if ss == s and tt == t)
+            buckets |= set(b for (ss, tt, b) in cam_g
+                           if ss == s and tt == t + 1)
+            for b in sorted(buckets):
+                n_s = len(sima_g.get((s, t, b), []))
+                n_c = len(cam_g.get((s, t + 1, b), []))
+                per_bucket[b] = per_bucket.get(b, 0) + min(n_s, n_c)
+                if n_s != n_c:
+                    problems.append(
+                        "    MISMATCH step {} [{}]: sima {} vs cam {} "
+                        "hits (extra hits not compared)".format(
+                            t, b, n_s, n_c))
+        if not per_bucket:
+            print("  {}: never called within compared steps".format(s))
             continue
-        if steps > 0 and n_s % steps == 0:
-            k = n_s // steps
-        else:
-            k = max(n_c - n_s, 0)
-            print("  WARNING {}: sima hit count {} not divisible by "
-                  "--steps {}; guessing skip={}".format(s, n_s, steps, k))
-        skip[s] = k
-        if n_c < n_s + k:
-            print("  WARNING {}: cam has {} hits, expected >= {}; "
-                  "tail hits not compared".format(s, n_c, n_s + k))
-        print("  {}: {} calls/step, comparing sima hits 0..{} vs cam "
-              "{}..{}".format(s, k, n_s - 1, k, k + n_s - 1))
+        desc = ", ".join("{} x{}".format(b, n)
+                         for b, n in sorted(per_bucket.items()))
+        print("  {}: {}".format(s, desc))
+        for p in problems:
+            print(p)
 
     # --- stream-order comparison ----------------------------------------
     print("")
@@ -343,14 +426,14 @@ def report(outdir, suite_order, steps):
     rep = Reporter()
     n_pairs = 0
     for srec in sima["hits"]:
-        s = srec["scheme"]
-        if s not in skip:
+        t = srec.get("step", 0)
+        if t < 1 or t > steps:
             continue
-        cam_list = cam_by.get(s, [])
-        ci = srec["hit"] + skip[s]
-        if ci >= len(cam_list):
-            continue
-        compare_hit(srec, cam_list[ci], sima, cam, const_ctx, rep)
+        key = (srec["scheme"], t + 1, srec["_bucket"])
+        cam_list = cam_g.get(key, [])
+        if srec["_occ"] >= len(cam_list):
+            continue  # count mismatch, already reported above
+        compare_hit(srec, cam_list[srec["_occ"]], sima, cam, const_ctx, rep)
         n_pairs += 1
 
     # --- summary ----------------------------------------------------------

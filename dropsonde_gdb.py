@@ -17,6 +17,7 @@
 import json
 import os
 import struct
+import traceback
 
 import gdb
 
@@ -24,12 +25,15 @@ CFG = json.load(open(os.environ["DROPSONDE_CONFIG"]))
 ROLE = CFG["role"]            # "cam" | "sima"
 OUT = CFG["out_dir"]
 SCHEMES = CFG["schemes"]      # unique scheme names, suite order
+KILL_AFTER = CFG.get("kill_after_steps", 0)  # 0 = run to natural exit
 
-# gdb is believed to report Fortran array ranges in source (subscript)
-# order. Both runs use the same gdb so comparisons are valid either way;
-# only the (col, lev) labels in the report would be transposed. Flip to
-# "reversed" during calibration if labels come out backwards.
-DIM_ORDER = "fortran"
+# gdb (Derecho gfortran, calibrated 2026-06-12) reports Fortran array
+# ranges outermost-first, i.e. REVERSED relative to subscript order, while
+# our stride probes are per subscript position. Each array's extents/stride
+# pairing is additionally cross-checked against gdb's type sizeof in
+# array_plan() and flipped automatically when the check is conclusive;
+# DIM_ORDER is only the fallback for ambiguous (square/strided) cases.
+DIM_ORDER = "reversed"
 
 MANIFEST = {
     "role": ROLE,
@@ -101,6 +105,7 @@ def array_plan(name, val):
     los = [d[0] for d in dims]
     extents = [d[1] - d[0] + 1 for d in dims]
     elsize = base.sizeof
+    sizeof = val.type.sizeof
     addr0 = elem_addr(name, los)
     strides = []
     for k in range(len(dims)):
@@ -112,6 +117,18 @@ def array_plan(name, val):
         strides.append(elem_addr(name, subs) - addr0)
     if any(s < 0 for s in strides):
         return None, "negative stride (reversed slice?): {}".format(strides)
+
+    # Cross-check the extents<->stride pairing against gdb's logical array
+    # size and flip when (and only when) the flipped pairing matches.
+    # Strided dummies legitimately fail both checks; they keep the
+    # DIM_ORDER pairing, which is still self-consistent across both runs.
+    def span(exts):
+        return sum(s * (e - 1) for s, e in zip(strides, exts)) + elsize
+
+    if len(dims) > 1 and span(extents) != sizeof:
+        flipped = extents[::-1]
+        if span(flipped) == sizeof and los == los[::-1]:
+            extents = flipped
     return {"addr": addr0, "elsize": elsize, "dtype": dt, "los": los,
             "extents": extents, "strides": strides}, None
 
@@ -181,7 +198,12 @@ def arg_symbols(frame):
 def handle_entry(scheme, frame):
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
-    rec = {"scheme": scheme, "hit": hit, "args": {}}
+    try:
+        caller = frame.older().name() or "?"
+    except Exception:
+        caller = "?"
+    rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
+           "caller": caller, "args": {}}
     frame.select()
     for sym in arg_symbols(frame):
         name = sym.name
@@ -283,37 +305,54 @@ def dump_constituents():
         if ROLE == "cam":
             # character(len=16) :: cnst_name(pcnst) in module constituents
             arr = None
-            for expr in ("__constituents_MOD_cnst_name", "cnst_name"):
+            for expr in ("constituents::cnst_name",
+                         "__constituents_MOD_cnst_name", "cnst_name"):
                 try:
                     arr = gdb.parse_and_eval(expr)
                     break
                 except gdb.error:
                     continue
             if arr is None:
-                raise gdb.error("cnst_name not found")
-            dims, _ = array_dims(arr.type)
-            n = dims[0][1] - dims[0][0] + 1
-            width = arr.type.sizeof // n
+                raise gdb.error("cnst_name not found by any spelling")
+            total = arr.type.sizeof
+            # element sizeof gives the character length regardless of how
+            # gdb orders the array-of-strings dimensions
+            width = gdb.parse_and_eval(expr + "(1)").type.sizeof
+            n = total // width
             raw = bytes(gdb.selected_inferior().read_memory(
-                int(arr.address), arr.type.sizeof))
+                int(arr.address), total))
             names = [raw[i * width:(i + 1) * width].decode("latin-1").strip()
                      for i in range(n)]
         else:
-            # cam_constituents module: const_props(:) + num_constituents
-            n = int(gdb.parse_and_eval(
-                "__cam_constituents_MOD_num_constituents"))
+            # cam_constituents module: const_props(:) + num_constituents.
+            # Linker-name spellings can hit "unknown type" (gdb 16.2), so
+            # try the Fortran module:: syntax first.
+            n = None
+            base = None
+            for prefix in ("cam_constituents::", "__cam_constituents_MOD_",
+                           ""):
+                try:
+                    n = int(gdb.parse_and_eval(prefix + "num_constituents"))
+                    base = prefix
+                    break
+                except gdb.error:
+                    continue
+            if n is None:
+                raise gdb.error(
+                    "num_constituents not found by any spelling")
             names = []
             for i in range(1, n + 1):
                 try:
                     names.append(_string_at(
-                        "__cam_constituents_MOD_const_props({})"
-                        "%prop%var_std_name".format(i)))
+                        "{}const_props({})%prop%var_std_name".format(
+                            base, i)))
                 except Exception as exc:
                     names.append("<unreadable: {}>".format(exc))
         MANIFEST["constituents"] = names
         note("captured {} constituent names".format(len(names)))
     except Exception as exc:
-        note("constituent name capture FAILED: {}".format(exc))
+        note("constituent name capture FAILED: {}\n{}".format(
+            exc, traceback.format_exc()))
 
 
 # --------------------------------------------------------------------------
@@ -326,8 +365,30 @@ class EntryBP(gdb.Breakpoint):
         self.scheme = scheme
 
 
+class StepBP(gdb.Breakpoint):
+    """Sentinel on cam_run1: fires once at the start of every timestep."""
+    pass
+
+
 LAST_STOP = [None]
 DONE = [False]
+CURRENT_STEP = [0]
+
+
+def _make_bp(cls, specs, *args):
+    """Create a breakpoint, trying each spec. The Python API ignores
+    'set breakpoint pending off' and silently creates PENDING breakpoints
+    for missing symbols (calibrated on gdb 16.2), so check and delete."""
+    for spec in specs:
+        try:
+            bp = cls(spec, *args)
+        except gdb.error:
+            continue
+        if getattr(bp, "pending", False):
+            bp.delete()
+            continue
+        return bp
+    return None
 
 
 def _on_stop(ev):
@@ -347,18 +408,19 @@ def setup():
 
     resolved = 0
     for s in SCHEMES:
-        bp = None
-        for spec in (s + "_run", "__{0}_MOD_{0}_run".format(s)):
-            try:
-                bp = EntryBP(spec, s)
-                MANIFEST["breakpoints"][s] = spec
-                resolved += 1
-                break
-            except gdb.error:
-                continue
+        bp = _make_bp(EntryBP, (s + "_run", "__{0}_MOD_{0}_run".format(s)),
+                      s)
         if bp is None:
             MANIFEST["breakpoints"][s] = "missing"
+        else:
+            MANIFEST["breakpoints"][s] = bp.location
+            resolved += 1
     note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
+
+    step_bp = _make_bp(StepBP, ("cam_run1", "__cam_comp_MOD_cam_run1"))
+    if step_bp is None:
+        note("WARNING: cam_run1 sentinel not found; hits will not be "
+             "timestep-tagged and the run will not auto-terminate")
     return resolved
 
 
@@ -375,11 +437,21 @@ def main():
             note("stopped without a stop event; aborting")
             break
         entry = None
+        step = None
         for b in getattr(ev, "breakpoints", None) or []:
             if isinstance(b, EntryBP):
                 entry = b
+            elif isinstance(b, StepBP):
+                step = b
+        if step is not None:
+            CURRENT_STEP[0] += 1
+            if KILL_AFTER and CURRENT_STEP[0] > KILL_AFTER:
+                note("collected {} timesteps; terminating run".format(
+                    KILL_AFTER))
+                gdb.execute("kill")
                 break
-        if entry is None:
+            note("timestep {} begins".format(CURRENT_STEP[0]))
+        elif entry is None:
             note("non-breakpoint stop ({}); backtrace follows".format(
                 getattr(ev, "stop_signal", "?")))
             try:
@@ -387,16 +459,26 @@ def main():
             except gdb.error:
                 pass
             break
-        frame = gdb.newest_frame()
-        try:
-            rec = handle_entry(entry.scheme, frame)
-            ExitBP(frame, rec)
-        except Exception as exc:
-            note("entry capture failed for {}: {}".format(
-                entry.scheme, exc))
-        if not const_done:
-            dump_constituents()
-            const_done = True
+        else:
+            # Step over the rest of the declaration line first: gfortran
+            # materializes explicit-shape dummy bounds (e.g. b(ncol,pver))
+            # in code attributed to it, past gdb's post-prologue stop.
+            # 'next' completes that setup and stops BEFORE the first
+            # executable statement, so this is still scheme entry.
+            try:
+                gdb.execute("next")
+            except gdb.error:
+                pass
+            frame = gdb.newest_frame()
+            try:
+                rec = handle_entry(entry.scheme, frame)
+                ExitBP(frame, rec)
+            except Exception as exc:
+                note("entry capture failed for {}: {}".format(
+                    entry.scheme, exc))
+            if not const_done:
+                dump_constituents()
+                const_done = True
         try:
             gdb.execute("continue")
         except gdb.error:

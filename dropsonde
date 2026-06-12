@@ -43,7 +43,7 @@ def parse_sdf(path):
     return schemes
 
 
-def launch(role, casedir, schemes, outdir):
+def launch(role, casedir, schemes, outdir, kill_after_steps):
     exe = os.path.join(casedir, "bld", "cesm.exe")
     rundir = os.path.join(casedir, "run")
     if not os.path.isfile(exe):
@@ -55,8 +55,8 @@ def launch(role, casedir, schemes, outdir):
     os.makedirs(roledir, exist_ok=True)
     cfgpath = os.path.join(roledir, "config.json")
     with open(cfgpath, "w") as f:
-        json.dump({"role": role, "out_dir": roledir, "schemes": schemes}, f,
-                  indent=1)
+        json.dump({"role": role, "out_dir": roledir, "schemes": schemes,
+                   "kill_after_steps": kill_after_steps}, f, indent=1)
 
     env = dict(os.environ, DROPSONDE_CONFIG=cfgpath)
     logpath = os.path.join(roledir, "gdb.log")
@@ -97,14 +97,27 @@ def main():
         json.dump({"schemes": schemes, "steps": args.steps,
                    "sdf": os.path.abspath(args.sdf)}, f, indent=1)
 
-    procs = [launch("cam", args.cam, uniq, outdir),
-             launch("sima", args.sima, uniq, outdir)]
+    # CAM dumps steps+1 timesteps (its first is skipped); SIMA dumps steps.
+    # The gdb side kills each run at the start of the timestep after that,
+    # so STOP_N only needs to be long enough (e.g. CAM's 6-step minimum).
+    procs = [launch("cam", args.cam, uniq, outdir, args.steps + 1),
+             launch("sima", args.sima, uniq, outdir, args.steps)]
     print("dropsonde: waiting for runs to finish ...")
-    for (proc, logpath), role in zip(procs, ("cam", "sima")):
-        rc = proc.wait()
-        if rc != 0:
-            print("dropsonde: warning: {} gdb exited with rc {} "
-                  "(see {})".format(role, rc, logpath))
+    try:
+        for (proc, logpath), role in zip(procs, ("cam", "sima")):
+            rc = proc.wait()
+            if rc != 0:
+                print("dropsonde: warning: {} gdb exited with rc {} "
+                      "(see {})".format(role, rc, logpath))
+    except KeyboardInterrupt:
+        print("\ndropsonde: interrupted; terminating gdb sessions and "
+              "comparing what was captured ...")
+        for (proc, _), _role in zip(procs, ("cam", "sima")):
+            try:
+                proc.terminate()
+                proc.wait()
+            except Exception:
+                pass
 
     sys.path.insert(0, HERE)
     import differ
