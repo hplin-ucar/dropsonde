@@ -1,0 +1,411 @@
+# dropsonde_gdb.py -- scheme-boundary argument dumper. Runs INSIDE gdb:
+#
+#   DROPSONDE_CONFIG=<config.json> gdb --batch -x dropsonde_gdb.py cesm.exe
+#
+# (normally launched by ./dropsonde). Must stay compatible with gdb's
+# embedded Python (>= 3.6, e.g. Derecho's 3.6.15) and use only the stdlib.
+#
+# Strategy: a breakpoint at every <scheme>_run entry. At entry we walk the
+# frame's dummy arguments, probe each array's base address and per-subscript
+# byte strides empirically (element-address arithmetic, so we never depend
+# on gdb's descriptor internals), dump the bytes, and plant a
+# FinishBreakpoint that re-reads the same addresses at scheme exit.
+# Argument storage is caller-owned, so entry-time addresses remain valid at
+# exit. The FinishBreakpoint's stop() does memory reads and file writes
+# only (safe inside stop callbacks) and never halts the run.
+
+import json
+import os
+import struct
+
+import gdb
+
+CFG = json.load(open(os.environ["DROPSONDE_CONFIG"]))
+ROLE = CFG["role"]            # "cam" | "sima"
+OUT = CFG["out_dir"]
+SCHEMES = CFG["schemes"]      # unique scheme names, suite order
+
+# gdb is believed to report Fortran array ranges in source (subscript)
+# order. Both runs use the same gdb so comparisons are valid either way;
+# only the (col, lev) labels in the report would be transposed. Flip to
+# "reversed" during calibration if labels come out backwards.
+DIM_ORDER = "fortran"
+
+MANIFEST = {
+    "role": ROLE,
+    "dim_order": DIM_ORDER,
+    "breakpoints": {},        # scheme -> resolved spec | "missing"
+    "constituents": None,     # ordered names (CAM short / CCPP standard)
+    "hits": [],               # one record per scheme entry, execution order
+    "notes": [],
+}
+FILE_IDX = [0]
+HIT_COUNT = {}
+
+SCALAR_FMT = {"f8": "d", "f4": "f", "i8": "q", "i4": "i", "i2": "h", "i1": "b"}
+
+
+def note(msg):
+    MANIFEST["notes"].append(msg)
+    gdb.write("dropsonde[{}]: {}\n".format(ROLE, msg))
+
+
+# --------------------------------------------------------------------------
+# type and memory helpers
+# --------------------------------------------------------------------------
+
+def dtype_of(t):
+    if t.code == gdb.TYPE_CODE_FLT:
+        return "f{}".format(t.sizeof)
+    if t.code in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_BOOL):
+        return "i{}".format(t.sizeof)
+    return None
+
+
+def is_character(t):
+    return "character" in str(t).lower()
+
+
+def array_dims(t):
+    """Nested array ranges as [(lo, hi), ...] plus the element type."""
+    dims = []
+    t = t.strip_typedefs()
+    while t.code == gdb.TYPE_CODE_ARRAY:
+        lo, hi = t.range()
+        dims.append((int(lo), int(hi)))
+        t = t.target().strip_typedefs()
+    return dims, t
+
+
+def elem_addr(name, subs):
+    v = gdb.parse_and_eval("{}({})".format(
+        name, ",".join(str(s) for s in subs)))
+    if v.address is None:
+        raise gdb.error("no address for element of " + name)
+    return int(v.address)
+
+
+def array_plan(name, val):
+    """Build a capture plan {addr, elsize, dtype, los, extents, strides}.
+
+    Strides are bytes per increment of each subscript (source order),
+    probed via element addresses so strided actual arguments (array
+    slices) are handled correctly.
+    """
+    dims, base = array_dims(val.type)
+    dt = dtype_of(base)
+    if dt is None:
+        return None, "unsupported element type: {}".format(base)
+    if DIM_ORDER == "reversed":
+        dims = dims[::-1]
+    los = [d[0] for d in dims]
+    extents = [d[1] - d[0] + 1 for d in dims]
+    elsize = base.sizeof
+    addr0 = elem_addr(name, los)
+    strides = []
+    for k in range(len(dims)):
+        if extents[k] <= 1:
+            strides.append(0)
+            continue
+        subs = list(los)
+        subs[k] = los[k] + 1
+        strides.append(elem_addr(name, subs) - addr0)
+    if any(s < 0 for s in strides):
+        return None, "negative stride (reversed slice?): {}".format(strides)
+    return {"addr": addr0, "elsize": elsize, "dtype": dt, "los": los,
+            "extents": extents, "strides": strides}, None
+
+
+def read_array(plan):
+    """Read the logical array contents as contiguous subscript-major bytes."""
+    extents = plan["extents"]
+    strides = plan["strides"]
+    elsize = plan["elsize"]
+    total = 1
+    for e in extents:
+        total *= e
+    if total == 0:
+        return b""
+    span = sum(s * (e - 1) for s, e in zip(strides, extents)) + elsize
+    raw = bytes(gdb.selected_inferior().read_memory(plan["addr"], span))
+
+    contig = True
+    expect = elsize
+    for s, e in zip(strides, extents):
+        if e > 1 and s != expect:
+            contig = False
+            break
+        expect *= e
+    if contig:
+        return raw[:total * elsize]
+
+    out = bytearray(total * elsize)
+    pos = 0
+    for li in range(total):
+        rem = li
+        off = 0
+        for s, e in zip(strides, extents):
+            off += (rem % e) * s
+            rem //= e
+        out[pos:pos + elsize] = raw[off:off + elsize]
+        pos += elsize
+    return bytes(out)
+
+
+def read_scalar(addr, dt):
+    raw = bytes(gdb.selected_inferior().read_memory(addr, int(dt[1:])))
+    return struct.unpack("=" + SCALAR_FMT[dt], raw)[0]
+
+
+def write_blob(scheme, hit, arg, phase, data):
+    FILE_IDX[0] += 1
+    fn = "{:05d}_{}_h{}_{}_{}.bin".format(FILE_IDX[0], scheme, hit, arg, phase)
+    with open(os.path.join(OUT, fn), "wb") as f:
+        f.write(data)
+    return fn
+
+
+# --------------------------------------------------------------------------
+# entry / exit capture
+# --------------------------------------------------------------------------
+
+def arg_symbols(frame):
+    blk = frame.block()
+    while blk is not None and blk.function is None:
+        blk = blk.superblock
+    if blk is None:
+        return []
+    return [s for s in blk if s.is_argument]
+
+
+def handle_entry(scheme, frame):
+    hit = HIT_COUNT.get(scheme, 0)
+    HIT_COUNT[scheme] = hit + 1
+    rec = {"scheme": scheme, "hit": hit, "args": {}}
+    frame.select()
+    for sym in arg_symbols(frame):
+        name = sym.name
+        info = {"kind": "skipped"}
+        rec["args"][name] = info
+        try:
+            val = sym.value(frame)
+            t = val.type.strip_typedefs()
+            if t.code == gdb.TYPE_CODE_ARRAY and not is_character(t):
+                plan, err = array_plan(name, val)
+                if plan is None:
+                    info["why"] = err
+                    continue
+                data = read_array(plan)
+                info["kind"] = "array"
+                info["dtype"] = plan["dtype"]
+                info["los"] = plan["los"]
+                info["extents"] = plan["extents"]
+                info["strides"] = plan["strides"]
+                info["plan"] = plan
+                info["entry_file"] = write_blob(scheme, hit, name, "in", data)
+            elif is_character(t):
+                info["kind"] = "char"
+                try:
+                    info["entry_value"] = val.string().rstrip()
+                except Exception:
+                    if val.address is not None and t.sizeof > 0:
+                        raw = bytes(gdb.selected_inferior().read_memory(
+                            int(val.address), t.sizeof))
+                        info["entry_value"] = raw.decode("latin-1").rstrip()
+                if val.address is not None and t.sizeof > 0:
+                    info["addr"] = int(val.address)
+                    info["len"] = t.sizeof
+            elif dtype_of(t) is not None:
+                dt = dtype_of(t)
+                info["kind"] = "scalar"
+                info["dtype"] = dt
+                info["entry_value"] = (float(val) if dt[0] == "f"
+                                       else int(val))
+                if val.address is not None:
+                    info["addr"] = int(val.address)
+            else:
+                info["why"] = "unsupported type: {}".format(t)
+        except Exception as exc:
+            info["kind"] = "error"
+            info["why"] = str(exc)
+    MANIFEST["hits"].append(rec)
+    return rec
+
+
+class ExitBP(gdb.FinishBreakpoint):
+    """Re-reads entry-time addresses when the scheme returns."""
+
+    def __init__(self, frame, rec):
+        super(ExitBP, self).__init__(frame, internal=True)
+        self.rec = rec
+
+    def stop(self):
+        rec = self.rec
+        for name, info in rec["args"].items():
+            try:
+                kind = info.get("kind")
+                if kind == "array":
+                    data = read_array(info["plan"])
+                    info["exit_file"] = write_blob(
+                        rec["scheme"], rec["hit"], name, "out", data)
+                elif kind == "scalar" and "addr" in info:
+                    info["exit_value"] = read_scalar(
+                        info["addr"], info["dtype"])
+                elif kind == "char" and "addr" in info:
+                    raw = bytes(gdb.selected_inferior().read_memory(
+                        info["addr"], info["len"]))
+                    info["exit_value"] = raw.decode("latin-1").rstrip()
+            except Exception as exc:
+                info["exit_error"] = str(exc)
+        rec["complete"] = True
+        return False
+
+    def out_of_scope(self):
+        note("finish breakpoint out of scope: {} h{}".format(
+            self.rec["scheme"], self.rec["hit"]))
+
+
+# --------------------------------------------------------------------------
+# constituent name capture (once, at first scheme hit, i.e. post-init)
+# --------------------------------------------------------------------------
+
+def _string_at(expr):
+    v = gdb.parse_and_eval(expr)
+    try:
+        return v.string().strip()
+    except Exception:
+        return bytes(gdb.selected_inferior().read_memory(
+            int(v.address), v.type.sizeof)).decode("latin-1").strip()
+
+
+def dump_constituents():
+    try:
+        if ROLE == "cam":
+            # character(len=16) :: cnst_name(pcnst) in module constituents
+            arr = None
+            for expr in ("__constituents_MOD_cnst_name", "cnst_name"):
+                try:
+                    arr = gdb.parse_and_eval(expr)
+                    break
+                except gdb.error:
+                    continue
+            if arr is None:
+                raise gdb.error("cnst_name not found")
+            dims, _ = array_dims(arr.type)
+            n = dims[0][1] - dims[0][0] + 1
+            width = arr.type.sizeof // n
+            raw = bytes(gdb.selected_inferior().read_memory(
+                int(arr.address), arr.type.sizeof))
+            names = [raw[i * width:(i + 1) * width].decode("latin-1").strip()
+                     for i in range(n)]
+        else:
+            # cam_constituents module: const_props(:) + num_constituents
+            n = int(gdb.parse_and_eval(
+                "__cam_constituents_MOD_num_constituents"))
+            names = []
+            for i in range(1, n + 1):
+                try:
+                    names.append(_string_at(
+                        "__cam_constituents_MOD_const_props({})"
+                        "%prop%var_std_name".format(i)))
+                except Exception as exc:
+                    names.append("<unreadable: {}>".format(exc))
+        MANIFEST["constituents"] = names
+        note("captured {} constituent names".format(len(names)))
+    except Exception as exc:
+        note("constituent name capture FAILED: {}".format(exc))
+
+
+# --------------------------------------------------------------------------
+# drive loop
+# --------------------------------------------------------------------------
+
+class EntryBP(gdb.Breakpoint):
+    def __init__(self, spec, scheme):
+        super(EntryBP, self).__init__(spec)
+        self.scheme = scheme
+
+
+LAST_STOP = [None]
+DONE = [False]
+
+
+def _on_stop(ev):
+    LAST_STOP[0] = ev
+
+
+def _on_exit(_ev):
+    DONE[0] = True
+
+
+def setup():
+    gdb.execute("set pagination off")
+    gdb.execute("set confirm off")
+    gdb.execute("set breakpoint pending off")
+    gdb.events.stop.connect(_on_stop)
+    gdb.events.exited.connect(_on_exit)
+
+    resolved = 0
+    for s in SCHEMES:
+        bp = None
+        for spec in (s + "_run", "__{0}_MOD_{0}_run".format(s)):
+            try:
+                bp = EntryBP(spec, s)
+                MANIFEST["breakpoints"][s] = spec
+                resolved += 1
+                break
+            except gdb.error:
+                continue
+        if bp is None:
+            MANIFEST["breakpoints"][s] = "missing"
+    note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
+    return resolved
+
+
+def main():
+    if setup() == 0:
+        note("no breakpoints resolved; not running")
+        return
+    const_done = False
+    gdb.execute("run")
+    while not DONE[0]:
+        ev = LAST_STOP[0]
+        LAST_STOP[0] = None
+        if ev is None:
+            note("stopped without a stop event; aborting")
+            break
+        entry = None
+        for b in getattr(ev, "breakpoints", None) or []:
+            if isinstance(b, EntryBP):
+                entry = b
+                break
+        if entry is None:
+            note("non-breakpoint stop ({}); backtrace follows".format(
+                getattr(ev, "stop_signal", "?")))
+            try:
+                gdb.execute("bt 25")
+            except gdb.error:
+                pass
+            break
+        frame = gdb.newest_frame()
+        try:
+            rec = handle_entry(entry.scheme, frame)
+            ExitBP(frame, rec)
+        except Exception as exc:
+            note("entry capture failed for {}: {}".format(
+                entry.scheme, exc))
+        if not const_done:
+            dump_constituents()
+            const_done = True
+        try:
+            gdb.execute("continue")
+        except gdb.error:
+            break
+
+
+try:
+    main()
+finally:
+    with open(os.path.join(OUT, "manifest.json"), "w") as f:
+        json.dump(MANIFEST, f, indent=1)
+    note("manifest written: {} hits".format(len(MANIFEST["hits"])))
