@@ -35,9 +35,10 @@ SPECIAL_CONST_MAP = {
 TYPECODE = {"f8": "d", "f4": "f", "i8": "q", "i4": "i", "i2": "h", "i1": "b"}
 ELSIZE = {"f8": 8, "f4": 4, "i8": 8, "i4": 4, "i2": 2, "i1": 1}
 
-# Not compared: uninitialized at entry on the CAM side (callers pass
-# stack garbage), and any nonzero errflg aborts the run instantly anyway.
-SKIP_ARGS = {"errmsg", "errflg"}
+# Not compared: errmsg/errflg are uninitialized at entry on the CAM side
+# (callers pass stack garbage) and any nonzero errflg aborts the run
+# instantly anyway; iulog is each model's own log unit number.
+SKIP_ARGS = {"errmsg", "errflg", "iulog"}
 
 
 def load_role(outdir, role):
@@ -171,19 +172,113 @@ def kdesc(info):
     return "{} ({})".format(k, why) if why else str(k)
 
 
-def compare_hit(srec, crec, sman, cman, const_ctx, rep):
-    """Compare one aligned hit pair; entry args first, then exit."""
+def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
+                 const_ctx, rep):
+    fkey = phase + "_file"
+    vkey = phase + "_value"
+    cam_names, sima_names, pairs = const_ctx
+    kind = sinfo.get("kind")
+    if kind != cinfo.get("kind"):
+        if phase == "entry":
+            rep.diff(label, hit, phase, arg,
+                     "argument kind mismatch: sima {} vs cam {}".format(
+                         kdesc(sinfo), kdesc(cinfo)))
+        return
+    if kind == "error":
+        if phase == "entry":
+            rep.note("{} (hit {}): arg {} capture errored on both sides: "
+                     "sima {} / cam {}".format(label, hit, arg,
+                                               kdesc(sinfo), kdesc(cinfo)))
+        return
+
+    if kind == "array":
+        sfile = sinfo.get(fkey)
+        cfile = cinfo.get(fkey)
+        if not sfile or not cfile:
+            return  # incomplete capture (noted in manifest)
+        dt = sinfo["dtype"]
+        if dt != cinfo.get("dtype"):
+            if phase == "entry":
+                rep.diff(label, hit, phase, arg,
+                         "dtype mismatch: sima {} vs cam {}".format(
+                             dt, cinfo.get("dtype")))
+            return
+        sext = sinfo["extents"]
+        cext = cinfo["extents"]
+        sdata = blob(sman, sfile)
+        cdata = blob(cman, cfile)
+
+        # constituent-indexed array: last dim is the constituent index,
+        # e.g. q(ncol,pver,pcnst) or surface fluxes cflx(ncol,pcnst)
+        rank = len(sext)
+        const_arr = (rank == len(cext) and rank in (2, 3) and
+                     sima_names and cam_names and
+                     sext[-1] == len(sima_names) and
+                     cext[-1] == len(cam_names) and
+                     sext[:-1] == cext[:-1])
+        if const_arr:
+            chunk = ELSIZE[dt]
+            for e in sext[:-1]:
+                chunk *= e
+            lines = []
+            for ci, sj, cn, sn in pairs:
+                ss = sdata[sj * chunk:(sj + 1) * chunk]
+                cs = cdata[ci * chunk:(ci + 1) * chunk]
+                txt = array_diff_text(ss, cs, dt, sext[:-1],
+                                      sinfo["los"][:-1])
+                if txt:
+                    lines.append("{} <-> {}: {}".format(cn, sn, txt))
+            if lines:
+                rep.diff(label, hit, phase, arg,
+                         "constituent-indexed array, {} mapped species "
+                         "differ".format(len(lines)), lines)
+            return
+
+        if sext != cext:
+            if phase == "entry":
+                rep.diff(label, hit, phase, arg,
+                         "shape mismatch: sima {} vs cam {}".format(
+                             sext, cext))
+            return
+        txt = array_diff_text(sdata, cdata, dt, sext, sinfo["los"])
+        if txt:
+            rep.diff(label, hit, phase, arg, txt)
+
+    elif kind in ("scalar", "char"):
+        sv = sinfo.get(vkey)
+        cv = cinfo.get(vkey)
+        if sv is None or cv is None:
+            return
+        if sv != cv:
+            rep.diff(label, hit, phase, arg,
+                     "sima={} cam={}".format(fmt_val(sv), fmt_val(cv)))
+
+
+def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
+    """Compare one aligned hit pair; entry args first, then exit.
+
+    With .meta intents available, intent(out) args are not compared at
+    entry (caller-side garbage) and intent(in) args not at exit. Exit
+    reports are suppressed for args whose entry already differed -- the
+    'outputs differ given identical inputs' signal is gone for those.
+    """
     bucket = srec.get("_bucket", "<toplevel>")
     label = srec["scheme"]
     if bucket != "<toplevel>":
         label += " via " + bucket
     label += " [step {}]".format(srec.get("step", "?"))
     hit = srec.get("_occ", srec["hit"])
-    cam_names, sima_names, pairs = const_ctx
-    for phase, fkey, vkey in (("entry", "entry_file", "entry_value"),
-                              ("exit", "exit_file", "exit_value")):
+    sch_int = (intents or {}).get(srec["scheme"], {})
+    entry_diffed = set()
+    for phase in ("entry", "exit"):
+        suppressed = []
         for arg, sinfo in srec["args"].items():
             if arg in SKIP_ARGS:
+                continue
+            it = sch_int.get(arg)
+            if it == "out" and phase == "entry":
+                continue
+            if it == "in" and phase == "exit":
                 continue
             cinfo = crec["args"].get(arg)
             if cinfo is None:
@@ -191,78 +286,19 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep):
                     rep.note("{} (hit {}): arg {} absent on CAM side".format(
                         label, hit, arg))
                 continue
-            kind = sinfo.get("kind")
-            if kind != cinfo.get("kind"):
-                if phase == "entry":
-                    rep.diff(label, hit, phase, arg,
-                             "argument kind mismatch: sima {} vs cam "
-                             "{}".format(kdesc(sinfo), kdesc(cinfo)))
+            if phase == "exit" and arg in entry_diffed:
+                suppressed.append(arg)
                 continue
-            if kind == "error":
-                if phase == "entry":
-                    rep.note("{} (hit {}): arg {} capture errored on both "
-                             "sides: sima {} / cam {}".format(
-                                 label, hit, arg, kdesc(sinfo),
-                                 kdesc(cinfo)))
-                continue
-
-            if kind == "array":
-                sfile = sinfo.get(fkey)
-                cfile = cinfo.get(fkey)
-                if not sfile or not cfile:
-                    continue  # incomplete capture (noted in manifest)
-                dt = sinfo["dtype"]
-                if dt != cinfo.get("dtype"):
-                    if phase == "entry":
-                        rep.diff(label, hit, phase, arg,
-                                 "dtype mismatch: sima {} vs cam {}".format(
-                                     dt, cinfo.get("dtype")))
-                    continue
-                sext = sinfo["extents"]
-                cext = cinfo["extents"]
-                sdata = blob(sman, sfile)
-                cdata = blob(cman, cfile)
-
-                const_arr = (len(sext) == 3 and len(cext) == 3 and
-                             sima_names and cam_names and
-                             sext[2] == len(sima_names) and
-                             cext[2] == len(cam_names) and
-                             sext[:2] == cext[:2])
-                if const_arr:
-                    chunk = sext[0] * sext[1] * ELSIZE[dt]
-                    lines = []
-                    for ci, sj, cn, sn in pairs:
-                        ss = sdata[sj * chunk:(sj + 1) * chunk]
-                        cs = cdata[ci * chunk:(ci + 1) * chunk]
-                        txt = array_diff_text(ss, cs, dt, sext[:2],
-                                              sinfo["los"][:2])
-                        if txt:
-                            lines.append("{} <-> {}: {}".format(cn, sn, txt))
-                    if lines:
-                        rep.diff(label, hit, phase, arg,
-                                 "constituent-indexed array, {} mapped "
-                                 "species differ".format(len(lines)), lines)
-                    continue
-
-                if sext != cext:
-                    if phase == "entry":
-                        rep.diff(label, hit, phase, arg,
-                                 "shape mismatch: sima {} vs cam {}".format(
-                                     sext, cext))
-                    continue
-                txt = array_diff_text(sdata, cdata, dt, sext, sinfo["los"])
-                if txt:
-                    rep.diff(label, hit, phase, arg, txt)
-
-            elif kind in ("scalar", "char"):
-                sv = sinfo.get(vkey)
-                cv = cinfo.get(vkey)
-                if sv is None or cv is None:
-                    continue
-                if sv != cv:
-                    rep.diff(label, hit, phase, arg,
-                             "sima={} cam={}".format(fmt_val(sv),
-                                                     fmt_val(cv)))
+            pre = rep.n_diffs
+            _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
+                         const_ctx, rep)
+            if phase == "entry" and rep.n_diffs > pre:
+                entry_diffed.add(arg)
+        if phase == "exit" and suppressed:
+            rep.note("{} (hit {}): exit comparison suppressed for {} args "
+                     "with differing inputs: {}".format(
+                         label, hit, len(suppressed),
+                         ", ".join(suppressed)))
         if phase == "entry" and not rep.first_pair_seen:
             rep.first_pair_seen = True
             if rep.n_diffs > 0:
@@ -304,7 +340,64 @@ def tag_hits(man, shared):
     return groups
 
 
-def report(outdir, suite_order, steps):
+def count_matching_entry_args(srec, crec, sman, cman):
+    """(n_bitwise_identical, n_comparable) over entry captures."""
+    same = 0
+    total = 0
+    for arg, sinfo in srec["args"].items():
+        if arg in SKIP_ARGS:
+            continue
+        cinfo = crec["args"].get(arg)
+        if cinfo is None or sinfo.get("kind") != cinfo.get("kind"):
+            continue
+        if sinfo.get("kind") == "array":
+            if not sinfo.get("entry_file") or not cinfo.get("entry_file"):
+                continue
+            total += 1
+            if (sinfo["extents"] == cinfo["extents"] and
+                    blob(sman, sinfo["entry_file"]) ==
+                    blob(cman, cinfo["entry_file"])):
+                same += 1
+        elif sinfo.get("kind") in ("scalar", "char"):
+            if sinfo.get("entry_value") is None:
+                continue
+            total += 1
+            if sinfo.get("entry_value") == cinfo.get("entry_value"):
+                same += 1
+    return same, total
+
+
+def offset_scan(first_srec, cam_g, sima_g, sman, cman):
+    """When alignment looks wrong, show which cam/sima steps the first
+    compared sima hit actually matches, bitwise."""
+    s = first_srec["scheme"]
+    b = first_srec["_bucket"]
+    occ = first_srec["_occ"]
+    print("offset scan: entry args of {} (sima step {}) vs every dumped "
+          "step:".format(s, first_srec["step"]))
+    cam_steps = sorted(set(t for (ss, t, bb) in cam_g
+                           if ss == s and bb == b))
+    for t in cam_steps:
+        lst = cam_g.get((s, t, b), [])
+        if occ < len(lst):
+            same, total = count_matching_entry_args(
+                first_srec, lst[occ], sman, cman)
+            print("  vs cam  step {}: {:2d}/{} args bitwise identical"
+                  .format(t, same, total))
+    sima_steps = sorted(set(t for (ss, t, bb) in sima_g
+                            if ss == s and bb == b
+                            and t != first_srec["step"]))
+    for t in sima_steps:
+        lst = sima_g.get((s, t, b), [])
+        if occ < len(lst):
+            same, total = count_matching_entry_args(
+                first_srec, lst[occ], sman, sman)
+            print("  vs sima step {}: {:2d}/{} args bitwise identical "
+                  "(identical => snapshot record repeated!)".format(
+                      t, same, total))
+
+
+def report(outdir, suite_order, steps, intents=None):
     print("")
     print("=" * 64)
     print("dropsonde report  ({})".format(outdir))
@@ -425,6 +518,7 @@ def report(outdir, suite_order, steps):
     print("comparison (execution order):")
     rep = Reporter()
     n_pairs = 0
+    first_srec = None
     for srec in sima["hits"]:
         t = srec.get("step", 0)
         if t < 1 or t > steps:
@@ -433,7 +527,10 @@ def report(outdir, suite_order, steps):
         cam_list = cam_g.get(key, [])
         if srec["_occ"] >= len(cam_list):
             continue  # count mismatch, already reported above
-        compare_hit(srec, cam_list[srec["_occ"]], sima, cam, const_ctx, rep)
+        if first_srec is None:
+            first_srec = srec
+        compare_hit(srec, cam_list[srec["_occ"]], sima, cam, const_ctx,
+                    rep, intents)
         n_pairs += 1
 
     # --- summary ----------------------------------------------------------
@@ -445,6 +542,8 @@ def report(outdir, suite_order, steps):
               "check snapshot setup")
         print("*** before believing any divergence below the first "
               "scheme.")
+        if first_srec is not None:
+            offset_scan(first_srec, cam_g, sima_g, sima, cam)
         print("")
     if rep.n_diffs == 0:
         n_args = sum(len(r["args"]) for r in sima["hits"])
@@ -468,5 +567,6 @@ if __name__ == "__main__":
         sys.exit("usage: python3 differ.py <out_dir>")
     outdir = sys.argv[1]
     meta = json.load(open(os.path.join(outdir, "suite.json")))
-    ok = report(outdir, meta["schemes"], meta["steps"])
+    ok = report(outdir, meta["schemes"], meta["steps"],
+                meta.get("intents"))
     sys.exit(0 if ok else 1)

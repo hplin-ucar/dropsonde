@@ -10,8 +10,14 @@ dumps all scheme arguments to disk, and diffs them byte-for-byte.
 ```
 ./dropsonde --cam  /glade/derecho/scratch/.../cam_case  \
             --sima /glade/derecho/scratch/.../sima_case \
-            --sdf  suite_park_macrop.xml
+            --sdf  suite_park_macrop.xml \
+            [--meta-root /path/to/atmospheric_physics] [--steps 2]
 ```
+
+`--meta-root` (default: three levels up from the SDF) locates the schemes'
+CCPP `.meta` files; their intents let the differ skip `intent(out)` args
+at entry (caller-side garbage, e.g. 67 of bretherton_park_diff's 113
+args) and `intent(in)` args at exit.
 
 Run it where the models can run (i.e., a compute node). Both gdb sessions
 launch in parallel; the report prints to stdout when they finish.
@@ -58,14 +64,26 @@ Re-run just the comparison with `python3 differ.py <out_dir>`.
    `compute_cloud_fraction` inside RK) has the *same shared-code caller
    symbol* in both binaries and is compared against its nested
    counterpart; model-specific call sites (CCPP cap vs CAM driver) bucket
-   together as toplevel. `errmsg`/`errflg` are not compared (uninitialized
-   at entry on the CAM side). Constituent indices are matched via a
-   short-name ↔ standard-name table (`SPECIAL_CONST_MAP` — extend it as
-   ports grow). The report, in execution order:
+   together as toplevel. `errmsg`/`errflg`/`iulog` are never compared.
+   Intent filtering (from `.meta`) drops entry-garbage and
+   input-repeated-at-exit noise; exit reports are suppressed for args
+   whose entry already differed. Constituent-indexed arrays — rank-3
+   `q(ncol,pver,pcnst)` and rank-2 fluxes `cflx(ncol,pcnst)` — are
+   compared per mapped species via a short-name ↔ standard-name table
+   (`SPECIAL_CONST_MAP` plus exact-name fallback, which covers MAM
+   species whose standard name equals the CAM short name). The report,
+   in execution order:
    - inputs differ → wiring problem upstream of the scheme;
    - inputs match, outputs differ → problem inside the scheme;
    - shape/dtype/kind mismatches, hit-count mismatches, SIMA-only schemes;
    - the constituent index mapping (useful for manual gdb sessions);
+   - if the very first compared scheme already has input differences, an
+     alignment warning plus an *offset scan*: the first hit's entry args
+     are checked bitwise against every dumped CAM step (wrong offset →
+     some other step matches; no step matches → the two runs are
+     different trajectories, e.g. the snapshot driving CAM-SIMA came
+     from a different CAM build) and against the other SIMA steps
+     (identical → the snapshot time record is being re-read);
    - bit-for-bit: `No differences found in any subroutines!`
 
 Entry-time addresses of every argument are kept in
@@ -84,21 +102,23 @@ default `bash -l` environment) verified on 2026-06-12:
   3-D `[8,32,96]`) with `DIM_ORDER = "reversed"` + per-array sizeof check
 - CAM `cnst_name` capture works
 
-Still to verify on re-run (fixes applied since the first attempt):
+Full-model run (UW PBL suite, 2026-06-12) verified end-to-end mechanics:
+step tagging + auto-kill ("collected 3 timesteps; terminating run"),
+explicit-shape capture, exits, caller bucketing (nested
+`bretherton_park_diff_run` calls of the diffusion routines pair
+correctly), CAM constituent names, pending-breakpoint detection
+(13 CAM-missing schemes correctly classified). The report correctly
+flagged alignment as suspect; manual offset scanning showed the
+snapshot driving the SIMA case came from a different CAM trajectory
+(no CAM step matched bitwise) — that scan is now automated.
 
-1. Explicit-shape dummies (`b(ncol,pver)`) capture after the
-   declaration-line `next` (was: `no such vector element`).
-2. SIMA constituent chase with `cam_constituents::` spelling (linker-name
-   spelling hit "unknown type" on gdb 16.2).
-3. FinishBreakpoint exits: hit records have `"complete": true` and
-   `exit_file` entries; `CHECK b == 2a: True` in cal_run.sh.
-4. Pending-breakpoint detection (the Python API ignores
-   `set breakpoint pending off`): missing symbols must report `missing`,
-   not resolve silently.
-5. Step tagging + auto-kill: cam role stops after 1 "timestep" in
-   cal_run.sh; hits carry correct `step`.
-6. Then the real known-BFB case must report zero diffs end-to-end; if the
-   first scheme's inputs differ the report flags alignment as suspect.
+Still to verify on the next run:
+
+1. SIMA constituent names via the gdb-printer path (raw descriptor reads
+   returned pointer bytes).
+2. Intent filtering end-to-end (`--meta-root`).
+3. A true BFB pairing (CAM case == the snapshot-producing build) must
+   report zero diffs.
 
 ## Known limitations
 

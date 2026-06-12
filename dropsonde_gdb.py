@@ -16,6 +16,7 @@
 
 import json
 import os
+import re
 import struct
 import traceback
 
@@ -296,8 +297,16 @@ def _string_at(expr):
     try:
         return v.string().strip()
     except Exception:
-        return bytes(gdb.selected_inferior().read_memory(
-            int(v.address), v.type.sizeof)).decode("latin-1").strip()
+        pass
+    # Deferred-length allocatable strings: let gdb's own printer resolve
+    # the descriptor. (Reading v.address raw returns the data POINTER
+    # bytes, which is how garbage names get captured.)
+    out = gdb.execute("print {}".format(expr), to_string=True)
+    m = re.search(r"'(.*)'", out, re.S)
+    if m:
+        return m.group(1).strip()
+    raise gdb.error("could not read string {}: {}".format(
+        expr, out.strip()[:120]))
 
 
 def dump_constituents():
@@ -403,6 +412,10 @@ def setup():
     gdb.execute("set pagination off")
     gdb.execute("set confirm off")
     gdb.execute("set breakpoint pending off")
+    gdb.execute("set width unlimited")
+    # don't let gdb print frame args at every stop: slow and floods the
+    # log (and pre-'next', explicit-shape dummies have garbage bounds)
+    gdb.execute("set print frame-arguments none")
     gdb.events.stop.connect(_on_stop)
     gdb.events.exited.connect(_on_exit)
 

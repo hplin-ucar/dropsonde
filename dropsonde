@@ -43,6 +43,42 @@ def parse_sdf(path):
     return schemes
 
 
+def parse_meta_intents(meta_root, schemes):
+    """{scheme: {arg: intent}} for the schemes' _run phases, from CCPP
+    .meta files found under meta_root. Lets the differ skip intent(out)
+    args at entry (caller-side garbage) and intent(in) args at exit."""
+    want = {s + "_run": s for s in schemes}
+    intents = {}
+    for dirpath, _dirs, filenames in os.walk(meta_root):
+        for fn in filenames:
+            if not fn.endswith(".meta"):
+                continue
+            cur_scheme = None
+            cur_var = None
+            try:
+                f = open(os.path.join(dirpath, fn), errors="replace")
+            except OSError:
+                continue
+            with f:
+                for ln in f:
+                    t = ln.strip()
+                    if t.startswith("[ccpp-arg-table]"):
+                        cur_scheme = None
+                        cur_var = None
+                    elif t.startswith("[") and t.endswith("]"):
+                        cur_var = t[1:-1].strip()
+                    elif "=" in t:
+                        k, _, v = t.partition("=")
+                        k = k.strip()
+                        v = v.strip()
+                        if k == "name" and cur_var is None:
+                            cur_scheme = want.get(v)
+                        elif k == "intent" and cur_scheme and cur_var:
+                            intents.setdefault(cur_scheme, {})[
+                                cur_var.lower()] = v.lower()
+    return intents
+
+
 def launch(role, casedir, schemes, outdir, kill_after_steps):
     exe = os.path.join(casedir, "bld", "cesm.exe")
     rundir = os.path.join(casedir, "run")
@@ -81,6 +117,10 @@ def main():
                     help="physics timesteps to compare (default 2); CAM "
                          "contributes steps+1, its first being skipped")
     ap.add_argument("--out", default="dropsonde_out", help="dump directory")
+    ap.add_argument("--meta-root", default=None,
+                    help="root to search for CCPP .meta files "
+                         "(default: three levels up from the SDF, i.e. "
+                         "the ncar_ccpp/atmospheric_physics root)")
     args = ap.parse_args()
 
     schemes = parse_sdf(args.sdf)
@@ -91,11 +131,24 @@ def main():
     print("dropsonde: {} scheme calls per timestep in SDF ({} unique)".format(
         len(schemes), len(uniq)))
 
+    sdf_abs = os.path.abspath(args.sdf)
+    meta_root = args.meta_root or os.path.dirname(
+        os.path.dirname(os.path.dirname(sdf_abs)))
+    intents = parse_meta_intents(meta_root, uniq)
+    print("dropsonde: intents for {}/{} schemes ({} args) from .meta "
+          "under {}".format(len(intents), len(uniq),
+                            sum(len(v) for v in intents.values()),
+                            meta_root))
+    if not intents:
+        print("dropsonde: WARNING: no .meta intents found; entry values of "
+              "intent(out) args will be compared (noisy) -- set "
+              "--meta-root")
+
     outdir = os.path.abspath(args.out)
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "suite.json"), "w") as f:
         json.dump({"schemes": schemes, "steps": args.steps,
-                   "sdf": os.path.abspath(args.sdf)}, f, indent=1)
+                   "sdf": sdf_abs, "intents": intents}, f, indent=1)
 
     # CAM dumps steps+1 timesteps (its first is skipped); SIMA dumps steps.
     # The gdb side kills each run at the start of the timestep after that,
@@ -121,7 +174,7 @@ def main():
 
     sys.path.insert(0, HERE)
     import differ
-    ok = differ.report(outdir, schemes, args.steps)
+    ok = differ.report(outdir, schemes, args.steps, intents)
     sys.exit(0 if ok else 1)
 
 
