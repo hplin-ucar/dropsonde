@@ -11,8 +11,14 @@ dumps all scheme arguments to disk, and diffs them byte-for-byte.
 ./dropsonde --cam  /glade/derecho/scratch/.../cam_case  \
             --sima /glade/derecho/scratch/.../sima_case \
             --sdf  suite_park_macrop.xml \
-            [--meta-root /path/to/atmospheric_physics] [--steps 2]
+            [--meta-root /path/to/atmospheric_physics] [--steps 1]
 ```
+
+`--steps` defaults to 1: in FPHYStest snapshot runs every timestep is
+independent (the model state is re-read from `ncdata` each step), so
+comparing CAM timestep 2 against SIMA timestep 1 is decisive — if one
+timestep matches, the rest will too (barring `is_first_timestep` logic,
+for which `--steps 2` compares an extra pair).
 
 `--meta-root` (default: three levels up from the SDF) locates the schemes'
 CCPP `.meta` files; their intents let the differ skip `intent(out)` args
@@ -22,6 +28,11 @@ args) and `intent(in)` args at exit.
 Run it where the models can run (i.e., a compute node). Both gdb sessions
 launch in parallel; the report prints to stdout when they finish.
 Re-run just the comparison with `python3 differ.py <out_dir>`.
+
+WARNING: any direct `cesm.exe` execution (dropsonde, manual gdb) reopens
+and TRUNCATES the component logs named in `nuopc.runconfig` — i.e. it
+clobbers `atm.log.<last-jobid>.*` etc. from the most recent batch run.
+Copy aside any logs you want to keep before running.
 
 ## Prerequisites
 
@@ -67,12 +78,20 @@ Re-run just the comparison with `python3 differ.py <out_dir>`.
    together as toplevel. `errmsg`/`errflg`/`iulog` are never compared.
    Intent filtering (from `.meta`) drops entry-garbage and
    input-repeated-at-exit noise; exit reports are suppressed for args
-   whose entry already differed. Constituent-indexed arrays — rank-3
-   `q(ncol,pver,pcnst)` and rank-2 fluxes `cflx(ncol,pcnst)` — are
-   compared per mapped species via a short-name ↔ standard-name table
+   whose entry already differed, and `intent(out)` exit elements that
+   BOTH models left untouched (entry == exit bitwise) are ignored —
+   partially-defined outputs (e.g. `dtk`'s surface row) otherwise echo
+   each caller's unrelated buffer contents. Constituent-indexed arrays —
+   rank-3 `q(ncol,pver,pcnst)`, rank-2 fluxes `cflx(ncol,pcnst)`, and
+   rank-1 per-species config like `qmincg(pcnst)` — are compared per
+   mapped species via a short-name ↔ standard-name table
    (`SPECIAL_CONST_MAP` plus exact-name fallback, which covers MAM
-   species whose standard name equals the CAM short name). The report,
-   in execution order:
+   species whose standard name equals the CAM short name). When hit
+   counts differ within a bucket (CAM hosts call `geopotential_temp`
+   from ~20 sites per step), each SIMA hit is paired with the CAM hit
+   whose comparable inputs ALL match bitwise (constituent arrays
+   per-species), or reported unpaired with the closest candidate. The
+   report, in execution order:
    - inputs differ → wiring problem upstream of the scheme;
    - inputs match, outputs differ → problem inside the scheme;
    - shape/dtype/kind mismatches, hit-count mismatches, SIMA-only schemes;
@@ -112,12 +131,28 @@ flagged alignment as suspect; manual offset scanning showed the
 snapshot driving the SIMA case came from a different CAM trajectory
 (no CAM step matched bitwise) — that scan is now automated.
 
+A second full run verified intent filtering end-to-end and exposed that
+deferred-length strings need the hidden-length path: gdb prints SIMA's
+`const_props(i)%prop%var_std_name` as `(PTR TO -> character*0) 0x...`
+because DWARF carries no dynamic length on the component. The capture
+now reads the hidden sibling member `_var_std_name_length` (gfortran
+appends it after the type's own visible components; verified against
+gfortran DWARF output) and then reads exactly that many bytes at the
+data pointer.
+
+The second run also validated the differ on real data: with the
+constituent permutation recovered bitwise from the q dumps themselves,
+the decisive timestep pair (CAM nstep 1 vs SIMA nstep 0) was bit-for-bit
+across the whole UW PBL suite except for genuine, separately-explained
+findings (SIMA reading NUMLIQ/NUMICE as zero from the snapshot; the
+known `do_diffusion_const` NUMLIQ flag mismatch; SIMA passing `qmin`
+where CAM passes `qmincg`; `update_dry_static_energy` invoked from a
+different host phase — `dp_coupling` in CAM).
+
 Still to verify on the next run:
 
-1. SIMA constituent names via the gdb-printer path (raw descriptor reads
-   returned pointer bytes).
-2. Intent filtering end-to-end (`--meta-root`).
-3. A true BFB pairing (CAM case == the snapshot-producing build) must
+1. SIMA constituent names via the hidden `_<name>_length` member path.
+2. A true BFB pairing (with the SIMA-side input findings fixed) must
    report zero diffs.
 
 ## Known limitations

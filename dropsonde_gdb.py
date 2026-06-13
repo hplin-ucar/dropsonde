@@ -295,16 +295,40 @@ class ExitBP(gdb.FinishBreakpoint):
 def _string_at(expr):
     v = gdb.parse_and_eval(expr)
     try:
-        return v.string().strip()
+        s = v.string().strip()
+        if s:
+            return s
     except Exception:
         pass
-    # Deferred-length allocatable strings: let gdb's own printer resolve
-    # the descriptor. (Reading v.address raw returns the data POINTER
-    # bytes, which is how garbage names get captured.)
+    # Let gdb's own printer resolve descriptors it understands.
     out = gdb.execute("print {}".format(expr), to_string=True)
     m = re.search(r"'(.*)'", out, re.S)
     if m:
         return m.group(1).strip()
+    # Deferred-length allocatable component: gdb sees only the data
+    # pointer ("PTR TO -> character*0").  gfortran stores the length in a
+    # hidden sibling member _<name>_length appended after the type's own
+    # visible components (named in DWARF, readable like class %_data).
+    if v.type.code == gdb.TYPE_CODE_PTR:
+        ptr = int(v)
+        if ptr == 0:
+            return ""
+        head, sep, last = expr.rpartition("%")
+        if sep:
+            try:
+                length = int(gdb.parse_and_eval(
+                    "{}%_{}_length".format(head, last)))
+            except gdb.error:
+                length = -1
+            if 0 < length <= 1024:
+                raw = bytes(gdb.selected_inferior().read_memory(ptr, length))
+                return raw.decode("latin-1").strip()
+        # last resort: printable run at the data pointer; "?" marks the
+        # name as heuristic (it will show as unmatched in the report)
+        raw = bytes(gdb.selected_inferior().read_memory(ptr, 256))
+        m = re.match(rb"[A-Za-z][A-Za-z0-9_]*", raw)
+        if m:
+            return m.group(0).decode("latin-1") + "?"
     raise gdb.error("could not read string {}: {}".format(
         expr, out.strip()[:120]))
 

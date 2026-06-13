@@ -15,8 +15,8 @@ Requirements:
     (preview_namelists already run).
   - CAM:      DEBUG, GNU, NTASKS=1, NTHRDS=1, pcols = total columns,
               STOP_N covering at least --steps + 1 physics timesteps.
-  - CAM-SIMA: DEBUG, GNU, single rank, STOP_N covering exactly --steps
-              physics timesteps (the differ infers calls-per-step from it).
+  - CAM-SIMA: DEBUG, GNU, single rank, STOP_N covering at least --steps
+              physics timesteps.
   - gdb on PATH; both executables built with the same atmospheric_physics.
 
 Python 3.6 compatible; stdlib only (no numpy anywhere).
@@ -113,9 +113,12 @@ def main():
     ap.add_argument("--cam", required=True, help="CAM case scratch dir")
     ap.add_argument("--sima", required=True, help="CAM-SIMA case scratch dir")
     ap.add_argument("--sdf", required=True, help="suite definition file (XML)")
-    ap.add_argument("--steps", type=int, default=2,
-                    help="physics timesteps to compare (default 2); CAM "
-                         "contributes steps+1, its first being skipped")
+    ap.add_argument("--steps", type=int, default=1,
+                    help="physics timesteps to compare (default 1: in "
+                         "FPHYStest snapshot runs every timestep is "
+                         "independent, so CAM step 2 vs SIMA step 1 is "
+                         "decisive); CAM contributes steps+1, its first "
+                         "being skipped")
     ap.add_argument("--out", default="dropsonde_out", help="dump directory")
     ap.add_argument("--meta-root", default=None,
                     help="root to search for CCPP .meta files "

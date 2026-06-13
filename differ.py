@@ -111,6 +111,52 @@ def array_diff_text(sdata, cdata, dt, extents, los):
                                     fmt_val(x), fmt_val(y)))
 
 
+def _exit_diff_written_only(sdata, cdata, s_entry, c_entry, dt, extents,
+                            los):
+    """Like array_diff_text, but ignore elements left untouched (entry ==
+    exit, bitwise) by the scheme in BOTH models: intent(out) args are not
+    always fully defined, and untouched elements just echo each caller's
+    prior buffer contents. Returns (text_or_None, n_ignored)."""
+    es = ELSIZE[dt]
+    n = min(len(sdata), len(cdata)) // es
+    keep = []
+    ignored = 0
+    for k in range(n):
+        a = k * es
+        b = a + es
+        if sdata[a:b] == cdata[a:b]:
+            continue
+        if s_entry[a:b] == sdata[a:b] and c_entry[a:b] == cdata[a:b]:
+            ignored += 1
+            continue
+        keep.append(k)
+    if not keep:
+        return None, ignored
+    va = unpack(sdata, dt)
+    vb = unpack(cdata, dt)
+    count = 0
+    worst = None
+    for k in keep:
+        x, y = va[k], vb[k]
+        if x == y or (x != x and y != y):
+            continue
+        count += 1
+        d = abs(x - y)
+        if d != d:
+            d = float("inf")
+        if worst is None or d > worst[0]:
+            worst = (d, k, x, y)
+    if worst is None:
+        return None, ignored
+    d, li, x, y = worst
+    extra = " (ignoring {} untouched in both models)".format(ignored) \
+        if ignored else ""
+    return ("{}/{} elements differ{}, max |diff| {:.3e} at {}: "
+            "sima={} cam={}".format(count, n, extra, d,
+                                    lin_to_sub(li, extents, los),
+                                    fmt_val(x), fmt_val(y)), ignored)
+
+
 def build_const_map(cam_names, sima_names):
     """(pairs, cam_unmatched, sima_unmatched); pairs are 0-based
     (cam_idx, sima_idx, cam_name, sima_name)."""
@@ -145,9 +191,14 @@ class Reporter(object):
         self.first_printed = False
         self.alignment_suspect = False
         self.first_pair_seen = False
+        self.cur_scheme = None
+        self.by_scheme = {}  # scheme -> [entry_diffs, exit_diffs]
 
     def diff(self, scheme, hit, phase, arg, text, extra_lines=None):
         self.n_diffs += 1
+        if self.cur_scheme:
+            c = self.by_scheme.setdefault(self.cur_scheme, [0, 0])
+            c[0 if phase == "entry" else 1] += 1
         tag = "INPUTS DIFFER" if phase == "entry" else "OUTPUTS DIFFER"
         head = "  [{}] {} (hit {}) arg {}: {}".format(
             tag, scheme, hit, arg, text)
@@ -173,7 +224,7 @@ def kdesc(info):
 
 
 def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
-                 const_ctx, rep):
+                 const_ctx, rep, intent=None):
     fkey = phase + "_file"
     vkey = phase + "_value"
     cam_names, sima_names, pairs = const_ctx
@@ -209,9 +260,10 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
         cdata = blob(cman, cfile)
 
         # constituent-indexed array: last dim is the constituent index,
-        # e.g. q(ncol,pver,pcnst) or surface fluxes cflx(ncol,pcnst)
+        # e.g. q(ncol,pver,pcnst), fluxes cflx(ncol,pcnst), or per-species
+        # config like qmincg(pcnst) / do_diffusion_const(pcnst)
         rank = len(sext)
-        const_arr = (rank == len(cext) and rank in (2, 3) and
+        const_arr = (rank == len(cext) and rank in (1, 2, 3) and
                      sima_names and cam_names and
                      sext[-1] == len(sima_names) and
                      cext[-1] == len(cam_names) and
@@ -239,6 +291,20 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
                 rep.diff(label, hit, phase, arg,
                          "shape mismatch: sima {} vs cam {}".format(
                              sext, cext))
+            return
+        if (phase == "exit" and intent == "out" and sdata != cdata and
+                sinfo.get("entry_file") and cinfo.get("entry_file")):
+            txt, ignored = _exit_diff_written_only(
+                sdata, cdata, blob(sman, sinfo["entry_file"]),
+                blob(cman, cinfo["entry_file"]), dt, sext, sinfo["los"])
+            if txt is None:
+                if ignored:
+                    rep.note("{} (hit {}): arg {}: exit differs only in "
+                             "{} elements untouched by the scheme in both "
+                             "models (partially-defined intent(out)); "
+                             "ignored".format(label, hit, arg, ignored))
+                return
+            rep.diff(label, hit, phase, arg, txt)
             return
         txt = array_diff_text(sdata, cdata, dt, sext, sinfo["los"])
         if txt:
@@ -269,6 +335,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
     label += " [step {}]".format(srec.get("step", "?"))
     hit = srec.get("_occ", srec["hit"])
     sch_int = (intents or {}).get(srec["scheme"], {})
+    rep.cur_scheme = srec["scheme"]
     entry_diffed = set()
     for phase in ("entry", "exit"):
         suppressed = []
@@ -291,7 +358,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
                 continue
             pre = rep.n_diffs
             _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
-                         const_ctx, rep)
+                         const_ctx, rep, it)
             if phase == "entry" and rep.n_diffs > pre:
                 entry_diffed.add(arg)
         if phase == "exit" and suppressed:
@@ -340,12 +407,20 @@ def tag_hits(man, shared):
     return groups
 
 
-def count_matching_entry_args(srec, crec, sman, cman):
-    """(n_bitwise_identical, n_comparable) over entry captures."""
+def count_matching_entry_args(srec, crec, sman, cman, sch_int=None,
+                              const_ctx=None):
+    """(n_bitwise_identical, n_comparable) over entry captures.
+    intent(out) args are excluded when intents are known -- their entry
+    values are caller-side garbage. Constituent-indexed arrays are
+    matched per mapped species (the raw bytes never match across the
+    models' different constituent orderings)."""
+    cam_names, sima_names, pairs = const_ctx or ([], [], [])
     same = 0
     total = 0
     for arg, sinfo in srec["args"].items():
         if arg in SKIP_ARGS:
+            continue
+        if sch_int and sch_int.get(arg) == "out":
             continue
         cinfo = crec["args"].get(arg)
         if cinfo is None or sinfo.get("kind") != cinfo.get("kind"):
@@ -353,8 +428,28 @@ def count_matching_entry_args(srec, crec, sman, cman):
         if sinfo.get("kind") == "array":
             if not sinfo.get("entry_file") or not cinfo.get("entry_file"):
                 continue
+            sext = sinfo["extents"]
+            cext = cinfo["extents"]
+            if (len(sext) == len(cext) and len(sext) in (1, 2, 3) and
+                    sima_names and cam_names and
+                    sext[-1] == len(sima_names) and
+                    cext[-1] == len(cam_names) and
+                    sext[:-1] == cext[:-1]):
+                if not pairs:
+                    continue  # no species mapping: cannot judge this arg
+                sdata = blob(sman, sinfo["entry_file"])
+                cdata = blob(cman, cinfo["entry_file"])
+                chunk = ELSIZE[sinfo["dtype"]]
+                for e in sext[:-1]:
+                    chunk *= e
+                total += 1
+                if all(sdata[sj * chunk:(sj + 1) * chunk] ==
+                       cdata[ci * chunk:(ci + 1) * chunk]
+                       for ci, sj, _, _ in pairs):
+                    same += 1
+                continue
             total += 1
-            if (sinfo["extents"] == cinfo["extents"] and
+            if (sext == cext and
                     blob(sman, sinfo["entry_file"]) ==
                     blob(cman, cinfo["entry_file"])):
                 same += 1
@@ -367,12 +462,14 @@ def count_matching_entry_args(srec, crec, sman, cman):
     return same, total
 
 
-def offset_scan(first_srec, cam_g, sima_g, sman, cman):
+def offset_scan(first_srec, cam_g, sima_g, sman, cman, intents=None,
+                const_ctx=None):
     """When alignment looks wrong, show which cam/sima steps the first
     compared sima hit actually matches, bitwise."""
     s = first_srec["scheme"]
     b = first_srec["_bucket"]
     occ = first_srec["_occ"]
+    sch_int = (intents or {}).get(s, {})
     print("offset scan: entry args of {} (sima step {}) vs every dumped "
           "step:".format(s, first_srec["step"]))
     cam_steps = sorted(set(t for (ss, t, bb) in cam_g
@@ -381,7 +478,7 @@ def offset_scan(first_srec, cam_g, sima_g, sman, cman):
         lst = cam_g.get((s, t, b), [])
         if occ < len(lst):
             same, total = count_matching_entry_args(
-                first_srec, lst[occ], sman, cman)
+                first_srec, lst[occ], sman, cman, sch_int, const_ctx)
             print("  vs cam  step {}: {:2d}/{} args bitwise identical"
                   .format(t, same, total))
     sima_steps = sorted(set(t for (ss, t, bb) in sima_g
@@ -391,7 +488,7 @@ def offset_scan(first_srec, cam_g, sima_g, sman, cman):
         lst = sima_g.get((s, t, b), [])
         if occ < len(lst):
             same, total = count_matching_entry_args(
-                first_srec, lst[occ], sman, sman)
+                first_srec, lst[occ], sman, sman, sch_int, const_ctx)
             print("  vs sima step {}: {:2d}/{} args bitwise identical "
                   "(identical => snapshot record repeated!)".format(
                       t, same, total))
@@ -500,10 +597,11 @@ def report(outdir, suite_order, steps, intents=None):
                 n_c = len(cam_g.get((s, t + 1, b), []))
                 per_bucket[b] = per_bucket.get(b, 0) + min(n_s, n_c)
                 if n_s != n_c:
+                    how = ("paired by bitwise input match"
+                           if n_s and n_c else "extra hits not compared")
                     problems.append(
                         "    MISMATCH step {} [{}]: sima {} vs cam {} "
-                        "hits (extra hits not compared)".format(
-                            t, b, n_s, n_c))
+                        "hits ({})".format(t, b, n_s, n_c, how))
         if not per_bucket:
             print("  {}: never called within compared steps".format(s))
             continue
@@ -519,18 +617,55 @@ def report(outdir, suite_order, steps, intents=None):
     rep = Reporter()
     n_pairs = 0
     first_srec = None
+    matched_cam = {}  # group key -> set of cam occurrences already paired
     for srec in sima["hits"]:
         t = srec.get("step", 0)
         if t < 1 or t > steps:
             continue
         key = (srec["scheme"], t + 1, srec["_bucket"])
         cam_list = cam_g.get(key, [])
-        if srec["_occ"] >= len(cam_list):
-            continue  # count mismatch, already reported above
+        n_s = len(sima_g.get((srec["scheme"], t, srec["_bucket"]), []))
+        if len(cam_list) == n_s:
+            # unambiguous: pair occurrence-by-occurrence
+            crec = cam_list[srec["_occ"]]
+        elif not cam_list:
+            continue  # cam never calls it; reported above
+        else:
+            # hit counts differ (e.g. CAM's host calls geopotential_temp
+            # from many sites): pair with the cam hit whose comparable
+            # inputs ALL match bitwise, if there is one.
+            sch_int = (intents or {}).get(srec["scheme"], {})
+            used = matched_cam.setdefault(key, set())
+            crec = None
+            closest = None
+            for k, cand in enumerate(cam_list):
+                if k in used:
+                    continue
+                same, total = count_matching_entry_args(
+                    srec, cand, sima, cam, sch_int, const_ctx)
+                if total and same == total:
+                    crec = cand
+                    used.add(k)
+                    rep.note("{} [step {}] (hit {}): paired with cam "
+                             "occurrence {} of {} (bitwise input match)"
+                             .format(srec["scheme"], t, srec["_occ"],
+                                     k, len(cam_list)))
+                    break
+                if closest is None or same > closest[1]:
+                    closest = (k, same, total)
+            if crec is None:
+                why = ("all {} candidates already paired".format(
+                       len(cam_list)) if closest is None else
+                       "closest: occurrence {}, {}/{} args match".format(
+                           closest[0], closest[1], closest[2]))
+                rep.note("{} [step {}] (hit {}): NO cam hit with matching "
+                         "inputs among {} candidates ({}); not compared"
+                         .format(srec["scheme"], t, srec["_occ"],
+                                 len(cam_list), why))
+                continue
         if first_srec is None:
             first_srec = srec
-        compare_hit(srec, cam_list[srec["_occ"]], sima, cam, const_ctx,
-                    rep, intents)
+        compare_hit(srec, crec, sima, cam, const_ctx, rep, intents)
         n_pairs += 1
 
     # --- summary ----------------------------------------------------------
@@ -543,7 +678,8 @@ def report(outdir, suite_order, steps, intents=None):
         print("*** before believing any divergence below the first "
               "scheme.")
         if first_srec is not None:
-            offset_scan(first_srec, cam_g, sima_g, sima, cam)
+            offset_scan(first_srec, cam_g, sima_g, sima, cam, intents,
+                        const_ctx)
         print("")
     if rep.n_diffs == 0:
         n_args = sum(len(r["args"]) for r in sima["hits"])
@@ -557,6 +693,13 @@ def report(outdir, suite_order, steps, intents=None):
         return True
     print("{} differing comparisons across {} hit pairs.".format(
         rep.n_diffs, n_pairs))
+    clean = [s for s in compared if s not in rep.by_scheme]
+    print("per-scheme: {}/{} compared schemes bit-for-bit; differing:"
+          .format(len(clean), len(compared)))
+    for s in compared:
+        if s in rep.by_scheme:
+            ne, nx = rep.by_scheme[s]
+            print("  {}: {} input / {} output diffs".format(s, ne, nx))
     print("Raw dumps and entry-time addresses are in the manifests for "
           "manual gdb follow-up.")
     return False
