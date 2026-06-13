@@ -171,6 +171,11 @@ def build_const_map(cam_names, sima_names):
             j = sima_lookup[std]
         elif cn in sima_lookup:
             j = sima_lookup[cn]
+        elif "cnst_" + cn in sima_lookup:
+            # constituents auto-registered from a snapshot file keep
+            # their netcdf variable name (cnst_<CAM short name>) as
+            # their standard name
+            j = sima_lookup["cnst_" + cn]
         else:
             cands = [k for k, n in enumerate(sima_names)
                      if cn.lower() == n or cn.lower() in n.split("_")]

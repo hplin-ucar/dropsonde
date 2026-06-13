@@ -85,8 +85,9 @@ Copy aside any logs you want to keep before running.
    rank-3 `q(ncol,pver,pcnst)`, rank-2 fluxes `cflx(ncol,pcnst)`, and
    rank-1 per-species config like `qmincg(pcnst)` — are compared per
    mapped species via a short-name ↔ standard-name table
-   (`SPECIAL_CONST_MAP` plus exact-name fallback, which covers MAM
-   species whose standard name equals the CAM short name). When hit
+   (`SPECIAL_CONST_MAP`, then exact-name, then `cnst_<short name>` —
+   constituents auto-registered from a snapshot file keep their netcdf
+   variable name as their standard name). When hit
    counts differ within a bucket (CAM hosts call `geopotential_temp`
    from ~20 sites per step), each SIMA hit is paired with the CAM hit
    whose comparable inputs ALL match bitwise (constituent arrays
