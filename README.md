@@ -27,7 +27,23 @@ args) and `intent(in)` args at exit.
 
 Run it where the models can run (i.e., a compute node). Both gdb sessions
 launch in parallel; the report prints to stdout when they finish.
-Re-run just the comparison with `python3 differ.py <out_dir>`.
+
+Everything lands in `--out` (default `./dropsonde_out`):
+
+```
+report.txt    the printed report, archived verbatim
+suite.json    scheme order, --steps, parsed .meta intents
+cam/, sima/   manifest.json + gdb.log + one .bin dump per argument
+              per phase (entry/exit)
+```
+
+Re-run just the comparison — to re-read the report, regenerate it after
+editing `differ.py`, or compare with different code without re-running
+the models — with:
+
+```
+python3 differ.py dropsonde_out
+```
 
 WARNING: any direct `cesm.exe` execution (dropsonde, manual gdb) reopens
 and TRUNCATES the component logs named in `nuopc.runconfig` — i.e. it
@@ -71,90 +87,138 @@ Copy aside any logs you want to keep before running.
 4. `differ.py` aligns offline: SIMA timestep t pairs with CAM timestep
    t+1 (CAM's first dumped step is skipped). Within a step, hits are
    bucketed by caller: a scheme called from inside another scheme (e.g.
-   the diffusion solver inside `bretherton_park`'s iteration, or
-   `compute_cloud_fraction` inside RK) has the *same shared-code caller
-   symbol* in both binaries and is compared against its nested
-   counterpart; model-specific call sites (CCPP cap vs CAM driver) bucket
-   together as toplevel. `errmsg`/`errflg`/`iulog` are never compared.
-   Intent filtering (from `.meta`) drops entry-garbage and
-   input-repeated-at-exit noise; exit reports are suppressed for args
-   whose entry already differed, and `intent(out)` exit elements that
-   BOTH models left untouched (entry == exit bitwise) are ignored —
-   partially-defined outputs (e.g. `dtk`'s surface row) otherwise echo
-   each caller's unrelated buffer contents. Constituent-indexed arrays —
-   rank-3 `q(ncol,pver,pcnst)`, rank-2 fluxes `cflx(ncol,pcnst)`, and
-   rank-1 per-species config like `qmincg(pcnst)` — are compared per
-   mapped species via a short-name ↔ standard-name table
-   (`SPECIAL_CONST_MAP`, then exact-name, then `cnst_<short name>` —
-   constituents auto-registered from a snapshot file keep their netcdf
-   variable name as their standard name). When hit
-   counts differ within a bucket (CAM hosts call `geopotential_temp`
-   from ~20 sites per step), each SIMA hit is paired with the CAM hit
-   whose comparable inputs ALL match bitwise (constituent arrays
-   per-species), or reported unpaired with the closest candidate. The
-   report, in execution order:
-   - inputs differ → wiring problem upstream of the scheme;
-   - inputs match, outputs differ → problem inside the scheme;
-   - shape/dtype/kind mismatches, hit-count mismatches, SIMA-only schemes;
-   - the constituent index mapping (useful for manual gdb sessions);
-   - if the very first compared scheme already has input differences, an
-     alignment warning plus an *offset scan*: the first hit's entry args
-     are checked bitwise against every dumped CAM step (wrong offset →
-     some other step matches; no step matches → the two runs are
-     different trajectories, e.g. the snapshot driving CAM-SIMA came
-     from a different CAM build) and against the other SIMA steps
-     (identical → the snapshot time record is being re-read);
-   - bit-for-bit: `No differences found in any subroutines!`
+   the diffusion solver inside `bretherton_park`'s iteration) has the
+   *same shared-code caller symbol* in both binaries and is compared
+   against its nested counterpart; model-specific call sites (CCPP cap vs
+   CAM driver) bucket together as toplevel. When hit counts still differ
+   within a bucket (CAM hosts call `geopotential_temp` from ~20 sites per
+   step), each SIMA hit is paired with the CAM hit whose comparable
+   inputs ALL match bitwise, or reported unpaired with the closest
+   candidate. Constituent-indexed arrays — rank-3 `q(ncol,pver,pcnst)`,
+   rank-2 fluxes `cflx(ncol,pcnst)`, rank-1 per-species config like
+   `qmincg(pcnst)` — are compared per mapped species via a short-name ↔
+   standard-name table (`SPECIAL_CONST_MAP`, then exact name, then
+   `cnst_<short name>`: constituents auto-registered from a snapshot file
+   keep their netcdf variable name as their standard name). Intent
+   filtering (from `.meta`) drops entry-garbage and
+   input-repeated-at-exit noise; `errmsg`/`errflg`/`iulog` are never
+   compared.
 
-Entry-time addresses of every argument are kept in
-`<out>/<role>/manifest.json` — handy for setting watchpoints manually
-afterwards.
+gdb/gfortran facts the capture relies on (gdb 16.2, gfortran 12, Derecho):
 
-## Calibration status
+- Array dims appear REVERSED through the gdb Python API; a per-array
+  sizeof cross-check guards the convention.
+- The Python API ignores `set breakpoint pending off`; unresolved
+  breakpoints must be detected via `bp.pending`.
+- gdb's post-prologue stop is before explicit-shape dummy bounds exist;
+  one `next` materializes them.
+- Deferred-length character components print as
+  `(PTR TO -> character*0)` (DWARF carries no dynamic length); the
+  length lives in a hidden member `_<name>_length` that gfortran appends
+  after each type extension level's visible components, readable like
+  any other component.
+- Prefer `module::var` spelling for globals.
 
-Micro-calibration (`tests/cal.f90` + `tests/cal_run.sh`, run on a machine
-with gdb/gfortran — Derecho login node has gdb 16.2 + gfortran 12.5 in the
-default `bash -l` environment) verified on 2026-06-12:
+## Reading the report
 
-- plain `<scheme>_run` breakpoints resolve; caller capture works
-  (`phys::outer_run` form, identical across binaries for shared code)
-- array extents/strides pair correctly (`ext=[4,3] str=[8,32]`,
-  3-D `[8,32,96]`) with `DIM_ORDER = "reversed"` + per-array sizeof check
-- CAM `cnst_name` capture works
+In order of appearance:
 
-Full-model run (UW PBL suite, 2026-06-12) verified end-to-end mechanics:
-step tagging + auto-kill ("collected 3 timesteps; terminating run"),
-explicit-shape capture, exits, caller bucketing (nested
-`bretherton_park_diff_run` calls of the diffusion routines pair
-correctly), CAM constituent names, pending-breakpoint detection
-(13 CAM-missing schemes correctly classified). The report correctly
-flagged alignment as suspect; manual offset scanning showed the
-snapshot driving the SIMA case came from a different CAM trajectory
-(no CAM step matched bitwise) — that scan is now automated.
+- **schemes compared** — SDF schemes whose `_run` symbol resolved in both
+  binaries. SIMA-only schemes (no CAM symbol — usually CCPP-only glue
+  like `*_stub`, `*_default`) are listed and skipped; a CAM-only entry
+  would mean the SIMA build is missing a scheme.
+- **constituent mapping** — the recovered `q(:,:,i) <-> q(:,:,j)` index
+  permutation with both names. Unmatched species are listed and excluded
+  from per-species comparison (extend `SPECIAL_CONST_MAP` in `differ.py`
+  if a name pair should match but doesn't). Also handy as a lookup table
+  during manual gdb sessions.
+- **call alignment** — one row per call site with per-side hit counts
+  (`sima x4 cam x4`); indented rows are calls made from inside the
+  parent scheme (e.g. the diffusion routines inside `bretherton_park`'s
+  iteration). `<--` markers flag count mismatches and say how they were
+  handled.
+- **comparison (execution order)** — the heart of the report. The first
+  divergence is boxed. Each line is one argument of one hit pair:
+  - `[INPUTS DIFFER]`: the two models handed the scheme different data —
+    the problem is *upstream* (wiring, initialization, an earlier
+    scheme), not in the scheme itself.
+  - `[OUTPUTS DIFFER]`: identical inputs, different results — the
+    problem is *inside* the scheme (or a build difference). Exit
+    comparison is suppressed for args whose entry already differed.
+  - Constituent-indexed args report per species:
+    `NUMLIQ (cam idx 4, sima idx 1) <-> mass_number_... : ...` with
+    element stats, or just `sima=… cam=…` for rank-1 (one value per
+    species).
+  - `[note]` lines are non-verdicts: hits paired by input match, args
+    absent on one side, and `intent(out)` args where every element the
+    scheme wrote matches but some elements were never written in either
+    model (exit == entry bitwise) — those still hold each caller's
+    pre-call memory and are not compared. A scheme that fills its
+    outputs only partially (e.g. `dtk` rows above the surface layer)
+    shows up this way; persistent notes of this kind can also point at
+    an oversized actual argument on one side.
+- **per-scheme summary** (on failure) — diff counts per scheme, schemes
+  that were bit-for-bit.
+- **alignment warning + offset scan** — printed when the very *first*
+  compared scheme already has input diffs. The first hit's entry args
+  are then matched bitwise against every dumped CAM step (some other
+  step matches → step offset is wrong) and the other SIMA steps
+  (identical → the snapshot time record is being re-read). Distrust
+  everything below the first scheme until this is resolved.
 
-A second full run verified intent filtering end-to-end and exposed that
-deferred-length strings need the hidden-length path: gdb prints SIMA's
-`const_props(i)%prop%var_std_name` as `(PTR TO -> character*0) 0x...`
-because DWARF carries no dynamic length on the component. The capture
-now reads the hidden sibling member `_var_std_name_length` (gfortran
-appends it after the type's own visible components; verified against
-gfortran DWARF output) and then reads exactly that many bytes at the
-data pointer.
+## Digging deeper after a run
 
-The second run also validated the differ on real data: with the
-constituent permutation recovered bitwise from the q dumps themselves,
-the decisive timestep pair (CAM nstep 1 vs SIMA nstep 0) was bit-for-bit
-across the whole UW PBL suite except for genuine, separately-explained
-findings (SIMA reading NUMLIQ/NUMICE as zero from the snapshot; the
-known `do_diffusion_const` NUMLIQ flag mismatch; SIMA passing `qmin`
-where CAM passes `qmincg`; `update_dry_static_energy` invoked from a
-different host phase — `dp_coupling` in CAM).
+The comparison is rerunnable and the raw data self-describing; nothing
+about a finding requires re-running the models.
 
-Still to verify on the next run:
+- `<out>/<role>/manifest.json` — per hit: `scheme`, `step`, `caller`,
+  `hit`, and per argument: `kind`, `dtype` (`f8`, `i4`, ...), `extents`
+  and `los` (Fortran order, first subscript fastest; `los` = lower
+  bounds), `addr` (entry-time base address), `entry_file`/`exit_file`
+  (dump names), or `entry_value`/`exit_value` for scalars. Skipped args
+  carry a `why`.
+- Dumps are named `NNNNN_<scheme>_h<hit>_<arg>_<in|out>.bin`: raw
+  native-endian bytes in Fortran memory order, no header. Bitwise
+  questions need no unpacking: `cmp a.bin b.bin`. To look at values:
 
-1. SIMA constituent names via the hidden `_<name>_length` member path.
-2. A true BFB pairing (with the SIMA-side input findings fixed) must
-   report zero diffs.
+  ```python
+  from array import array
+  a = array("d")            # "d" for dtype f8, "i" for i4, ...
+  a.frombytes(open("00123_..._q1_out.bin", "rb").read())
+  # element (i,j,k), extents [ni,nj,nk], lower bounds los:
+  # a[(i-los[0]) + ni*((j-los[1]) + nj*(k-los[2]))]
+  ```
+
+- Argument storage is caller-owned, so the manifest `addr` of an
+  argument is valid for the whole scheme call: break at the scheme in a
+  manual gdb session and `watch *(double *)0x<addr>` to catch the exact
+  statement that writes a differing element.
+- `<out>/<role>/gdb.log` — full gdb transcript (breakpoint resolution,
+  capture notes, the kill).
+
+## Validation
+
+Micro-calibration: `tests/cal.f90` + `tests/cal_run.sh` (any machine
+with gdb + gfortran; Derecho login nodes work) checks breakpoint
+resolution, caller capture, extent/stride probing against known arrays,
+and constituent-name capture.
+
+Full-model calibration (2026-06, CAM5 UW PBL suite
+`suite_vdiff_bretherton_park`, ne3 = 486 columns, CAM FHIST_C5 vs
+CAM-SIMA FPHYStest): end-to-end mechanics verified — step tagging and
+auto-kill, explicit-shape capture, exits, nested-call bucketing,
+constituent capture on both sides, pending-breakpoint classification,
+best-match hit pairing, and the offset scan (which correctly identified
+a snapshot from a mismatched CAM trajectory before clean snapshots were
+regenerated). With clean snapshots the decisive timestep pair was
+bit-for-bit across the whole suite except real, separately-confirmed
+SIMA-side issues the tool surfaced (constituents silently reading as
+zero when `ic_file_input_names` is missing; a `diffuse_tracers_init`
+constituent flag mismatch; `qmin` passed where CAM passes `qmincg`) —
+divergences it reports are real wiring differences, not tool noise.
+
+Not yet exercised: a fully-fixed model pair reporting
+`No differences found in any subroutines!`.
 
 ## Known limitations
 

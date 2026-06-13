@@ -149,8 +149,8 @@ def _exit_diff_written_only(sdata, cdata, s_entry, c_entry, dt, extents,
     if worst is None:
         return None, ignored
     d, li, x, y = worst
-    extra = " (ignoring {} untouched in both models)".format(ignored) \
-        if ignored else ""
+    extra = (" (+{} elements never written in either model, "
+             "not compared)".format(ignored)) if ignored else ""
     return ("{}/{} elements differ{}, max |diff| {:.3e} at {}: "
             "sima={} cam={}".format(count, n, extra, d,
                                     lin_to_sub(li, extents, los),
@@ -217,6 +217,8 @@ class Reporter(object):
             print("-" * 64)
         else:
             print(head)
+            for ln in extra_lines or []:
+                print("    " + ln)
 
     def note(self, text):
         print("  [note] " + text)
@@ -278,17 +280,31 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
             for e in sext[:-1]:
                 chunk *= e
             lines = []
+            diff_names = []
             for ci, sj, cn, sn in pairs:
                 ss = sdata[sj * chunk:(sj + 1) * chunk]
                 cs = cdata[ci * chunk:(ci + 1) * chunk]
-                txt = array_diff_text(ss, cs, dt, sext[:-1],
-                                      sinfo["los"][:-1])
+                if rank == 1:
+                    # one element per species: just show the two values
+                    txt = None
+                    if ss != cs:
+                        txt = "sima={} cam={}".format(
+                            fmt_val(unpack(ss, dt)[0]),
+                            fmt_val(unpack(cs, dt)[0]))
+                else:
+                    txt = array_diff_text(ss, cs, dt, sext[:-1],
+                                          sinfo["los"][:-1])
                 if txt:
-                    lines.append("{} <-> {}: {}".format(cn, sn, txt))
+                    diff_names.append(cn)
+                    lines.append(
+                        "{} (cam idx {}, sima idx {}) <-> {}: {}".format(
+                            cn, ci + 1, sj + 1, sn, txt))
             if lines:
                 rep.diff(label, hit, phase, arg,
-                         "constituent-indexed array, {} mapped species "
-                         "differ".format(len(lines)), lines)
+                         "constituent-indexed array, {}/{} mapped species"
+                         " differ: {}".format(len(lines), len(pairs),
+                                              ", ".join(diff_names)),
+                         lines)
             return
 
         if sext != cext:
@@ -304,10 +320,13 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
                 blob(cman, cinfo["entry_file"]), dt, sext, sinfo["los"])
             if txt is None:
                 if ignored:
-                    rep.note("{} (hit {}): arg {}: exit differs only in "
-                             "{} elements untouched by the scheme in both "
-                             "models (partially-defined intent(out)); "
-                             "ignored".format(label, hit, arg, ignored))
+                    rep.note("{} (hit {}): arg {}: every element the "
+                             "scheme wrote matches; {} elements were "
+                             "never written in either model (exit == "
+                             "entry bitwise) and still hold each "
+                             "caller's unrelated pre-call memory, so "
+                             "they are not compared".format(
+                                 label, hit, arg, ignored))
                 return
             rep.diff(label, hit, phase, arg, txt)
             return
@@ -499,7 +518,37 @@ def offset_scan(first_srec, cam_g, sima_g, sman, cman, intents=None,
                       t, same, total))
 
 
+class _Tee(object):
+    """Write-through to several streams (console + report.txt archive)."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            st.write(s)
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
+
+
 def report(outdir, suite_order, steps, intents=None):
+    """Run the comparison; everything printed is also archived to
+    <out>/report.txt so it can be re-read (or regenerated after editing
+    differ.py) without re-running the models: python3 differ.py <out>."""
+    path = os.path.join(outdir, "report.txt")
+    old = sys.stdout
+    try:
+        with open(path, "w") as f:
+            sys.stdout = _Tee(old, f)
+            ok = _report(outdir, suite_order, steps, intents)
+    finally:
+        sys.stdout = old
+    print("(report archived to {})".format(path))
+    return ok
+
+
+def _report(outdir, suite_order, steps, intents=None):
     print("")
     print("=" * 64)
     print("dropsonde report  ({})".format(outdir))
@@ -586,13 +635,42 @@ def report(outdir, suite_order, steps, intents=None):
     shared = shared_caller_map(cam, sima)
     cam_g = tag_hits(cam, shared)
     sima_g = tag_hits(sima, shared)
+
+    def bucket_parent(b):
+        # 'bretherton_park_diff::bretherton_park_diff_run' -> the
+        # compared scheme whose _run subroutine made the nested call
+        name = b.split("::")[-1]
+        if name.endswith("_run"):
+            name = name[:-4]
+        return name if name in compared else None
+
     print("")
-    print("alignment (sima step t <=> cam step t+1; nested calls "
-          "bucketed by caller):")
-    for s in compared:
-        per_bucket = {}
-        problems = []
-        for t in range(1, steps + 1):
+    print("call alignment (hits per compared step; sima step t pairs "
+          "with cam step t+1;")
+    print("indented rows are calls made from inside the parent scheme):")
+    width = max(len(s) for s in compared) + 2
+
+    def vmark(n_s, n_c):
+        if n_s == n_c:
+            return ""
+        if n_c == 0:
+            return "  <-- no CAM hits: not compared"
+        if n_s == 0:
+            return "  <-- no SIMA hits: not compared"
+        return ("  <-- hit counts differ: paired by bitwise input match"
+                " (see notes)")
+
+    def row(label, n_s, n_c, depth):
+        print("  {}{:<{w}} sima x{:<3d} cam x{:<3d}{}".format(
+            "    " * depth, label, n_s, n_c, vmark(n_s, n_c),
+            w=max(1, width - 4 * depth)).rstrip())
+
+    for t in range(1, steps + 1):
+        if steps > 1:
+            print("  step {}:".format(t))
+        info = {}  # scheme -> {"top": (n_s, n_c)|None, "via": [...]}
+        kids = {}  # parent scheme -> set of nested callees
+        for s in compared:
             buckets = set(b for (ss, tt, b) in sima_g
                           if ss == s and tt == t)
             buckets |= set(b for (ss, tt, b) in cam_g
@@ -600,21 +678,54 @@ def report(outdir, suite_order, steps, intents=None):
             for b in sorted(buckets):
                 n_s = len(sima_g.get((s, t, b), []))
                 n_c = len(cam_g.get((s, t + 1, b), []))
-                per_bucket[b] = per_bucket.get(b, 0) + min(n_s, n_c)
-                if n_s != n_c:
-                    how = ("paired by bitwise input match"
-                           if n_s and n_c else "extra hits not compared")
-                    problems.append(
-                        "    MISMATCH step {} [{}]: sima {} vs cam {} "
-                        "hits ({})".format(t, b, n_s, n_c, how))
-        if not per_bucket:
-            print("  {}: never called within compared steps".format(s))
-            continue
-        desc = ", ".join("{} x{}".format(b, n)
-                         for b, n in sorted(per_bucket.items()))
-        print("  {}: {}".format(s, desc))
-        for p in problems:
-            print(p)
+                e = info.setdefault(s, {"top": None, "via": []})
+                if b == "<toplevel>":
+                    e["top"] = (n_s, n_c)
+                else:
+                    p = bucket_parent(b)
+                    e["via"].append((b, p, n_s, n_c))
+                    if p:
+                        kids.setdefault(p, set()).add(s)
+
+        printed = set()
+
+        def emit_nested(parent, depth):
+            for c in compared:
+                if c not in kids.get(parent, ()):
+                    continue
+                new = False
+                for (b, p, n_s, n_c) in info[c]["via"]:
+                    if p == parent and (c, b) not in printed:
+                        printed.add((c, b))
+                        row(c, n_s, n_c, depth)
+                        new = True
+                if new:
+                    emit_nested(c, depth + 1)
+
+        for s in compared:
+            e = info.get(s)
+            if e is None:
+                continue
+            if e["top"] is not None:
+                printed.add((s, "<toplevel>"))
+                row(s, e["top"][0], e["top"][1], 0)
+                emit_nested(s, 1)
+            for (b, p, n_s, n_c) in e["via"]:
+                if p is None and (s, b) not in printed:
+                    printed.add((s, b))
+                    row("{} (via {})".format(s, b), n_s, n_c, 0)
+        # nested rows whose parent never printed a row of its own
+        for s in compared:
+            if s not in info:
+                continue
+            for (b, p, n_s, n_c) in info[s]["via"]:
+                if (s, b) not in printed:
+                    printed.add((s, b))
+                    row("{} (via {})".format(s, b), n_s, n_c, 0)
+        never = [s for s in compared if s not in info]
+        if never:
+            print("  (not called in compared steps: {})".format(
+                ", ".join(never)))
 
     # --- stream-order comparison ----------------------------------------
     print("")
