@@ -232,3 +232,13 @@ Not yet exercised: a fully-fixed model pair reporting
 - One subcycle scheme called with *different arguments* per sub-step
   aligns fine (hits are sequence-matched), but the report labels hits by
   per-scheme index, not subcycle position.
+
+## Credits
+
+Dropsonde was created in a session with Claude Mythos/Fable 5 in a discussion
+about programmatically operating gdb to automate the discovery of answer
+differences between CAM and CAM-SIMA.
+
+Later improvements were added by Claude Opus 4.6.
+
+The supervising human was Haipeng Lin <hplin@ucar.edu>, NSF NCAR/CGD/AMP.

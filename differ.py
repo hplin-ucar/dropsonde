@@ -657,8 +657,7 @@ def _report(outdir, suite_order, steps, intents=None):
             return "  <-- no CAM hits: not compared"
         if n_s == 0:
             return "  <-- no SIMA hits: not compared"
-        return ("  <-- hit counts differ: paired by bitwise input match"
-                " (see notes)")
+        return "  <-- hit counts differ (see notes)"
 
     def row(label, n_s, n_c, depth):
         print("  {}{:<{w}} sima x{:<3d} cam x{:<3d}{}".format(
@@ -727,6 +726,54 @@ def _report(outdir, suite_order, steps, intents=None):
             print("  (not called in compared steps: {})".format(
                 ", ".join(never)))
 
+    # --- SDF-order pairing support ----------------------------------------
+    # CAM runs the full model timestep (all parameterizations), so a
+    # utility scheme like geopotential_temp is called from physics_update
+    # after EVERY parameterization -- but SIMA only runs the SDF suite, so
+    # it calls geopotential_temp once. To match, find the CAM call that
+    # follows the SDF predecessor in CAM's execution order: that's the
+    # physics_update call right after the parameterization we're debugging.
+    for idx, rec in enumerate(cam["hits"]):
+        rec["_exec_idx"] = idx
+    compared_set = set(compared)
+
+    def sdf_pred_of(scheme):
+        """Last compared scheme before scheme in the SDF."""
+        last = None
+        for s in suite_order:
+            if s == scheme:
+                return last
+            if s in compared_set:
+                last = s
+        return None
+
+    def find_cam_by_sdf_order(scheme, cam_step, cam_list, used):
+        """Find the cam_list entry that follows the SDF predecessor in
+        CAM's execution order. Returns (cam_list_idx, hit_record,
+        predecessor_name) or None."""
+        pred = sdf_pred_of(scheme)
+        if pred is None:
+            return None
+        # last execution-order hit of pred at cam_step
+        pred_pos = -1
+        for rec in cam["hits"]:
+            if rec.get("step") == cam_step and rec["scheme"] == pred:
+                pred_pos = rec["_exec_idx"]
+        if pred_pos < 0:
+            return None
+        # next hit of our scheme after pred_pos
+        for idx in range(pred_pos + 1, len(cam["hits"])):
+            rec = cam["hits"][idx]
+            if rec.get("step") != cam_step:
+                continue
+            if rec["scheme"] != scheme:
+                continue
+            for k, c in enumerate(cam_list):
+                if c["_exec_idx"] == idx and k not in used:
+                    return k, c, pred
+            break
+        return None
+
     # --- stream-order comparison ----------------------------------------
     print("")
     print("comparison (execution order):")
@@ -747,38 +794,56 @@ def _report(outdir, suite_order, steps, intents=None):
         elif not cam_list:
             continue  # cam never calls it; reported above
         else:
-            # hit counts differ (e.g. CAM's host calls geopotential_temp
-            # from many sites): pair with the cam hit whose comparable
-            # inputs ALL match bitwise, if there is one.
+            # Hit counts differ: CAM runs the full model timestep, so
+            # utility schemes (geopotential_temp, update_dry_static_energy)
+            # are called from physics_update after every parameterization;
+            # SIMA only runs the SDF suite, so it calls them once.
             sch_int = (intents or {}).get(srec["scheme"], {})
             used = matched_cam.setdefault(key, set())
             crec = None
-            closest = None
-            for k, cand in enumerate(cam_list):
-                if k in used:
+
+            # Strategy 1: SDF-order pairing -- find the CAM call that
+            # follows the last SDF predecessor in CAM's execution order
+            result = find_cam_by_sdf_order(
+                srec["scheme"], t + 1, cam_list, used)
+            if result is not None:
+                k, crec, pred = result
+                used.add(k)
+                rep.note("{} [step {}] (hit {}): paired with cam "
+                         "occurrence {} of {} (SDF order: follows {} "
+                         "in CAM execution)".format(
+                             srec["scheme"], t, srec["_occ"],
+                             k, len(cam_list), pred))
+            else:
+                # Strategy 2: bitwise input match (fallback)
+                closest = None
+                for k, cand in enumerate(cam_list):
+                    if k in used:
+                        continue
+                    same, total = count_matching_entry_args(
+                        srec, cand, sima, cam, sch_int, const_ctx)
+                    if total and same == total:
+                        crec = cand
+                        used.add(k)
+                        rep.note(
+                            "{} [step {}] (hit {}): paired with cam "
+                            "occurrence {} of {} (bitwise input match)"
+                            .format(srec["scheme"], t, srec["_occ"],
+                                    k, len(cam_list)))
+                        break
+                    if closest is None or same > closest[1]:
+                        closest = (k, same, total)
+                if crec is None:
+                    why = ("all {} candidates already paired".format(
+                           len(cam_list)) if closest is None else
+                           "closest: occurrence {}, {}/{} args match"
+                           .format(closest[0], closest[1], closest[2]))
+                    rep.note(
+                        "{} [step {}] (hit {}): NO cam hit with matching "
+                        "inputs among {} candidates ({}); not compared"
+                        .format(srec["scheme"], t, srec["_occ"],
+                                len(cam_list), why))
                     continue
-                same, total = count_matching_entry_args(
-                    srec, cand, sima, cam, sch_int, const_ctx)
-                if total and same == total:
-                    crec = cand
-                    used.add(k)
-                    rep.note("{} [step {}] (hit {}): paired with cam "
-                             "occurrence {} of {} (bitwise input match)"
-                             .format(srec["scheme"], t, srec["_occ"],
-                                     k, len(cam_list)))
-                    break
-                if closest is None or same > closest[1]:
-                    closest = (k, same, total)
-            if crec is None:
-                why = ("all {} candidates already paired".format(
-                       len(cam_list)) if closest is None else
-                       "closest: occurrence {}, {}/{} args match".format(
-                           closest[0], closest[1], closest[2]))
-                rep.note("{} [step {}] (hit {}): NO cam hit with matching "
-                         "inputs among {} candidates ({}); not compared"
-                         .format(srec["scheme"], t, srec["_occ"],
-                                 len(cam_list), why))
-                continue
         if first_srec is None:
             first_srec = srec
         compare_hit(srec, crec, sima, cam, const_ctx, rep, intents)
