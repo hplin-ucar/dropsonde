@@ -68,10 +68,14 @@ Copy aside any logs you want to keep before running.
 1. `dropsonde` parses the SDF for the ordered scheme list and launches
    `gdb --batch -x dropsonde_gdb.py` on each executable (config passed via
    `$DROPSONDE_CONFIG`).
-2. `dropsonde_gdb.py` breaks on every `<scheme>_run`. At entry it first
-   steps over the declaration line (gfortran materializes explicit-shape
-   dummy bounds there, past gdb's post-prologue stop), then walks the
-   frame's dummy arguments, probes each array's base address and
+2. `dropsonde_gdb.py` breaks on every `<scheme>_run`. At entry it steps
+   over gfortran's dummy-argument setup (descriptors/bounds are wired in
+   code attributed to the declaration lines, past gdb's post-prologue
+   stop) — `next`-ing until every numeric-array dummy resolves, which is
+   what lets schemes with long argument lists (e.g. `park_macrophysics`,
+   ~50 dummies whose descriptors span many declaration lines) capture at
+   all. It then walks the frame's dummy arguments, probes each array's
+   base address and
    per-subscript byte strides empirically (element-address arithmetic, so
    strided actual args like `state%q(:ncol,:,m)` are handled), dumps raw
    bytes, and plants a `FinishBreakpoint` that re-reads the same addresses
@@ -99,8 +103,10 @@ gdb/gfortran assumptions (gdb 16.2, gfortran 12, Derecho):
 - Array dims are REVERSED in the gdb Python API.
 - `set breakpoint pending off` is ignored by the Python API; detect via
   `bp.pending`.
-- Post-prologue stop precedes explicit-shape dummy bound materialization;
-  one `next` is needed.
+- Post-prologue stop precedes dummy descriptor/bound materialization;
+  step (`next`) until every numeric-array dummy resolves. Short argument
+  lists need one `next`; long ones (e.g. `park_macrophysics`) need more,
+  capped by `ARG_SETUP_MAX_STEPS` and bailed if the scheme frame is left.
 - Deferred-length character components: length is in a hidden
   `_<name>_length` member, not the DWARF type.
 - Use `module::var` spelling for globals.

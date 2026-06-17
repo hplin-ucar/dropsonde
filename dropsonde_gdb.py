@@ -49,6 +49,13 @@ HIT_COUNT = {}
 
 SCALAR_FMT = {"f8": "d", "f4": "f", "i8": "q", "i4": "i", "i2": "h", "i1": "b"}
 
+# Upper bound on 'next' steps spent materializing dummy-argument descriptors
+# at scheme entry (see the drive loop). Schemes with long argument lists
+# (e.g. park_macrophysics, ~50 dummies) spread gfortran's descriptor wiring
+# across many declaration lines; this caps the search so an unreadable arg
+# can't stall the run. Readiness is normally reached well within this.
+ARG_SETUP_MAX_STEPS = 96
+
 
 def note(msg):
     MANIFEST["notes"].append(msg)
@@ -194,6 +201,47 @@ def arg_symbols(frame):
     if blk is None:
         return []
     return [s for s in blk if s.is_argument]
+
+
+def _capturable_array_dtype(sym):
+    """Element dtype if this dummy is a numeric array we capture, else None
+    (scalars, character, and derived-type arrays such as const_props).
+
+    Uses the static symbol type so the classification holds even before the
+    descriptor is materialized -- so a derived-type arg, which never becomes
+    capturable, is excluded from the readiness gate rather than stalling it.
+    """
+    try:
+        t = sym.type.strip_typedefs()
+    except gdb.error:
+        return None
+    if is_character(t):
+        return None
+    depth = 0
+    while t.code == gdb.TYPE_CODE_ARRAY:
+        t = t.target().strip_typedefs()
+        depth += 1
+    if depth == 0:
+        return None
+    return dtype_of(t)
+
+
+def _args_ready(frame):
+    """True once every numeric-array dummy resolves to a base element
+    address, i.e. gfortran has finished wiring its descriptor. Scalars,
+    character and derived-type args are ignored so they never gate."""
+    for sym in arg_symbols(frame):
+        if _capturable_array_dtype(sym) is None:
+            continue
+        try:
+            val = sym.value(frame)
+            dims, _base = array_dims(val.type)
+            if DIM_ORDER == "reversed":
+                dims = dims[::-1]
+            elem_addr(sym.name, [d[0] for d in dims])
+        except Exception:
+            return False
+    return True
 
 
 def handle_entry(scheme, frame):
@@ -497,16 +545,37 @@ def main():
                 pass
             break
         else:
-            # Step over the rest of the declaration line first: gfortran
-            # materializes explicit-shape dummy bounds (e.g. b(ncol,pver))
-            # in code attributed to it, past gdb's post-prologue stop.
-            # 'next' completes that setup and stops BEFORE the first
-            # executable statement, so this is still scheme entry.
-            try:
-                gdb.execute("next")
-            except gdb.error:
-                pass
+            # Step over gfortran's compiler-generated dummy-argument setup
+            # before capturing. Bounds/descriptors for explicit- and
+            # assumed-shape dummies are wired in entry code attributed to the
+            # declaration lines, past gdb's post-prologue stop, so the args
+            # are not readable there yet. A single 'next' covers short
+            # argument lists; large schemes (e.g. park_macrophysics, ~50
+            # dummies) spread this across many source lines, leaving later
+            # descriptors unset ("Location address is not set"). Step until
+            # every numeric-array dummy resolves -- which lands on the first
+            # executable statement (errmsg=''), still scheme entry, before
+            # any input is touched -- capped, and bailing if we ever leave
+            # the scheme frame, so an unreadable arg can't run past entry.
             frame = gdb.newest_frame()
+            steps = 0
+            while steps < ARG_SETUP_MAX_STEPS:
+                try:
+                    gdb.execute("next")
+                except gdb.error:
+                    break
+                steps += 1
+                frame = gdb.newest_frame()
+                if entry.scheme not in (frame.name() or ""):
+                    note("{}: left scheme frame after {} setup steps; "
+                         "capture may be partial".format(entry.scheme, steps))
+                    break
+                if _args_ready(frame):
+                    break
+            if steps > 1:
+                note("{}: {} setup steps to materialize args{}".format(
+                    entry.scheme, steps,
+                    "" if _args_ready(frame) else " (cap hit; partial)"))
             try:
                 rec = handle_entry(entry.scheme, frame)
                 ExitBP(frame, rec)
