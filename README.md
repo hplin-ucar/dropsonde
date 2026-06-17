@@ -68,14 +68,14 @@ Copy aside any logs you want to keep before running.
 1. `dropsonde` parses the SDF for the ordered scheme list and launches
    `gdb --batch -x dropsonde_gdb.py` on each executable (config passed via
    `$DROPSONDE_CONFIG`).
-2. `dropsonde_gdb.py` breaks on every `<scheme>_run`. At entry it steps
-   over gfortran's dummy-argument setup (descriptors/bounds are wired in
-   code attributed to the declaration lines, past gdb's post-prologue
-   stop) — `next`-ing until every numeric-array dummy resolves, which is
-   what lets schemes with long argument lists (e.g. `park_macrophysics`,
-   ~50 dummies whose descriptors span many declaration lines) capture at
-   all. It then walks the frame's dummy arguments, probes each array's
-   base address and
+2. `dropsonde_gdb.py` breaks on every `<scheme>_run`. gdb's prologue skip
+   stops inside gfortran's dummy-argument descriptor setup, where the
+   dummies aren't readable yet and single-stepping can't escape (the setup
+   cycles — `park_macrophysics`, ~66 dummies, never clears). So it instead
+   `advance`s to the first body statement (`errmsg=''`/`errflg=0`, located
+   by scanning the source from the subroutine's definition line), where
+   every dummy is live and no input has been touched. It then walks the
+   frame's dummy arguments, probes each array's base address and
    per-subscript byte strides empirically (element-address arithmetic, so
    strided actual args like `state%q(:ncol,:,m)` are handled), dumps raw
    bytes, and plants a `FinishBreakpoint` that re-reads the same addresses
@@ -103,13 +103,13 @@ gdb/gfortran assumptions (gdb 16.2, gfortran 12, Derecho):
 - Array dims are REVERSED in the gdb Python API.
 - `set breakpoint pending off` is ignored by the Python API; detect via
   `bp.pending`.
-- Post-prologue stop precedes dummy descriptor/bound materialization. Until
-  the descriptor is wired, even `sym.value()` on the dummy raises "Location
-  address is not set" (so the arg can't be typed as an array yet). Step
-  (`next`) until that error clears for every dummy; errors that never clear
-  ("value has been optimized out") don't gate. Short argument lists need one
-  `next`; long ones (e.g. `park_macrophysics`) need more, capped by
-  `ARG_SETUP_MAX_STEPS` and bailed if the scheme frame is left.
+- gdb's prologue skip lands the scheme breakpoint inside the argument-
+  descriptor setup, where dummies raise "Location address is not set". On
+  large subroutines (`park_macrophysics`, ~66 dummies) this setup cycles and
+  single-stepping never escapes it — confirmed identical on `-O0` and
+  optimized builds. `advance` to the body's first statement instead (found
+  by scanning the source for `errmsg=''`/`errflg=0` from the subroutine's
+  definition line); all dummies are live there, with inputs untouched.
 - Deferred-length character components: length is in a hidden
   `_<name>_length` member, not the DWARF type.
 - Use `module::var` spelling for globals.

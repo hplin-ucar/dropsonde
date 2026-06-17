@@ -49,12 +49,17 @@ HIT_COUNT = {}
 
 SCALAR_FMT = {"f8": "d", "f4": "f", "i8": "q", "i4": "i", "i2": "h", "i1": "b"}
 
-# Upper bound on 'next' steps spent materializing dummy-argument descriptors
-# at scheme entry (see the drive loop). Schemes with long argument lists
-# (e.g. park_macrophysics, ~50 dummies) spread gfortran's descriptor wiring
-# across many declaration lines; this caps the search so an unreadable arg
-# can't stall the run. Readiness is normally reached well within this.
-ARG_SETUP_MAX_STEPS = 96
+# gdb's prologue skip lands the scheme-entry breakpoint INSIDE gfortran's
+# argument-descriptor setup, where assumed-shape dummies aren't readable yet
+# ("Location address is not set") and single-stepping cannot reliably escape:
+# the setup code cycles, confirmed on both -O0 and optimized builds for the
+# ~66-dummy park_macrophysics_run (96 'next's never reached the body). We
+# instead advance to the first executable statement of the body, where every
+# dummy is live. CCPP _run/_init subroutines open with errmsg=''/errflg=0, so
+# the body line is found by scanning the source from the subroutine's own
+# definition line for that idiom. Cached per scheme.
+_ERR_INIT_RE = re.compile(r"^\s*(errmsg|errflg|errcode|errstat)\s*=", re.I)
+_BODY_LINE = {}  # scheme -> (filename, line) | None
 
 
 def note(msg):
@@ -203,35 +208,33 @@ def arg_symbols(frame):
     return [s for s in blk if s.is_argument]
 
 
-def _args_ready(frame):
-    """True once no dummy still reports an unmaterialized descriptor.
-
-    Type classification can't drive this: gfortran wires each assumed-shape
-    dummy's descriptor in code attributed to its argument-list line, and
-    until we step past that line BOTH evaluating the value (`sym.value`) and
-    taking an element address raise "Location address is not set" -- so the
-    arg can't even be typed as an array yet, and the static symbol type does
-    not flag it as one either. Instead we watch that error directly: it
-    clears with more stepping, so it gates. Errors that never clear -- e.g.
-    an optimized-out scalar ("value has been optimized out") -- do not, so
-    they must not stall the loop.
-    """
-    for sym in arg_symbols(frame):
-        try:
-            val = sym.value(frame)
-            t = val.type.strip_typedefs()
-            if t.code == gdb.TYPE_CODE_ARRAY and not is_character(t):
-                dims, base = array_dims(t)
-                if dtype_of(base) is not None:
-                    if DIM_ORDER == "reversed":
-                        dims = dims[::-1]
-                    elem_addr(sym.name, [d[0] for d in dims])
-        except Exception as exc:
-            if "Location address is not set" in str(exc):
-                return False
-            # other failures (optimized-out scalars, etc.) never clear
-            continue
-    return True
+def _first_body_line(scheme, frame):
+    """(filename, line) of the first executable statement of the scheme's
+    body, or None. Dummy arguments are only reliably readable once execution
+    is in the body (past the compiler-generated descriptor setup), so the
+    drive loop advances here before capturing. CCPP subroutines open with
+    errmsg=''/errflg=0; we scan the source from the subroutine's OWN
+    definition line (so a sibling subroutine earlier in the same file -- e.g.
+    the _init above _run -- is not matched). Result is cached per scheme."""
+    if scheme in _BODY_LINE:
+        return _BODY_LINE[scheme]
+    result = None
+    try:
+        start = frame.function().line
+        fname = frame.find_sal().symtab.fullname()
+        with open(fname) as fh:
+            lines = fh.readlines()
+        for idx in range(start - 1, len(lines)):
+            if _ERR_INIT_RE.match(lines[idx]):
+                result = (fname, idx + 1)
+                break
+    except Exception as exc:
+        note("{}: body-line scan failed: {}".format(scheme, exc))
+    if result is not None:
+        note("{}: capturing at body {}:{}".format(
+            scheme, os.path.basename(result[0]), result[1]))
+    _BODY_LINE[scheme] = result
+    return result
 
 
 def handle_entry(scheme, frame):
@@ -535,37 +538,33 @@ def main():
                 pass
             break
         else:
-            # Step over gfortran's compiler-generated dummy-argument setup
-            # before capturing. Bounds/descriptors for explicit- and
-            # assumed-shape dummies are wired in entry code attributed to the
-            # declaration lines, past gdb's post-prologue stop, so the args
-            # are not readable there yet. A single 'next' covers short
-            # argument lists; large schemes (e.g. park_macrophysics, ~50
-            # dummies) spread this across many source lines, leaving later
-            # descriptors unset ("Location address is not set"). Step until
-            # every numeric-array dummy resolves -- which lands on the first
-            # executable statement (errmsg=''), still scheme entry, before
-            # any input is touched -- capped, and bailing if we ever leave
-            # the scheme frame, so an unreadable arg can't run past entry.
+            # gdb's prologue skip stops inside the argument-descriptor setup,
+            # where dummies raise "Location address is not set" and stepping
+            # can't escape (the setup cycles). Advance to the first body
+            # statement (errmsg=''), where every dummy is live, then capture.
+            # Nothing but compiler-generated setup runs between entry and that
+            # statement, so 'advance' lands in this same call with inputs
+            # untouched (errmsg=''/errflg=0 don't modify physical args).
             frame = gdb.newest_frame()
-            steps = 0
-            while steps < ARG_SETUP_MAX_STEPS:
+            body = _first_body_line(entry.scheme, frame)
+            if body is not None:
+                try:
+                    gdb.execute("advance {}:{}".format(
+                        os.path.basename(body[0]), body[1]))
+                    frame = gdb.newest_frame()
+                except gdb.error as exc:
+                    note("{}: advance to body line {} failed: {}".format(
+                        entry.scheme, body[1], exc))
+            else:
+                # No body marker found: fall back to the historical single
+                # 'next', which suffices for short argument lists.
+                note("{}: no body marker found; single-next fallback".format(
+                    entry.scheme))
                 try:
                     gdb.execute("next")
                 except gdb.error:
-                    break
-                steps += 1
+                    pass
                 frame = gdb.newest_frame()
-                if entry.scheme not in (frame.name() or ""):
-                    note("{}: left scheme frame after {} setup steps; "
-                         "capture may be partial".format(entry.scheme, steps))
-                    break
-                if _args_ready(frame):
-                    break
-            if steps > 1:
-                note("{}: {} setup steps to materialize args{}".format(
-                    entry.scheme, steps,
-                    "" if _args_ready(frame) else " (cap hit; partial)"))
             try:
                 rec = handle_entry(entry.scheme, frame)
                 ExitBP(frame, rec)
