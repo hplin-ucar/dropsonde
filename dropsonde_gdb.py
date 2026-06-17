@@ -203,41 +203,31 @@ def arg_symbols(frame):
     return [s for s in blk if s.is_argument]
 
 
-def _capturable_array_dtype(sym):
-    """Element dtype if this dummy is a numeric array we capture, else None
-    (scalars, character, and derived-type arrays such as const_props).
-
-    Uses the static symbol type so the classification holds even before the
-    descriptor is materialized -- so a derived-type arg, which never becomes
-    capturable, is excluded from the readiness gate rather than stalling it.
-    """
-    try:
-        t = sym.type.strip_typedefs()
-    except gdb.error:
-        return None
-    if is_character(t):
-        return None
-    depth = 0
-    while t.code == gdb.TYPE_CODE_ARRAY:
-        t = t.target().strip_typedefs()
-        depth += 1
-    if depth == 0:
-        return None
-    return dtype_of(t)
-
-
 def _args_ready(frame):
     """True once every numeric-array dummy resolves to a base element
-    address, i.e. gfortran has finished wiring its descriptor. Scalars,
-    character and derived-type args are ignored so they never gate."""
+    address, i.e. gfortran has finished wiring its descriptor.
+
+    Classification mirrors handle_entry and uses the FRAME-evaluated value
+    type: the static symbol type does not resolve assumed-shape dummies to
+    TYPE_CODE_ARRAY (the shape lives in the runtime descriptor), so static
+    typing would skip every array and gate on nothing. Args whose value is
+    not yet evaluable (e.g. optimized-out scalars), character arrays, and
+    derived-type arrays (const_props) are skipped so they never gate.
+    """
     for sym in arg_symbols(frame):
-        if _capturable_array_dtype(sym) is None:
-            continue
         try:
             val = sym.value(frame)
-            dims, _base = array_dims(val.type)
-            if DIM_ORDER == "reversed":
-                dims = dims[::-1]
+            t = val.type.strip_typedefs()
+        except Exception:
+            continue
+        if t.code != gdb.TYPE_CODE_ARRAY or is_character(t):
+            continue
+        dims, base = array_dims(t)
+        if dtype_of(base) is None:
+            continue
+        if DIM_ORDER == "reversed":
+            dims = dims[::-1]
+        try:
             elem_addr(sym.name, [d[0] for d in dims])
         except Exception:
             return False
