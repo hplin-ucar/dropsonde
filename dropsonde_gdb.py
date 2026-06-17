@@ -51,13 +51,15 @@ SCALAR_FMT = {"f8": "d", "f4": "f", "i8": "q", "i4": "i", "i2": "h", "i1": "b"}
 
 # gdb's prologue skip lands the scheme-entry breakpoint INSIDE gfortran's
 # argument-descriptor setup, where assumed-shape dummies aren't readable yet
-# ("Location address is not set") and single-stepping cannot reliably escape:
-# the setup code cycles, confirmed on both -O0 and optimized builds for the
-# ~66-dummy park_macrophysics_run (96 'next's never reached the body). We
-# instead advance to the first executable statement of the body, where every
-# dummy is live. CCPP _run/_init subroutines open with errmsg=''/errflg=0, so
-# the body line is found by scanning the source from the subroutine's own
-# definition line for that idiom. Cached per scheme.
+# ("Location address is not set") and single-stepping does not reliably escape
+# (stepping bounces among the subroutine-declaration line numbers for the
+# ~66-dummy park_macrophysics_run). We instead advance to the first executable
+# statement of the body, where the dummies are live. CCPP _run/_init
+# subroutines open with errmsg=''/errflg=0, so the body line is found by
+# scanning the source from the subroutine's own definition line for that
+# idiom. Cached per scheme. (Subroutines large enough that gfortran -O0 drops
+# the DWARF locations of their stack-passed dummies altogether additionally
+# need the ABI fallback in handle_entry; the body is a valid vantage for it.)
 _ERR_INIT_RE = re.compile(r"^\s*(errmsg|errflg|errcode|errstat)\s*=", re.I)
 _BODY_LINE = {}  # scheme -> (filename, line) | None
 
@@ -237,6 +239,131 @@ def _first_body_line(scheme, frame):
     return result
 
 
+# --------------------------------------------------------------------------
+# ABI-level argument capture (gfortran / System V AMD64 fallback)
+#
+# A few CCPP schemes are large enough that gfortran -O0 emits an EMPTY
+# DW_AT_location for every stack-passed dummy: `info address numliq` reports
+# "optimized out" and gdb cannot read the dummy by name ANYWHERE in the
+# routine -- not a prologue or stopping-point issue (park_macrophysics_run:
+# 66 dummies, ~1500 lines, a ~30 KB frame from its (ncol,pver) automatic
+# arrays). The data is still on the stack where the ABI put it, so we recover
+# it directly. Every Fortran dummy is passed by reference (one 8-byte
+# pointer); System V AMD64 puts the first 6 in registers and the rest as
+# consecutive 8-byte slots from rbp+16. So dummy i (1-based, declaration
+# order) with i > 6 is the pointer at [rbp + 16 + 8*(i-7)] -- a descriptor
+# pointer for assumed-shape arrays, a value pointer for scalars. Confirmed on
+# gcc 14.3.0. Assumes all-by-reference dummies (the CCPP norm); by-value float
+# arguments would shift the integer-register accounting and are not handled.
+# --------------------------------------------------------------------------
+
+N_INT_REG = 6          # System V AMD64 integer/pointer argument registers
+STACK_ARG0 = 16        # first stack arg at rbp+16 (saved rbp, then return addr)
+
+# gfortran array descriptor, LP64, gcc 9-14 (byte offsets):
+_D_BASE = 0            # void *base_addr (points at the element at the lbounds)
+_D_ELEM_LEN = 16       # size_t elem_len
+_D_RANK = 28           # signed char rank
+_D_DIM0 = 40           # dim[]: {index_type stride (ELEMENTS), lbound, ubound}
+_D_DIM = 24            #   3 * 8 bytes per dimension
+
+
+def _read_u64(addr):
+    return struct.unpack("=Q", bytes(
+        gdb.selected_inferior().read_memory(addr, 8)))[0]
+
+
+def _read_i64(addr):
+    return struct.unpack("=q", bytes(
+        gdb.selected_inferior().read_memory(addr, 8)))[0]
+
+
+def _frame_base(frame):
+    return int(frame.read_register("rbp")) & 0xFFFFFFFFFFFFFFFF
+
+
+def _element_type(t):
+    """Strip array codes to the element type without touching dynamic ranges."""
+    t = t.strip_typedefs()
+    while t.code == gdb.TYPE_CODE_ARRAY:
+        t = t.target().strip_typedefs()
+    return t
+
+
+def _descriptor_plan(desc_addr, elem_type):
+    """An array_plan()-shaped dict built from a raw gfortran descriptor."""
+    dt = dtype_of(elem_type)
+    if dt is None:
+        return None, "unsupported element type: {}".format(elem_type)
+    rank = struct.unpack("=b", bytes(
+        gdb.selected_inferior().read_memory(desc_addr + _D_RANK, 1)))[0]
+    if rank < 1 or rank > 7:
+        return None, "implausible descriptor rank: {}".format(rank)
+    base = _read_u64(desc_addr + _D_BASE)
+    if base == 0:
+        return None, "null descriptor base_addr"
+    elem_len = _read_i64(desc_addr + _D_ELEM_LEN)
+    los, extents, strides = [], [], []
+    for d in range(rank):
+        b = desc_addr + _D_DIM0 + _D_DIM * d
+        st = _read_i64(b)
+        lb = _read_i64(b + 8)
+        ub = _read_i64(b + 16)
+        los.append(lb)
+        extents.append(ub - lb + 1)
+        strides.append(st * elem_len)
+    if any(e < 0 for e in extents):
+        return None, "negative extent in descriptor: {}".format(extents)
+    return {"addr": base, "elsize": elem_type.sizeof, "dtype": dt,
+            "los": los, "extents": extents, "strides": strides}, None
+
+
+def _capture_abi(scheme, hit, name, sym, idx, frame, info):
+    """Recover a stack-passed dummy whose DWARF location gfortran dropped,
+    reading it straight from the ABI argument slot. Fills `info` exactly like
+    handle_entry's normal path, so the exit re-read and differ are unchanged."""
+    if name.startswith("_"):              # gfortran hidden character-length arg
+        info["why"] = "hidden character-length arg (by value)"
+        return
+    st = sym.type.strip_typedefs()
+    if is_character(st):
+        info["why"] = "character arg via ABI not captured"
+        return
+    slot = _frame_base(frame) + STACK_ARG0 + 8 * (idx - N_INT_REG - 1)
+    ptr = _read_u64(slot)                 # by reference: descriptor/value pointer
+    info["abi"] = True
+    if st.code == gdb.TYPE_CODE_ARRAY:
+        elem = _element_type(st)
+        if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+            info["why"] = "derived-type array via ABI not captured"
+            return
+        plan, err = _descriptor_plan(ptr, elem)
+        if plan is None:
+            info["kind"] = "error"
+            info["why"] = "abi: " + err
+            return
+        info["kind"] = "array"
+        info["dtype"] = plan["dtype"]
+        info["los"] = plan["los"]
+        info["extents"] = plan["extents"]
+        info["strides"] = plan["strides"]
+        info["plan"] = plan
+        info["entry_file"] = write_blob(
+            scheme, hit, name, "in", read_array(plan))
+    elif st.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+        info["why"] = "derived-type arg via ABI not captured"
+    else:
+        dt = dtype_of(st)
+        if dt is None:
+            info["kind"] = "error"
+            info["why"] = "abi: unsupported scalar type: {}".format(st)
+            return
+        info["kind"] = "scalar"
+        info["dtype"] = dt
+        info["addr"] = ptr
+        info["entry_value"] = read_scalar(ptr, dt)
+
+
 def handle_entry(scheme, frame):
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
@@ -247,7 +374,7 @@ def handle_entry(scheme, frame):
     rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
            "caller": caller, "args": {}}
     frame.select()
-    for sym in arg_symbols(frame):
+    for idx, sym in enumerate(arg_symbols(frame), start=1):
         name = sym.name
         info = {"kind": "skipped"}
         rec["args"][name] = info
@@ -290,6 +417,17 @@ def handle_entry(scheme, frame):
             else:
                 info["why"] = "unsupported type: {}".format(t)
         except Exception as exc:
+            # gfortran -O0 drops the DWARF location of stack-passed dummies of
+            # very large subroutines; recover those (declaration index > 6)
+            # straight from the ABI argument slots.
+            if idx > N_INT_REG:
+                try:
+                    _capture_abi(scheme, hit, name, sym, idx, frame, info)
+                    continue
+                except Exception as exc2:
+                    info["kind"] = "error"
+                    info["why"] = "abi fallback failed: {}".format(exc2)
+                    continue
             info["kind"] = "error"
             info["why"] = str(exc)
     MANIFEST["hits"].append(rec)

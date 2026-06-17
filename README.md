@@ -70,16 +70,18 @@ Copy aside any logs you want to keep before running.
    `$DROPSONDE_CONFIG`).
 2. `dropsonde_gdb.py` breaks on every `<scheme>_run`. gdb's prologue skip
    stops inside gfortran's dummy-argument descriptor setup, where the
-   dummies aren't readable yet and single-stepping can't escape (the setup
-   cycles — `park_macrophysics`, ~66 dummies, never clears). So it instead
-   `advance`s to the first body statement (`errmsg=''`/`errflg=0`, located
-   by scanning the source from the subroutine's definition line), where
-   every dummy is live and no input has been touched. It then walks the
-   frame's dummy arguments, probes each array's base address and
-   per-subscript byte strides empirically (element-address arithmetic, so
-   strided actual args like `state%q(:ncol,:,m)` are handled), dumps raw
-   bytes, and plants a `FinishBreakpoint` that re-reads the same addresses
-   at scheme exit. Every hit is tagged with the current timestep (sentinel
+   dummies aren't readable yet and single-stepping doesn't reliably escape.
+   So it instead `advance`s to the first body statement (`errmsg=''`/
+   `errflg=0`, located by scanning the source from the subroutine's
+   definition line), where every dummy is live and no input has been
+   touched. It then walks the frame's dummy arguments, probes each array's
+   base address and per-subscript byte strides empirically (element-address
+   arithmetic, so strided actual args like `state%q(:ncol,:,m)` are
+   handled), dumps raw bytes, and plants a `FinishBreakpoint` that re-reads
+   the same addresses at scheme exit. Dummies that gfortran's `-O0` debug
+   info fails to locate at all — the stack-passed arguments of very large
+   subroutines — are recovered directly from the System V AMD64 argument
+   slots instead. Every hit is tagged with the current timestep (sentinel
    breakpoint on `cam_run1`) and its caller, and the run is killed after
    enough timesteps.
 3. At the first hit it also captures the ordered constituent name lists:
@@ -104,12 +106,23 @@ gdb/gfortran assumptions (gdb 16.2, gfortran 12, Derecho):
 - `set breakpoint pending off` is ignored by the Python API; detect via
   `bp.pending`.
 - gdb's prologue skip lands the scheme breakpoint inside the argument-
-  descriptor setup, where dummies raise "Location address is not set". On
-  large subroutines (`park_macrophysics`, ~66 dummies) this setup cycles and
-  single-stepping never escapes it — confirmed identical on `-O0` and
-  optimized builds. `advance` to the body's first statement instead (found
-  by scanning the source for `errmsg=''`/`errflg=0` from the subroutine's
-  definition line); all dummies are live there, with inputs untouched.
+  descriptor setup, where dummies raise "Location address is not set" and
+  single-stepping doesn't reliably escape. `advance` to the body's first
+  statement instead (found by scanning the source for `errmsg=''`/`errflg=0`
+  from the subroutine's definition line); dummies are live there, with
+  inputs untouched.
+- Very large subroutines (`park_macrophysics_run`: 66 dummies, ~1500 lines,
+  a ~30 KB automatic-array frame) defeat gfortran `-O0` debug info outright:
+  it emits an *empty* `DW_AT_location` for every stack-passed dummy (the
+  first 6, register-passed, still resolve), so gdb can't read them by name
+  anywhere in the routine — not a stopping-point problem. The capture falls
+  back to the System V AMD64 ABI: dummy `i` (declaration order, `i>6`) is the
+  pointer at `[rbp + 16 + 8*(i-7)]` — a gfortran array descriptor for
+  assumed-shape args, a value pointer for scalars. The descriptor (`base_addr`
+  `+0`, `elem_len` `+16`, `rank` `+28`, `dim[]` `+40`) yields the same base/
+  extents/strides the normal path probes. Assumes all-by-reference dummies;
+  by-value float args (which shift the integer-register accounting) aren't
+  handled.
 - Deferred-length character components: length is in a hidden
   `_<name>_length` member, not the DWARF type.
 - Use `module::var` spelling for globals.
