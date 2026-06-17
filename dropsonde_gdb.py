@@ -204,33 +204,33 @@ def arg_symbols(frame):
 
 
 def _args_ready(frame):
-    """True once every numeric-array dummy resolves to a base element
-    address, i.e. gfortran has finished wiring its descriptor.
+    """True once no dummy still reports an unmaterialized descriptor.
 
-    Classification mirrors handle_entry and uses the FRAME-evaluated value
-    type: the static symbol type does not resolve assumed-shape dummies to
-    TYPE_CODE_ARRAY (the shape lives in the runtime descriptor), so static
-    typing would skip every array and gate on nothing. Args whose value is
-    not yet evaluable (e.g. optimized-out scalars), character arrays, and
-    derived-type arrays (const_props) are skipped so they never gate.
+    Type classification can't drive this: gfortran wires each assumed-shape
+    dummy's descriptor in code attributed to its argument-list line, and
+    until we step past that line BOTH evaluating the value (`sym.value`) and
+    taking an element address raise "Location address is not set" -- so the
+    arg can't even be typed as an array yet, and the static symbol type does
+    not flag it as one either. Instead we watch that error directly: it
+    clears with more stepping, so it gates. Errors that never clear -- e.g.
+    an optimized-out scalar ("value has been optimized out") -- do not, so
+    they must not stall the loop.
     """
     for sym in arg_symbols(frame):
         try:
             val = sym.value(frame)
             t = val.type.strip_typedefs()
-        except Exception:
+            if t.code == gdb.TYPE_CODE_ARRAY and not is_character(t):
+                dims, base = array_dims(t)
+                if dtype_of(base) is not None:
+                    if DIM_ORDER == "reversed":
+                        dims = dims[::-1]
+                    elem_addr(sym.name, [d[0] for d in dims])
+        except Exception as exc:
+            if "Location address is not set" in str(exc):
+                return False
+            # other failures (optimized-out scalars, etc.) never clear
             continue
-        if t.code != gdb.TYPE_CODE_ARRAY or is_character(t):
-            continue
-        dims, base = array_dims(t)
-        if dtype_of(base) is None:
-            continue
-        if DIM_ORDER == "reversed":
-            dims = dims[::-1]
-        try:
-            elem_addr(sym.name, [d[0] for d in dims])
-        except Exception:
-            return False
     return True
 
 

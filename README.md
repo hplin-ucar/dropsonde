@@ -103,10 +103,13 @@ gdb/gfortran assumptions (gdb 16.2, gfortran 12, Derecho):
 - Array dims are REVERSED in the gdb Python API.
 - `set breakpoint pending off` is ignored by the Python API; detect via
   `bp.pending`.
-- Post-prologue stop precedes dummy descriptor/bound materialization;
-  step (`next`) until every numeric-array dummy resolves. Short argument
-  lists need one `next`; long ones (e.g. `park_macrophysics`) need more,
-  capped by `ARG_SETUP_MAX_STEPS` and bailed if the scheme frame is left.
+- Post-prologue stop precedes dummy descriptor/bound materialization. Until
+  the descriptor is wired, even `sym.value()` on the dummy raises "Location
+  address is not set" (so the arg can't be typed as an array yet). Step
+  (`next`) until that error clears for every dummy; errors that never clear
+  ("value has been optimized out") don't gate. Short argument lists need one
+  `next`; long ones (e.g. `park_macrophysics`) need more, capped by
+  `ARG_SETUP_MAX_STEPS` and bailed if the scheme frame is left.
 - Deferred-length character components: length is in a hidden
   `_<name>_length` member, not the DWARF type.
 - Use `module::var` spelling for globals.
