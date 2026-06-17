@@ -7,9 +7,14 @@ dumps all scheme arguments to disk, and diffs them byte-for-byte.
 
 ## Usage
 
+1. Build the models: `DEBUG=TRUE,NTASKS=1,NTHRDS=1`, chunks disabled for CAM.
+   **Important:** CAM and CAM-SIMA must be running the same underlying atmos_phys code.
+2. Run `./preview_namelists`.
+3. Run `dropsonde` where it is checked out: point it to the case directories on scratch with the SDF file:
+
 ```
-./dropsonde --cam  /glade/derecho/scratch/.../cam_case  \
-            --sima /glade/derecho/scratch/.../sima_case \
+./dropsonde --cam  /glade/derecho/scratch/.../cam_case_dir  \
+            --sima /glade/derecho/scratch/.../sima_case_dir \
             --sdf  suite_park_macrop.xml \
             [--meta-root /path/to/atmospheric_physics] [--steps 1]
 ```
@@ -25,7 +30,7 @@ at entry (caller-side garbage) and `intent(in)` args at exit.
 Run it where the models can run (i.e., a compute node). Both gdb sessions
 launch in parallel; the report prints to stdout when they finish.
 
-Everything lands in `--out` (default `./dropsonde_out`):
+Everything is written out in `--out` (default `./dropsonde_out`):
 
 ```
 report.txt    the printed report, archived verbatim
