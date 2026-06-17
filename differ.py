@@ -9,8 +9,10 @@
 
 import json
 import os
+import shutil
 import sys
 from array import array
+from datetime import datetime
 
 # CAM short name -> CCPP standard name, used to match constituent indices
 # between CAM's cnst_name(:) and CAM-SIMA's registered standard names.
@@ -532,10 +534,35 @@ class _Tee(object):
             st.flush()
 
 
+def _archive_report(outdir, report_path):
+    """Copy report.txt to a sibling reports/ directory (next to <out>, so it
+    survives emptying the dump directory) under a timestamped, SDF-named
+    filename. Returns the destination path, or None if it couldn't be
+    written."""
+    try:
+        sdf = json.load(
+            open(os.path.join(outdir, "suite.json"))).get("sdf", "")
+    except (IOError, ValueError):
+        sdf = ""
+    sdf_name = os.path.splitext(os.path.basename(sdf))[0] or "unknown"
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    reports_dir = os.path.join(os.path.dirname(outdir), "reports")
+    dest = os.path.join(
+        reports_dir, "dropsonde_report_{}_{}.txt".format(sdf_name, stamp))
+    try:
+        os.makedirs(reports_dir, exist_ok=True)
+        shutil.copyfile(report_path, dest)
+    except (IOError, OSError) as e:
+        print("(could not archive report to {}: {})".format(dest, e))
+        return None
+    return dest
+
+
 def report(outdir, suite_order, steps, intents=None):
     """Run the comparison; everything printed is also archived to
     <out>/report.txt so it can be re-read (or regenerated after editing
-    differ.py) without re-running the models: python3 differ.py <out>."""
+    differ.py) without re-running the models: python3 differ.py <out>. A
+    timestamped, SDF-named copy is also kept in a sibling reports/ directory."""
     path = os.path.join(outdir, "report.txt")
     old = sys.stdout
     try:
@@ -545,6 +572,9 @@ def report(outdir, suite_order, steps, intents=None):
     finally:
         sys.stdout = old
     print("(report archived to {})".format(path))
+    dest = _archive_report(outdir, path)
+    if dest:
+        print("(report copied to {})".format(dest))
     return ok
 
 
