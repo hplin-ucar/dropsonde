@@ -239,6 +239,8 @@ Dropsonde was created in a session with Claude Mythos/Fable 5 in a discussion
 about programmatically operating gdb to automate the discovery of answer
 differences between CAM and CAM-SIMA.
 
-Later improvements were added by Claude Opus 4.6.
+Later improvements were added by Claude Opus 4.6 and Claude Opus 4.8.
 
 The supervising human was Haipeng Lin <hplin@ucar.edu>, NSF NCAR/CGD/AMP.
+
+(c) 2026 University Corporation for Atmospheric Research.
