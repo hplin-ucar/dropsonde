@@ -1,6 +1,9 @@
 #!/bin/bash
-# Run the dropsonde_gdb.py micro-calibration on a machine with gdb+gfortran.
-# Usage: bash cal_run.sh   (expects cal.f90 and dropsonde_gdb.py in cwd)
+# Run the dropsonde_gdb.py micro-calibration on a machine with gdb + a
+# Fortran compiler. Usage: bash cal_run.sh   (expects cal.f90 and
+# dropsonde_gdb.py in cwd). Compiler selectable via $FC (default gfortran);
+# both gfortran and ifort accept -g -O0. Used to calibrate per machine
+# (Derecho gfortran, Izumi Intel, ...).
 #
 # Expected when everything works:
 #   cam role  (kill_after_steps=1): outer+inner step-1 hits only, then
@@ -11,7 +14,9 @@
 #             CHECK a = (1,2,3,5,6,7,9,10,11); all CHECK b == 2a: True;
 #             3 constituent names std_name_1..3
 set -e
-gfortran -g -O0 -o cal cal.f90
+FC=${FC:-gfortran}
+echo "=== compiling cal.f90 with $FC ==="
+$FC -g -O0 -o cal cal.f90
 KILL_cam=1
 KILL_sima=0
 for role in cam sima; do
@@ -21,7 +26,12 @@ for role in cam sima; do
 {"role": "$role", "out_dir": "$PWD/out_$role",
  "schemes": ["inner", "outer"], "kill_after_steps": $kill_steps}
 EOF
+  # -u PYTHONHOME/PYTHONPATH: some sites (e.g. Izumi) point these at an
+  # anaconda whose stdlib version mismatches gdb's embedded Python, which
+  # then aborts with "No module named 'encodings'". dropsonde's gdb side is
+  # stdlib-only, so stripping them is always safe.
   DROPSONDE_CONFIG=$PWD/out_$role/config.json \
+    env -u PYTHONHOME -u PYTHONPATH \
     gdb --batch -x dropsonde_gdb.py ./cal > out_$role/gdb.log 2>&1 || true
 done
 echo "=== cam gdb.log ==="; cat out_cam/gdb.log
