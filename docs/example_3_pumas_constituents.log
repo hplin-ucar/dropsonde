@@ -1,0 +1,63 @@
+./dropsonde --cam /glade/derecho/scratch/hplin/260617.camdev64_182.QPC7.ne3.snapshot.gnu.dbg.nochnk --sima /glade/derecho/scratch/hplin/260617.sima.FPHYStest.pumas.ne3.gnu --sd
+f /glade/derecho/scratch/hplin/260617_pumas_debug/CAM-SIMA.dev/src/physics/ncar_ccpp/test/test_suites/suite_pumas.xml
+dropsonde: 10 scheme calls per timestep in SDF (10 unique)
+dropsonde: intents for 7/10 schemes (357 args) from .meta under /glade/derecho/scratch/hplin/260617_pumas_debug/CAM-SIMA.dev/src/physics/ncar_ccpp
+dropsonde: cam run launched (pid 53742, log /glade/derecho/scratch/hplin/dropsonde/dropsonde_out/cam/gdb.log)
+dropsonde: sima run launched (pid 53743, log /glade/derecho/scratch/hplin/dropsonde/dropsonde_out/sima/gdb.log)
+dropsonde: waiting for runs to finish ...
+
+================================================================
+dropsonde report  (/glade/derecho/scratch/hplin/dropsonde/dropsonde_out)
+================================================================
+schemes: 1 compared
+  SIMA-only (no CAM symbol, not compared): initialize_constituents, micro_pumas_ccpp_dimensions_pre, micro_pumas_ccpp_dimensions_post, apply_constituent_tendencies, apply_heating_rate, clamp_number_concentrations
+  unresolved in both: to_be_ccppized_temporary, clubb_stub, pumas_pre_main
+
+constituent mapping (CAM 11 species, SIMA 13):
+  cam q(:,:, 1) Q                <-> sima q(:,:, 4) water_vapor_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 2) CLDLIQ           <-> sima q(:,:, 2) cloud_liquid_water_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 3) CLDICE           <-> sima q(:,:, 1) cloud_ice_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 4) NUMLIQ           <-> sima q(:,:, 7) mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water
+  cam q(:,:, 5) NUMICE           <-> sima q(:,:, 6) mass_number_concentration_of_ice_wrt_moist_air_and_condensed_water
+  cam q(:,:, 6) RAINQM           <-> sima q(:,:, 8) rain_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 7) SNOWQM           <-> sima q(:,:,10) snow_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 8) NUMRAI           <-> sima q(:,:, 9) mass_number_concentration_of_rain_wrt_moist_air_and_condensed_water
+  cam q(:,:, 9) NUMSNO           <-> sima q(:,:,11) mass_number_concentration_of_snow_wrt_moist_air_and_condensed_water
+  cam q(:,:,10) GRAUQM           <-> sima q(:,:, 3) graupel_water_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:,11) NUMGRA           <-> sima q(:,:,13) mass_number_concentration_of_graupel_wrt_moist_air_and_condensed_water
+  sima q(:,:, 5) mass_number_concentration_of_cloud_liquid_water_wrt_moist_air_and_condensed_water (unmatched, not compared)
+  sima q(:,:,12) mass_number_concentration_of_cloud_ice_wrt_moist_air_and_condensed_water (unmatched, not compared)
+
+call alignment (hits per compared step; sima step t pairs with cam step t+1;
+indented rows are calls made from inside the parent scheme):
+  micro_pumas_ccpp   sima x1   cam x1
+
+comparison (execution order):
+
+FIRST DIVERGENCE -----------------------------------------------
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_numliq: 28188/28188 elements differ, max |diff| 6.498e+07 at (208,36): sima=0 cam=64978883.821524113
+----------------------------------------------------------------
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_numice: 28188/28188 elements differ, max |diff| 5.955e+05 at (201,28): sima=0 cam=595530.6096265011
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_numrain: 28188/28188 elements differ, max |diff| 1.115e+06 at (70,54): sima=0 cam=1114690.4985518879
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_numsnow: 28188/28188 elements differ, max |diff| 3.389e+03 at (415,55): sima=0 cam=3388.657623429518
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_numgraup: 28188/28188 elements differ, max |diff| 4.427e+02 at (139,28): sima=0 cam=442.67857812209826
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_strat_liq_cldfrc: 13464/28188 elements differ, max |diff| 9.990e-01 at (199,12): sima=0 cam=0.999
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_strat_ice_cldfrc: 1768/28188 elements differ, max |diff| 1.000e+00 at (70,57): sima=0 cam=1
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_qsatfac: 28188/28188 elements differ, max |diff| 1.000e+00 at (1,1): sima=0 cam=1
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_naai: 812/28188 elements differ, max |diff| 1.031e+02 at (289,29): sima=0 cam=103.07385026541536
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_npccn: 28188/28188 elements differ, max |diff| 3.610e+04 at (208,36): sima=0 cam=-36099.379900846732
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_snowice_tend_external: 28188/28188 elements differ, max |diff| inf at (1,1): sima=2.8620201130581657e-25 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_numsnow_tend_external: 28188/28188 elements differ, max |diff| inf at (1,1): sima=9.9999999999999998e-13 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_effi_external: 28188/28188 elements differ, max |diff| inf at (1,1): sima=25 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_frzimm: 28188/28188 elements differ, max |diff| inf at (1,1): sima=0 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_frzcnt: 28188/28188 elements differ, max |diff| inf at (1,1): sima=0 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_frzdep: 28188/28188 elements differ, max |diff| inf at (1,1): sima=0 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg _micro_mg_warm_rain: sima=256 cam=16
+  [note] micro_pumas_ccpp [step 1] (hit 0): exit comparison suppressed for 1 args with differing inputs: _micro_mg_warm_rain
+
+*** WARNING: the very first compared scheme already has input differences.
+*** Timestep alignment or initial conditions are suspect; check snapshot setup
+*** before believing any divergence below the first scheme.
+offset scan: entry args of micro_pumas_ccpp (sima step 1) vs every dumped step:
+  vs cam  step 1: 10/39 args bitwise identical
+  vs cam  step 2: 22/39 args bitwise identical

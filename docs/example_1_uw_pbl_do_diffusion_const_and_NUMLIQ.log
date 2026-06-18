@@ -1,0 +1,118 @@
+./dropsonde --sima /glade/derecho/scratch/hplin/260612.sima.FPHYStest.uw_pbl.ne3.gnu --cam /glade/derecho/scratch/hplin/260612.cam64_181.FHIST_C5.ne3.gnu --sdf /glade/derecho/scratch/hplin/260612_gdbtool_test/CAM-SIMA/src/physics/ncar_ccpp/test/test_suites/suite_vdiff_bretherton_park.xml
+dropsonde: 34 scheme calls per timestep in SDF (34 unique)
+dropsonde: intents for 29/34 schemes (529 args) from .meta under /glade/derecho/scratch/hplin/260612_gdbtool_test/CAM-SIMA/src/physics/ncar_ccpp
+dropsonde: cam run launched (pid 29090, log /glade/u/home/hplin/dropsonde/dropsonde_out/cam/gdb.log)
+dropsonde: sima run launched (pid 29100, log /glade/u/home/hplin/dropsonde/dropsonde_out/sima/gdb.log)
+dropsonde: waiting for runs to finish ...
+
+================================================================
+dropsonde report  (/glade/u/home/hplin/dropsonde/dropsonde_out)
+================================================================
+schemes: 21 compared
+  SIMA-only (no CAM symbol, not compared): initialize_constituents, bretherton_park_diff_diagnostics, vertical_diffusion_tendencies_diagnostics, apply_tendency_of_northward_wind, apply_tendency_of_eastward_wind, apply_constituent_tendencies, apply_heating_rate, qneg
+  unresolved in both: to_be_ccppized_temporary, vertical_diffusion_options, zero_upper_boundary_condition, hb_diff_set_vertical_diffusion_top, vertical_diffusion_not_use_rairv
+
+constituent mapping (CAM 25 species, SIMA 25):
+  cam q(:,:, 1) Q                <-> sima q(:,:,21) water_vapor_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 2) CLDLIQ           <-> sima q(:,:, 3) cloud_liquid_water_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 3) CLDICE           <-> sima q(:,:,19) cloud_ice_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 4) NUMLIQ           <-> sima q(:,:,12) mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water
+  cam q(:,:, 5) NUMICE           <-> sima q(:,:, 1) mass_number_concentration_of_ice_wrt_moist_air_and_condensed_water
+  cam q(:,:, 6) H2O2             <-> sima q(:,:,13) cnst_H2O2
+  cam q(:,:, 7) H2SO4            <-> sima q(:,:,16) cnst_H2SO4
+  cam q(:,:, 8) SO2              <-> sima q(:,:,24) cnst_SO2
+  cam q(:,:, 9) DMS              <-> sima q(:,:,20) cnst_DMS
+  cam q(:,:,10) SOAG             <-> sima q(:,:, 7) cnst_SOAG
+  cam q(:,:,11) so4_a1           <-> sima q(:,:,15) cnst_so4_a1
+  cam q(:,:,12) pom_a1           <-> sima q(:,:, 6) cnst_pom_a1
+  cam q(:,:,13) soa_a1           <-> sima q(:,:,10) cnst_soa_a1
+  cam q(:,:,14) bc_a1            <-> sima q(:,:,17) cnst_bc_a1
+  cam q(:,:,15) dst_a1           <-> sima q(:,:, 4) cnst_dst_a1
+  cam q(:,:,16) ncl_a1           <-> sima q(:,:,18) cnst_ncl_a1
+  cam q(:,:,17) num_a1           <-> sima q(:,:, 9) cnst_num_a1
+  cam q(:,:,18) so4_a2           <-> sima q(:,:, 5) cnst_so4_a2
+  cam q(:,:,19) soa_a2           <-> sima q(:,:,22) cnst_soa_a2
+  cam q(:,:,20) ncl_a2           <-> sima q(:,:,11) cnst_ncl_a2
+  cam q(:,:,21) num_a2           <-> sima q(:,:,23) cnst_num_a2
+  cam q(:,:,22) dst_a3           <-> sima q(:,:, 8) cnst_dst_a3
+  cam q(:,:,23) ncl_a3           <-> sima q(:,:,14) cnst_ncl_a3
+  cam q(:,:,24) so4_a3           <-> sima q(:,:,25) cnst_so4_a3
+  cam q(:,:,25) num_a3           <-> sima q(:,:, 2) cnst_num_a3
+
+call alignment (hits per compared step; sima step t pairs with cam step t+1;
+indented rows are calls made from inside the parent scheme):
+  beljaars_zero_stub                                     sima x1   cam x0    <-- no CAM hits: not compared
+  vertical_diffusion_prepare_inputs                      sima x1   cam x1
+  hb_diff_prepare_vertical_diffusion_inputs              sima x1   cam x1
+  vertical_diffusion_set_temperature_at_toa_default      sima x1   cam x0    <-- no CAM hits: not compared
+  vertical_diffusion_interpolate_to_interfaces           sima x1   cam x1
+  vertical_diffusion_set_total_surface_stress            sima x1   cam x0    <-- no CAM hits: not compared
+  bretherton_park_diff                                   sima x1   cam x1
+      implicit_surface_stress_add_drag_coefficient       sima x1   cam x1
+      turbulent_mountain_stress_add_drag_coefficient     sima x1   cam x1
+      vertical_diffusion_wind_damping_rate               sima x1   cam x1
+      vertical_diffusion_diffuse_horizontal_momentum     sima x4   cam x4
+      vertical_diffusion_diffuse_dry_static_energy       sima x4   cam x4
+      vertical_diffusion_diffuse_tracers                 sima x4   cam x4
+  compute_kinematic_fluxes_and_obklen                    sima x1   cam x1
+  eddy_diffusivity_adjustment_above_pbl                  sima x1   cam x1
+  vertical_diffusion_sponge_layer                        sima x1   cam x1
+  implicit_surface_stress_add_drag_coefficient           sima x1   cam x1
+  turbulent_mountain_stress_add_drag_coefficient         sima x1   cam x1
+  vertical_diffusion_wind_damping_rate                   sima x1   cam x1
+  vertical_diffusion_diffuse_horizontal_momentum         sima x1   cam x1
+  vertical_diffusion_set_dry_static_energy_at_toa_zero   sima x1   cam x0    <-- no CAM hits: not compared
+  vertical_diffusion_diffuse_dry_static_energy           sima x1   cam x1
+  vertical_diffusion_diffuse_tracers                     sima x1   cam x1
+  dropmixnuc_apply_surface_fluxes                        sima x1   cam x0    <-- no CAM hits: not compared
+  vertical_diffusion_tendencies                          sima x1   cam x1
+  geopotential_temp                                      sima x1   cam x20   <-- hit counts differ: paired by bitwise input match (see notes)
+  update_dry_static_energy                               sima x1   cam x1
+
+comparison (execution order):
+  [note] vertical_diffusion_diffuse_horizontal_momentum via bretherton_park_diff::bretherton_park_diff_run [step 1] (hit 0): arg dtk: every element the scheme wrote matches; 486 elements were never written in either model (exit == entry bitwise) and still hold each caller's unrelated pre-call memory, so they are not compared
+  [note] vertical_diffusion_diffuse_horizontal_momentum via bretherton_park_diff::bretherton_park_diff_run [step 1] (hit 1): arg dtk: every element the scheme wrote matches; 486 elements were never written in either model (exit == entry bitwise) and still hold each caller's unrelated pre-call memory, so they are not compared
+  [note] vertical_diffusion_diffuse_horizontal_momentum via bretherton_park_diff::bretherton_park_diff_run [step 1] (hit 2): arg dtk: every element the scheme wrote matches; 486 elements were never written in either model (exit == entry bitwise) and still hold each caller's unrelated pre-call memory, so they are not compared
+  [note] vertical_diffusion_diffuse_horizontal_momentum via bretherton_park_diff::bretherton_park_diff_run [step 1] (hit 3): arg dtk: every element the scheme wrote matches; 486 elements were never written in either model (exit == entry bitwise) and still hold each caller's unrelated pre-call memory, so they are not compared
+
+FIRST DIVERGENCE -----------------------------------------------
+  [INPUTS DIFFER] vertical_diffusion_diffuse_tracers [step 1] (hit 0) arg do_diffusion_const: constituent-indexed array, 1/25 mapped species differ: NUMLIQ
+    NUMLIQ (cam idx 4, sima idx 12) <-> mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water: sima=1 cam=0
+----------------------------------------------------------------
+  [INPUTS DIFFER] vertical_diffusion_diffuse_tracers [step 1] (hit 0) arg qmincg: constituent-indexed array, 18/25 mapped species differ: Q, H2O2, H2SO4, SO2, DMS, SOAG, so4_a1, pom_a1, soa_a1, bc_a1, dst_a1, ncl_a1, so4_a2, soa_a2, ncl_a2, dst_a3, ncl_a3, so4_a3
+    Q (cam idx 1, sima idx 21) <-> water_vapor_mixing_ratio_wrt_moist_air_and_condensed_water: sima=9.9999999999999998e-13 cam=0
+    H2O2 (cam idx 6, sima idx 13) <-> cnst_H2O2: sima=0 cam=9.9999999999999994e-37
+    H2SO4 (cam idx 7, sima idx 16) <-> cnst_H2SO4: sima=0 cam=9.9999999999999994e-37
+    SO2 (cam idx 8, sima idx 24) <-> cnst_SO2: sima=0 cam=9.9999999999999994e-37
+    DMS (cam idx 9, sima idx 20) <-> cnst_DMS: sima=0 cam=9.9999999999999994e-37
+    SOAG (cam idx 10, sima idx 7) <-> cnst_SOAG: sima=0 cam=9.9999999999999994e-37
+    so4_a1 (cam idx 11, sima idx 15) <-> cnst_so4_a1: sima=0 cam=9.9999999999999994e-37
+    pom_a1 (cam idx 12, sima idx 6) <-> cnst_pom_a1: sima=0 cam=9.9999999999999994e-37
+    soa_a1 (cam idx 13, sima idx 10) <-> cnst_soa_a1: sima=0 cam=9.9999999999999994e-37
+    bc_a1 (cam idx 14, sima idx 17) <-> cnst_bc_a1: sima=0 cam=9.9999999999999994e-37
+    dst_a1 (cam idx 15, sima idx 4) <-> cnst_dst_a1: sima=0 cam=9.9999999999999994e-37
+    ncl_a1 (cam idx 16, sima idx 18) <-> cnst_ncl_a1: sima=0 cam=9.9999999999999994e-37
+    so4_a2 (cam idx 18, sima idx 5) <-> cnst_so4_a2: sima=0 cam=9.9999999999999994e-37
+    soa_a2 (cam idx 19, sima idx 22) <-> cnst_soa_a2: sima=0 cam=9.9999999999999994e-37
+    ncl_a2 (cam idx 20, sima idx 11) <-> cnst_ncl_a2: sima=0 cam=9.9999999999999994e-37
+    dst_a3 (cam idx 22, sima idx 8) <-> cnst_dst_a3: sima=0 cam=9.9999999999999994e-37
+    ncl_a3 (cam idx 23, sima idx 14) <-> cnst_ncl_a3: sima=0 cam=9.9999999999999994e-37
+    so4_a3 (cam idx 24, sima idx 25) <-> cnst_so4_a3: sima=0 cam=9.9999999999999994e-37
+  [OUTPUTS DIFFER] vertical_diffusion_diffuse_tracers [step 1] (hit 0) arg q1: constituent-indexed array, 1/25 mapped species differ: NUMLIQ
+    NUMLIQ (cam idx 4, sima idx 12) <-> mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water: 1938/14580 elements differ, max |diff| 7.127e+07 at (34,26): sima=108545916.40926519 cam=179815625.15062433
+  [INPUTS DIFFER] vertical_diffusion_tendencies [step 1] (hit 0) arg q1: constituent-indexed array, 1/25 mapped species differ: NUMLIQ
+    NUMLIQ (cam idx 4, sima idx 12) <-> mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water: 1938/14580 elements differ, max |diff| 7.127e+07 at (34,26): sima=108545916.40926519 cam=179815625.15062433
+  [OUTPUTS DIFFER] vertical_diffusion_tendencies [step 1] (hit 0) arg tend_q: constituent-indexed array, 1/25 mapped species differ: NUMLIQ
+    NUMLIQ (cam idx 4, sima idx 12) <-> mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water: 1938/14580 elements differ, max |diff| 3.959e+04 at (34,26): sima=-39594.282634088413 cam=0
+  [note] geopotential_temp [step 1] (hit 0): NO cam hit with matching inputs among 20 candidates (closest: occurrence 17, 19/20 args match); not compared
+  [INPUTS DIFFER] update_dry_static_energy [step 1] (hit 0) arg temp: 14580/14580 elements differ, max |diff| 5.874e+00 at (473,30): sima=259.25379811136605 cam=253.38013043436015
+  [INPUTS DIFFER] update_dry_static_energy [step 1] (hit 0) arg zm: 14580/14580 elements differ, max |diff| 1.662e+01 at (195,1): sima=37353.730380665911 cam=37337.106347836481
+  [OUTPUTS DIFFER] update_dry_static_energy [step 1] (hit 0) arg st_energy: 14580/14580 elements differ, max |diff| 5.913e+03 at (473,30): sima=261066.02606387401 cam=255152.58206947322
+
+8 differing comparisons across 30 hit pairs.
+per-scheme: 18/21 compared schemes bit-for-bit; differing:
+  vertical_diffusion_diffuse_tracers: 2 input / 1 output diffs
+  vertical_diffusion_tendencies: 1 input / 1 output diffs
+  update_dry_static_energy: 2 input / 1 output diffs
+Raw dumps and entry-time addresses are in the manifests for manual gdb follow-up.
+(report archived to /glade/u/home/hplin/dropsonde/dropsonde_out/report.txt)
