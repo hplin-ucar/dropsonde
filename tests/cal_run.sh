@@ -1,6 +1,7 @@
 #!/bin/bash
 # Run the dropsonde_gdb.py micro-calibration on a machine with gdb+gfortran.
-# Usage: bash cal_run.sh   (expects cal.f90 and dropsonde_gdb.py in cwd)
+# Usage: bash cal_run.sh   (run from anywhere; cal.f90 is located next to
+#        this script and dropsonde_gdb.py in the repo root above it)
 #
 # Expected when everything works:
 #   cam role  (kill_after_steps=1): outer+inner step-1 hits only, then
@@ -11,7 +12,8 @@
 #             CHECK a = (1,2,3,5,6,7,9,10,11); all CHECK b == 2a: True;
 #             3 constituent names std_name_1..3
 set -e
-gfortran -g -O0 -o cal cal.f90
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+gfortran -g -O0 -o cal "$SCRIPT_DIR/cal.f90"
 KILL_cam=1
 KILL_sima=0
 for role in cam sima; do
@@ -22,7 +24,7 @@ for role in cam sima; do
  "schemes": ["inner", "outer"], "kill_after_steps": $kill_steps}
 EOF
   DROPSONDE_CONFIG=$PWD/out_$role/config.json \
-    gdb --batch -x dropsonde_gdb.py ./cal > out_$role/gdb.log 2>&1 || true
+    gdb --batch -x "$SCRIPT_DIR/../dropsonde_gdb.py" ./cal > out_$role/gdb.log 2>&1 || true
 done
 echo "=== cam gdb.log ==="; cat out_cam/gdb.log
 echo "=== sima gdb.log ==="; cat out_sima/gdb.log

@@ -1,5 +1,7 @@
 # dropsonde
 
+![a lovely squid representing the SIMA project flying with a dropsonde](dropsonde_logo.png)
+
 Find the first CCPP scheme where CAM and CAM-SIMA physics answers diverge,
 without modifying or recompiling either model. Runs both executables under
 gdb with breakpoints at every scheme `_run` entry/exit listed in the SDF,
