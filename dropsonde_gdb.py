@@ -210,6 +210,9 @@ def arg_symbols(frame):
     return [s for s in blk if s.is_argument]
 
 
+_END_SUB_RE = re.compile(r"^\s*end\s+subroutine\b", re.I)
+
+
 def _first_body_line(scheme, frame):
     """(filename, line) of the first executable statement of the scheme's
     body, or None. Dummy arguments are only reliably readable once execution
@@ -217,7 +220,10 @@ def _first_body_line(scheme, frame):
     drive loop advances here before capturing. CCPP subroutines open with
     errmsg=''/errflg=0; we scan the source from the subroutine's OWN
     definition line (so a sibling subroutine earlier in the same file -- e.g.
-    the _init above _run -- is not matched). Result is cached per scheme."""
+    the _init above _run -- is not matched). Stop at 'end subroutine' so
+    schemes that lack the errmsg idiom don't match a sibling's body line
+    (which would cause advance to overshoot into the caller frame).
+    Result is cached per scheme."""
     if scheme in _BODY_LINE:
         return _BODY_LINE[scheme]
     result = None
@@ -227,6 +233,8 @@ def _first_body_line(scheme, frame):
         with open(fname) as fh:
             lines = fh.readlines()
         for idx in range(start - 1, len(lines)):
+            if _END_SUB_RE.match(lines[idx]):
+                break
             if _ERR_INIT_RE.match(lines[idx]):
                 result = (fname, idx + 1)
                 break
@@ -690,6 +698,19 @@ def main():
                     gdb.execute("advance {}:{}".format(
                         os.path.basename(body[0]), body[1]))
                     frame = gdb.newest_frame()
+                    # Safety: if advance hit the frame-exit stop (target
+                    # was unreachable), we're now in the caller -- fall
+                    # back to capturing from wherever we are, but warn.
+                    fn = frame.function()
+                    if fn and entry.scheme + "_run" not in fn.name:
+                        note("{}: advance escaped frame (now in {}); "
+                             "skipping capture".format(
+                                 entry.scheme, fn.name))
+                        try:
+                            gdb.execute("continue")
+                        except gdb.error:
+                            break
+                        continue
                 except gdb.error as exc:
                     note("{}: advance to body line {} failed: {}".format(
                         entry.scheme, body[1], exc))
