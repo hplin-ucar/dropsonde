@@ -111,6 +111,12 @@ def launch(role, casedir, schemes, outdir, kill_after_steps):
                    "kill_after_steps": kill_after_steps}, f, indent=1)
 
     env = dict(os.environ, DROPSONDE_CONFIG=cfgpath)
+    # Some sites (e.g. Izumi) point PYTHONHOME/PYTHONPATH at an anaconda whose
+    # stdlib version mismatches gdb's embedded Python, which then aborts with
+    # "No module named 'encodings'". dropsonde's gdb side is stdlib-only, so
+    # stripping them is always safe.
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONPATH", None)
     logpath = os.path.join(roledir, "gdb.log")
     log = open(logpath, "w")
     proc = subprocess.Popen(

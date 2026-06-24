@@ -58,17 +58,23 @@ Copy aside any logs you want to keep before running.
 
 - Case dirs contain `bld/cesm.exe` and a populated `run/` directory
   (`preview_namelists` already run).
-- CAM: GNU, `DEBUG=TRUE`, `NTASKS=1`, `NTHRDS=1`, dechunked
+- CAM: GNU or Intel, `DEBUG=TRUE`, `NTASKS=1`, `NTHRDS=1`, dechunked
   (`pcols` = total columns). Must call the same CCPPized
   `atmospheric_physics` routines as the SIMA build.
-- CAM-SIMA: GNU, `DEBUG=TRUE`, single rank.
+- CAM-SIMA: GNU or Intel, `DEBUG=TRUE`, single rank. Both runs must use
+  the same compiler (caller symbols and constituent capture are matched
+  across the pair). The compiler is auto-detected from the DWARF producer
+  string; no flag needed. NAG is not yet supported (see Known limitations).
 - `STOP_N` only needs to be *long enough* (CAM's 6-step coupling minimum
   is fine): each gdb session counts timesteps via a sentinel breakpoint on
   `cam_run1` and kills its run once it has what it needs (CAM:
   `--steps + 1` timesteps, SIMA: `--steps`).
 - `gdb` on PATH. No numpy needed anywhere — gdb side and differ are
   stdlib-only, Python >= 3.6 (works with gdb's embedded interpreter and
-  `/usr/bin/python3` on Derecho).
+  `/usr/bin/python3` on Derecho). Calibrated on gdb 16.2 (Derecho) and
+  gdb 8.2 (Izumi). dropsonde strips `PYTHONHOME`/`PYTHONPATH` when it
+  launches gdb, so a site anaconda on those vars (e.g. Izumi) does not
+  crash gdb's embedded interpreter with `No module named 'encodings'`.
 
 ## How it works
 
@@ -107,6 +113,11 @@ Copy aside any logs you want to keep before running.
    entry-garbage and input-repeated-at-exit noise;
    `errmsg`/`errflg`/`iulog` are never compared.
 
+The compiler is auto-detected at the first scheme hit from the DWARF
+producer string (`symtab.producer`: "GNU Fortran ..." / "Intel(R)
+Fortran ...") and selects the memory-layout-specific paths below; the
+by-name element-address probing is identical for both.
+
 gdb/gfortran assumptions (gdb 16.2, gfortran 12, Derecho):
 
 - Array dims are REVERSED in the gdb Python API.
@@ -133,6 +144,25 @@ gdb/gfortran assumptions (gdb 16.2, gfortran 12, Derecho):
 - Deferred-length character components: length is in a hidden
   `_<name>_length` member, not the DWARF type.
 - Use `module::var` spelling for globals.
+
+Intel assumptions (gdb 8.2, ifort 19.1, Izumi):
+
+- Symbols are mangled `module_mp_<proc>_`; gdb demangles them to
+  `module::<proc>`, which the bare name does not resolve to. Breakpoints
+  fall back to the qualified spelling found by listing the symbol table
+  (`info functions \b<proc>\b` → `module::<proc>`) — module-agnostic, so a
+  scheme whose `_run` lives in a differently named module still resolves.
+- Dummies are live right at the entry breakpoint (no descriptor-setup
+  prologue to skip); the body `advance` is harmless and still used.
+- gdb 8.2 misreads Intel's array descriptor for the module pointer-array
+  `cam_constituents::const_props` (bogus bounds), so the SIMA constituent
+  names are decoded from raw memory: descriptor `base_addr` `+0`,
+  `elem_len` `+8`; each element's `%prop` points to a properties type whose
+  `var_std_name` (`character(len=:),allocatable`) is laid out inline as
+  `{char *data; size_t len}` (data at the component offset, length `+8`).
+- The System V AMD64 ABI fallback is gfortran-descriptor-specific and so
+  gfortran-only; under Intel it bails with a note rather than misreading a
+  descriptor (Intel has not been observed to drop dummy locations).
 
 ## Reading the report
 
@@ -209,9 +239,14 @@ about a finding requires re-running the models.
 ## Validation
 
 Micro-calibration: `tests/cal.f90` + `tests/cal_run.sh` (any machine
-with gdb + gfortran; Derecho login nodes work) checks breakpoint
+with gdb + a Fortran compiler; Derecho login nodes work) checks breakpoint
 resolution, caller capture, extent/stride probing, and constituent-name
-capture.
+capture. The compiler is selectable via `$FC` (default `gfortran`):
+`FC=ifort bash cal_run.sh`. Passes clean under gfortran (Derecho, gdb
+16.2) and ifort 19.1 (Izumi, gdb 8.2). Under gfortran on gdb 8.2 the SIMA
+constituent names read as `<unreadable>` (that gdb's gfortran deferred-
+length-character support is too old); the gdb 16.2 gfortran path is
+unaffected.
 
 Full-model calibration (2026-06, CAM5 UW PBL suite
 `suite_vdiff_bretherton_park`, ne3, FHIST_C5 vs FPHYStest): all
@@ -225,9 +260,16 @@ noise. A fully-clean model pair has not yet been tested.
 - Derived-type and pointer dummy arguments are skipped (recorded in the
   manifest with reason). CCPP-compliant schemes should not have them,
   except `ccpp_constituent_prop_ptr_t` arrays, which are skipped too.
-- NAG/Izumi unsupported for now: the f2c-style lowering mangles names and
-  loses descriptors. The stride-probe design degrades to needing explicit
-  shapes (e.g. from `.meta` files) — future work.
+- NAG unsupported for now: it lowers Fortran to C (DWARF producer is
+  `GNU C...`), mangles names `module_MP_<proc>` with C-mangled,
+  pointer-typed dummies (`a_Dummy`, `ncol_`), and the Fortran name `a` is
+  gone, so by-name element addressing can't be used. Assumed-shape dummies
+  are still recoverable — gdb reads NAG's `__NAGf90_Dope2` descriptor as a
+  struct (`addr`, `offset`, `dim[].{extent,mult,lower}`) — but explicit-
+  shape dummies (`b(ncol,pver)`) lower to a bare data pointer with no
+  shape, which would have to come from the `.meta` files. A dedicated NAG
+  backend (arg demangling + dope-vector decode + `.meta`-sourced shapes)
+  is future work. (Intel on Izumi, by contrast, is supported.)
 - Negative-stride (reversed) array slices are skipped with a note.
 - One subcycle scheme called with *different arguments* per sub-step
   aligns fine (hits are sequence-matched), but the report labels hits by

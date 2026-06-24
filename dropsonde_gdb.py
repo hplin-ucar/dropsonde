@@ -70,6 +70,46 @@ def note(msg):
 
 
 # --------------------------------------------------------------------------
+# compiler detection
+#
+# Most of the capture is compiler-agnostic: gdb's by-name element addressing
+# (array_plan) and scalar reads work for gfortran and Intel alike. A few
+# memory-layout-specific paths -- the manual descriptor / deferred-length
+# character decode, and the stack-arg ABI fallback -- need to know which
+# compiler emitted the binary. We read it from the DWARF producer string
+# (e.g. "GNU Fortran ..." vs "Intel(R) Fortran ... Version 19.1..."), which
+# gdb exposes per compilation unit as symtab.producer. Requires a selected
+# frame (a symtab to read it from), so it is resolved lazily at the first
+# scheme hit and cached.
+# --------------------------------------------------------------------------
+
+_COMPILER = [None]
+
+
+def compiler():
+    """'gnu' | 'intel' | 'nag' | 'unknown' for the binary under debug."""
+    if _COMPILER[0] is not None:
+        return _COMPILER[0]
+    prod = ""
+    try:
+        prod = gdb.newest_frame().find_sal().symtab.producer or ""
+    except Exception:
+        pass
+    low = prod.lower()
+    if "intel" in low:
+        c = "intel"
+    elif "nag" in low:
+        c = "nag"
+    elif "gnu" in low or "gcc" in low:
+        c = "gnu"
+    else:
+        c = "unknown"
+    _COMPILER[0] = c
+    note("compiler: {} (producer: {})".format(c, prod[:70] or "?"))
+    return c
+
+
+# --------------------------------------------------------------------------
 # type and memory helpers
 # --------------------------------------------------------------------------
 
@@ -330,6 +370,14 @@ def _capture_abi(scheme, hit, name, sym, idx, frame, info):
     """Recover a stack-passed dummy whose DWARF location gfortran dropped,
     reading it straight from the ABI argument slot. Fills `info` exactly like
     handle_entry's normal path, so the exit re-read and differ are unchanged."""
+    # The descriptor decode below is the gfortran array-descriptor layout.
+    # Intel uses a different dope-vector format and (so far) has not dropped
+    # any dummy locations, so this path is gfortran-only; bail with a clear
+    # reason rather than misread an Intel descriptor as a gfortran one.
+    if compiler() not in ("gnu", "unknown"):
+        info["kind"] = "error"
+        info["why"] = "ABI fallback unsupported under {}".format(compiler())
+        return
     if name.startswith("_"):              # gfortran hidden character-length arg
         info["why"] = "hidden character-length arg (by value)"
         return
@@ -520,6 +568,57 @@ def _string_at(expr):
         expr, out.strip()[:120]))
 
 
+def _field_offset(t, name):
+    """(byte offset, field type) of a named component of a derived type."""
+    for f in t.strip_typedefs().fields():
+        if f.name == name:
+            return f.bitpos // 8, f.type
+    raise gdb.error("no component {!r} in {}".format(name, t))
+
+
+def _intel_const_names(prefix, n):
+    """SIMA constituent standard names under Intel. gdb 8.2 misreads Intel's
+    array descriptor for the module pointer-array const_props (it returns
+    bogus bounds), so const_props(i)%... cannot be evaluated by name; walk it
+    by hand instead.
+
+    Intel array descriptor (LP64): base_addr at +0, element length at +8 (the
+    only two fields we rely on -- not the rank/dim header, whose offsets are
+    less stable). const_props is a rank-1 contiguous array of
+    constituent_prop_ptr_t, so element i sits at base + i*elem_len and its
+    %prop pointer is at the component's offset within that element. %prop
+    points to a constituent-properties derived type whose var_std_name is
+    character(len=:),allocatable, stored inline by Intel as
+    {char *data; size_t len} -- data at the component's offset, length in the
+    next 8-byte word. Component offsets come from gdb's type info."""
+    desc_addr = int(gdb.parse_and_eval("&{}const_props".format(prefix)))
+    base = _read_u64(desc_addr)
+    elem_len = _read_i64(desc_addr + 8)
+    if base == 0 or elem_len <= 0:
+        raise gdb.error("implausible const_props descriptor: base={:#x} "
+                        "elem_len={}".format(base, elem_len))
+    # peel pointer/array layers to the constituent_prop_ptr_t element type
+    et = gdb.parse_and_eval("{}const_props".format(prefix)).type.strip_typedefs()
+    while et.code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_ARRAY):
+        et = et.target().strip_typedefs()
+    prop_off, prop_t = _field_offset(et, "prop")
+    vsn_off, _vsn_t = _field_offset(prop_t.target(), "var_std_name")
+    names = []
+    for i in range(n):
+        prop_ptr = _read_u64(base + i * elem_len + prop_off)
+        if prop_ptr == 0:
+            names.append("<null prop>")
+            continue
+        data_ptr = _read_u64(prop_ptr + vsn_off)
+        length = _read_i64(prop_ptr + vsn_off + 8)
+        if data_ptr == 0 or not (0 < length <= 1024):
+            names.append("<unreadable: len={}>".format(length))
+            continue
+        raw = bytes(gdb.selected_inferior().read_memory(data_ptr, length))
+        names.append(raw.decode("latin-1").strip())
+    return names
+
+
 def dump_constituents():
     try:
         if ROLE == "cam":
@@ -560,14 +659,19 @@ def dump_constituents():
             if n is None:
                 raise gdb.error(
                     "num_constituents not found by any spelling")
-            names = []
-            for i in range(1, n + 1):
-                try:
-                    names.append(_string_at(
-                        "{}const_props({})%prop%var_std_name".format(
-                            base, i)))
-                except Exception as exc:
-                    names.append("<unreadable: {}>".format(exc))
+            if compiler() == "intel":
+                # gdb 8.2 can't index Intel's pointer-array descriptor; decode
+                # const_props from raw memory.
+                names = _intel_const_names(base, n)
+            else:
+                names = []
+                for i in range(1, n + 1):
+                    try:
+                        names.append(_string_at(
+                            "{}const_props({})%prop%var_std_name".format(
+                                base, i)))
+                    except Exception as exc:
+                        names.append("<unreadable: {}>".format(exc))
         MANIFEST["constituents"] = names
         note("captured {} constituent names".format(len(names)))
     except Exception as exc:
@@ -595,11 +699,31 @@ DONE = [False]
 CURRENT_STEP = [0]
 
 
+def _qualified(short):
+    """The gdb-demangled, module-qualified spelling (module::short) of a
+    Fortran procedure, found by listing the symbol table. gfortran emits a
+    DWARF name equal to the bare 'short' so 'break short' resolves directly;
+    Intel mangles to module_mp_short_, which gdb DEMANGLES to module::short --
+    a valid breakpoint spec, but the bare name does not resolve. So we look up
+    the qualified spelling by the short name. Compiler-agnostic (gdb shows the
+    same module::proc form for both); returns None if absent or not
+    module-scoped. Works pre-run off the static symbol table."""
+    try:
+        out = gdb.execute("info functions \\b{}\\b".format(short),
+                          to_string=True)
+    except gdb.error:
+        return None
+    m = re.search(r"\b([A-Za-z_]\w*::{})\b".format(short), out)
+    return m.group(1) if m else None
+
+
 def _make_bp(cls, specs, *args):
     """Create a breakpoint, trying each spec. The Python API ignores
     'set breakpoint pending off' and silently creates PENDING breakpoints
     for missing symbols (calibrated on gdb 16.2), so check and delete."""
     for spec in specs:
+        if not spec:
+            continue
         try:
             bp = cls(spec, *args)
         except gdb.error:
@@ -632,8 +756,12 @@ def setup():
 
     resolved = 0
     for s in SCHEMES:
-        bp = _make_bp(EntryBP, (s + "_run", "__{0}_MOD_{0}_run".format(s)),
-                      s)
+        # gfortran bare DWARF name first (the calibrated Derecho fast path),
+        # then its linker name, then the module-qualified spelling gdb
+        # demangles Intel symbols to (module_mp_<scheme>_run_ -> module::run).
+        bp = _make_bp(EntryBP,
+                      (s + "_run", "__{0}_MOD_{0}_run".format(s),
+                       _qualified(s + "_run")), s)
         if bp is None:
             MANIFEST["breakpoints"][s] = "missing"
         else:
@@ -641,7 +769,8 @@ def setup():
             resolved += 1
     note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
 
-    step_bp = _make_bp(StepBP, ("cam_run1", "__cam_comp_MOD_cam_run1"))
+    step_bp = _make_bp(StepBP, ("cam_run1", "__cam_comp_MOD_cam_run1",
+                                _qualified("cam_run1")))
     if step_bp is None:
         note("WARNING: cam_run1 sentinel not found; hits will not be "
              "timestep-tagged and the run will not auto-terminate")
