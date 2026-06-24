@@ -1,5 +1,8 @@
 __pycache__
+.DS_Store
 tests/cal
 tests/cal.dSYM/
 tests/*.mod
 tests/out_*/
+dropsonde_out/
+reports/

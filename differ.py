@@ -48,7 +48,8 @@ def load_role(outdir, role):
     path = os.path.join(d, "manifest.json")
     if not os.path.isfile(path):
         return None
-    man = json.load(open(path))
+    with open(path) as f:
+        man = json.load(f)
     man["_dir"] = d
     return man
 
@@ -540,8 +541,8 @@ def _archive_report(outdir, report_path):
     filename. Returns the destination path, or None if it couldn't be
     written."""
     try:
-        sdf = json.load(
-            open(os.path.join(outdir, "suite.json"))).get("sdf", "")
+        with open(os.path.join(outdir, "suite.json")) as f:
+            sdf = json.load(f).get("sdf", "")
     except (IOError, ValueError):
         sdf = ""
     sdf_name = os.path.splitext(os.path.basename(sdf))[0] or "unknown"
@@ -583,6 +584,24 @@ def _report(outdir, suite_order, steps, intents=None):
     print("=" * 64)
     print("dropsonde report  ({})".format(outdir))
     print("=" * 64)
+    try:
+        with open(os.path.join(outdir, "suite.json")) as f:
+            suite_meta = json.load(f)
+    except (IOError, ValueError):
+        suite_meta = {}
+    ver = suite_meta.get("version")
+    if ver:
+        print("dropsonde version: {}".format(ver))
+    sdf_path = suite_meta.get("sdf")
+    if sdf_path:
+        print("SDF:       {}".format(sdf_path))
+    cam_case = suite_meta.get("cam_case")
+    if cam_case:
+        print("CAM case:  {}".format(cam_case))
+    sima_case = suite_meta.get("sima_case")
+    if sima_case:
+        print("SIMA case: {}".format(sima_case))
+    print("steps:     {}".format(steps))
 
     cam = load_role(outdir, "cam")
     sima = load_role(outdir, "sima")
@@ -645,6 +664,20 @@ def _report(outdir, suite_order, steps, intents=None):
         print("  (capture incomplete on {} side; constituent-indexed "
               "arrays compared element-wise only)".format(
                   "CAM" if not cam_names else "SIMA"))
+    if cam_un and sima_un:
+        print("")
+        print("  *** WARNING: {} CAM and {} SIMA constituents are "
+              "UNMATCHED on both sides.".format(len(cam_un), len(sima_un)))
+        print("  *** These species will NOT be compared in "
+              "constituent-indexed arrays.")
+        print("  *** This often indicates a missing entry in "
+              "SPECIAL_CONST_MAP (differ.py) or a")
+        print("  *** duplicate/mismatched standard name in the "
+              "registry (see example 3 in docs/).")
+        print("  *** Unmatched CAM:  {}".format(
+            ", ".join(cn for _, cn in cam_un)))
+        print("  *** Unmatched SIMA: {}".format(
+            ", ".join(sn for _, sn in sima_un)))
     const_ctx = (cam_names, sima_names, pairs)
 
     # --- alignment ------------------------------------------------------
@@ -920,7 +953,8 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit("usage: python3 differ.py <out_dir>")
     outdir = sys.argv[1]
-    meta = json.load(open(os.path.join(outdir, "suite.json")))
+    with open(os.path.join(outdir, "suite.json")) as f:
+        meta = json.load(f)
     ok = report(outdir, meta["schemes"], meta["steps"],
                 meta.get("intents"))
     sys.exit(0 if ok else 1)

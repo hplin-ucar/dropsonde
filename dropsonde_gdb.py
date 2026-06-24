@@ -22,7 +22,8 @@ import traceback
 
 import gdb
 
-CFG = json.load(open(os.environ["DROPSONDE_CONFIG"]))
+with open(os.environ["DROPSONDE_CONFIG"]) as _cfg_f:
+    CFG = json.load(_cfg_f)
 ROLE = CFG["role"]            # "cam" | "sima"
 OUT = CFG["out_dir"]
 SCHEMES = CFG["schemes"]      # unique scheme names, suite order
@@ -305,6 +306,9 @@ def _first_body_line(scheme, frame):
 # arguments would shift the integer-register accounting and are not handled.
 # --------------------------------------------------------------------------
 
+import platform as _platform
+_ARCH = _platform.machine()
+
 N_INT_REG = 6          # System V AMD64 integer/pointer argument registers
 STACK_ARG0 = 16        # first stack arg at rbp+16 (saved rbp, then return addr)
 
@@ -370,6 +374,11 @@ def _capture_abi(scheme, hit, name, sym, idx, frame, info):
     """Recover a stack-passed dummy whose DWARF location gfortran dropped,
     reading it straight from the ABI argument slot. Fills `info` exactly like
     handle_entry's normal path, so the exit re-read and differ are unchanged."""
+    if _ARCH not in ("x86_64", "AMD64"):
+        info["kind"] = "error"
+        info["why"] = ("ABI fallback only supports x86-64 (running on {})"
+                       .format(_ARCH))
+        return
     # The descriptor decode below is the gfortran array-descriptor layout.
     # Intel uses a different dope-vector format and (so far) has not dropped
     # any dummy locations, so this path is gfortran-only; bail with a clear

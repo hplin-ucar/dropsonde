@@ -31,6 +31,17 @@ import xml.etree.ElementTree as ET
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def git_version():
+    """Short git commit hash of the dropsonde repo, or 'unknown'."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=HERE, stderr=subprocess.DEVNULL)
+        return out.decode().strip()
+    except Exception:
+        return "unknown"
+
+
 def parse_sdf(path):
     """Ordered scheme names in document order; duplicates kept."""
     root = ET.parse(path).getroot()
@@ -124,7 +135,7 @@ def launch(role, casedir, schemes, outdir, kill_after_steps):
         cwd=rundir, env=env, stdout=log, stderr=subprocess.STDOUT)
     print("dropsonde: {} run launched (pid {}, log {})".format(
         role, proc.pid, logpath))
-    return proc, logpath
+    return proc, logpath, log
 
 
 def main():
@@ -176,31 +187,39 @@ def main():
 
     outdir = os.path.abspath(args.out)
     os.makedirs(outdir, exist_ok=True)
+    version = git_version()
     with open(os.path.join(outdir, "suite.json"), "w") as f:
         json.dump({"schemes": schemes, "steps": args.steps,
-                   "sdf": sdf_abs, "intents": intents}, f, indent=1)
+                   "sdf": sdf_abs, "intents": intents,
+                   "version": version,
+                   "cam_case": os.path.abspath(args.cam),
+                   "sima_case": os.path.abspath(args.sima),
+                   "meta_root": meta_root}, f, indent=1)
 
     # CAM dumps steps+1 timesteps (its first is skipped); SIMA dumps steps.
     # The gdb side kills each run at the start of the timestep after that,
     # so STOP_N only needs to be long enough (e.g. CAM's 6-step minimum).
-    procs = [launch("cam", args.cam, uniq, outdir, args.steps + 1),
-             launch("sima", args.sima, uniq, outdir, args.steps)]
+    runs = [launch("cam", args.cam, uniq, outdir, args.steps + 1),
+            launch("sima", args.sima, uniq, outdir, args.steps)]
     print("dropsonde: waiting for runs to finish ...")
     try:
-        for (proc, logpath), role in zip(procs, ("cam", "sima")):
+        for (proc, logpath, log), role in zip(runs, ("cam", "sima")):
             rc = proc.wait()
+            log.close()
             if rc != 0:
                 print("dropsonde: warning: {} gdb exited with rc {} "
                       "(see {})".format(role, rc, logpath))
     except KeyboardInterrupt:
         print("\ndropsonde: interrupted; terminating gdb sessions and "
               "comparing what was captured ...")
-        for (proc, _), _role in zip(procs, ("cam", "sima")):
+        for (proc, _, log), _role in zip(runs, ("cam", "sima")):
             try:
                 proc.terminate()
                 proc.wait()
             except Exception:
                 pass
+            finally:
+                log.close()
 
     sys.path.insert(0, HERE)
     import differ

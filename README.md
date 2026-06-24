@@ -3,13 +3,22 @@
 ![a lovely squid representing the SIMA project flying with a dropsonde](dropsonde_logo.png)
 
 Find the first CCPP scheme where CAM and CAM-SIMA physics answers diverge,
-without modifying or recompiling either model. Runs both executables under
-gdb with breakpoints at every scheme `_run` entry/exit listed in the SDF,
-dumps all scheme arguments to disk, and diffs them byte-for-byte.
+without needing to modify either model to add instrumentation or manually
+operating the debugger.
+
+`dropsonde` runs both models under `gdb` with breakpoints at every scheme's
+`run` phase (as specified in the SDF) and dumps all arguments entering/exiting
+these subroutines to disk, and diffs them byte-for-byte.
+
+## When to use `dropsonde`?
+
+`dropsonde` can be used during the final stretch of converting CAM physics to CCPP,
+where CAM already runs the CCPPized subroutines, but despite the same code,
+CAM-SIMA driven with the CAM snapshots have answer differences compared to CAM.
 
 ## Usage
 
-1. Build the models: `DEBUG=TRUE,NTASKS=1,NTHRDS=1`, chunks disabled for CAM.
+1. Build the models: `DEBUG=TRUE,NTASKS=1,NTHRDS=1`, with chunks disabled for CAM.
    **Important:** CAM and CAM-SIMA must be running the same underlying atmos_phys code.
 2. Run `./preview_namelists`.
 3. Run `dropsonde` where it is checked out: point it to the case directories on scratch with the SDF file:
@@ -41,7 +50,7 @@ cam/, sima/   manifest.json + gdb.log + one .bin dump per argument
               per phase (entry/exit)
 ```
 
-Re-run just the comparison — to re-read the report, regenerate it after
+Re-run just the comparison: to re-read the report, regenerate it after
 editing `differ.py`, or compare with different code without re-running
 the models — with:
 
