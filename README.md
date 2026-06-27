@@ -194,10 +194,12 @@ Retarget such a scheme by annotating its `<scheme>` line in the SDF with a
 
 The comment is invisible to the CCPP framework (no schema change). dropsonde
 then plants the breakpoint on the portable subroutine in *both* binaries
-(tagging it with the SDF scheme name, so ordering and the report are
-unchanged) and sources arg intents from the portable `.F90` declarations
-(portable subroutines have no `.meta`). Non-annotated schemes are unaffected
-and keep using `<scheme>_run` and `.meta` intents.
+(internally still keyed by the SDF scheme name, so pairing and suite ordering
+are unchanged) and sources arg intents from the portable `.F90` declarations
+(portable subroutines have no `.meta`). The report shows such schemes as
+`scheme -> portable_sub` (e.g. `modal_aero_calcsize_ccpp -> modal_aero_calcsize_run`)
+so it is clear what is actually being compared. Non-annotated schemes are
+unaffected and keep using `<scheme>_run` and `.meta` intents.
 
 Notes and limits: this fits *driver-level* portable subroutines called once
 per (dechunked) timestep, not per-column kernels called in a loop. Derived-type

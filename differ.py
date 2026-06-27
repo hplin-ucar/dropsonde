@@ -193,6 +193,15 @@ def build_const_map(cam_names, sima_names):
     return pairs, cam_un, sima_un
 
 
+def _disp_scheme(scheme, portable):
+    """Display label for a scheme. When the scheme is compared at a shared
+    portable subroutine (dropsonde:portable SDF annotation), show
+    'scheme -> portable_sub' so the report makes clear what is actually being
+    compared; otherwise just the scheme name."""
+    sym = (portable or {}).get(scheme)
+    return "{} -> {}".format(scheme, sym) if sym else scheme
+
+
 class Reporter(object):
     def __init__(self):
         self.n_diffs = 0
@@ -201,6 +210,7 @@ class Reporter(object):
         self.first_pair_seen = False
         self.cur_scheme = None
         self.by_scheme = {}  # scheme -> [entry_diffs, exit_diffs]
+        self.portable = {}   # scheme -> portable_sub, for display labels
 
     def diff(self, scheme, hit, phase, arg, text, extra_lines=None):
         self.n_diffs += 1
@@ -356,7 +366,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
     'outputs differ given identical inputs' signal is gone for those.
     """
     bucket = srec.get("_bucket", "<toplevel>")
-    label = srec["scheme"]
+    label = _disp_scheme(srec["scheme"], rep.portable)
     if bucket != "<toplevel>":
         label += " via " + bucket
     label += " [step {}]".format(srec.get("step", "?"))
@@ -589,6 +599,11 @@ def _report(outdir, suite_order, steps, intents=None):
             suite_meta = json.load(f)
     except (IOError, ValueError):
         suite_meta = {}
+    portable = suite_meta.get("portable", {}) or {}
+
+    def disp(s):
+        return _disp_scheme(s, portable)
+
     ver = suite_meta.get("version")
     if ver:
         print("dropsonde version: {}".format(ver))
@@ -711,7 +726,7 @@ def _report(outdir, suite_order, steps, intents=None):
     print("call alignment (hits per compared step; sima step t pairs "
           "with cam step t+1;")
     print("indented rows are calls made from inside the parent scheme):")
-    width = max(len(s) for s in compared) + 2
+    width = max(len(disp(s)) for s in compared) + 2
 
     def vmark(n_s, n_c):
         if n_s == n_c:
@@ -759,7 +774,7 @@ def _report(outdir, suite_order, steps, intents=None):
                 for (b, p, n_s, n_c) in info[c]["via"]:
                     if p == parent and (c, b) not in printed:
                         printed.add((c, b))
-                        row(c, n_s, n_c, depth)
+                        row(disp(c), n_s, n_c, depth)
                         new = True
                 if new:
                     emit_nested(c, depth + 1)
@@ -770,12 +785,12 @@ def _report(outdir, suite_order, steps, intents=None):
                 continue
             if e["top"] is not None:
                 printed.add((s, "<toplevel>"))
-                row(s, e["top"][0], e["top"][1], 0)
+                row(disp(s), e["top"][0], e["top"][1], 0)
                 emit_nested(s, 1)
             for (b, p, n_s, n_c) in e["via"]:
                 if p is None and (s, b) not in printed:
                     printed.add((s, b))
-                    row("{} (via {})".format(s, b), n_s, n_c, 0)
+                    row("{} (via {})".format(disp(s), b), n_s, n_c, 0)
         # nested rows whose parent never printed a row of its own
         for s in compared:
             if s not in info:
@@ -783,11 +798,11 @@ def _report(outdir, suite_order, steps, intents=None):
             for (b, p, n_s, n_c) in info[s]["via"]:
                 if (s, b) not in printed:
                     printed.add((s, b))
-                    row("{} (via {})".format(s, b), n_s, n_c, 0)
+                    row("{} (via {})".format(disp(s), b), n_s, n_c, 0)
         never = [s for s in compared if s not in info]
         if never:
             print("  (not called in compared steps: {})".format(
-                ", ".join(never)))
+                ", ".join(disp(s) for s in never)))
 
     # --- SDF-order pairing support ----------------------------------------
     # CAM runs the full model timestep (all parameterizations), so a
@@ -841,6 +856,7 @@ def _report(outdir, suite_order, steps, intents=None):
     print("")
     print("comparison (execution order):")
     rep = Reporter()
+    rep.portable = portable
     n_pairs = 0
     first_srec = None
     matched_cam = {}  # group key -> set of cam occurrences already paired
@@ -875,7 +891,7 @@ def _report(outdir, suite_order, steps, intents=None):
                 rep.note("{} [step {}] (hit {}): paired with cam "
                          "occurrence {} of {} (SDF order: follows {} "
                          "in CAM execution)".format(
-                             srec["scheme"], t, srec["_occ"],
+                             disp(srec["scheme"]), t, srec["_occ"],
                              k, len(cam_list), pred))
             else:
                 # Strategy 2: bitwise input match (fallback)
@@ -891,7 +907,7 @@ def _report(outdir, suite_order, steps, intents=None):
                         rep.note(
                             "{} [step {}] (hit {}): paired with cam "
                             "occurrence {} of {} (bitwise input match)"
-                            .format(srec["scheme"], t, srec["_occ"],
+                            .format(disp(srec["scheme"]), t, srec["_occ"],
                                     k, len(cam_list)))
                         break
                     if closest is None or same > closest[1]:
@@ -904,7 +920,7 @@ def _report(outdir, suite_order, steps, intents=None):
                     rep.note(
                         "{} [step {}] (hit {}): NO cam hit with matching "
                         "inputs among {} candidates ({}); not compared"
-                        .format(srec["scheme"], t, srec["_occ"],
+                        .format(disp(srec["scheme"]), t, srec["_occ"],
                                 len(cam_list), why))
                     continue
         if first_srec is None:
@@ -943,7 +959,7 @@ def _report(outdir, suite_order, steps, intents=None):
     for s in compared:
         if s in rep.by_scheme:
             ne, nx = rep.by_scheme[s]
-            print("  {}: {} input / {} output diffs".format(s, ne, nx))
+            print("  {}: {} input / {} output diffs".format(disp(s), ne, nx))
     print("Raw dumps and entry-time addresses are in the manifests for "
           "manual gdb follow-up.")
     return False
