@@ -45,7 +45,7 @@ Everything is written out in `--out` (default `./dropsonde_out`):
 
 ```
 report.txt    the printed report, archived verbatim
-suite.json    scheme order, --steps, parsed .meta intents
+suite.json    scheme order, --steps, parsed intents, portable overrides
 cam/, sima/   manifest.json + gdb.log + one .bin dump per argument
               per phase (entry/exit)
 ```
@@ -90,7 +90,9 @@ Copy aside any logs you want to keep before running.
 1. `dropsonde` parses the SDF for the ordered scheme list and launches
    `gdb --batch -x dropsonde_gdb.py` on each executable (config passed via
    `$DROPSONDE_CONFIG`).
-2. `dropsonde_gdb.py` breaks on every `<scheme>_run`. gdb's prologue skip
+2. `dropsonde_gdb.py` breaks on every `<scheme>_run` (or, for schemes with a
+   `dropsonde:portable=` SDF annotation, on the named portable subroutine
+   instead — see [Comparing shared portable subroutines](#comparing-shared-portable-subroutines)). gdb's prologue skip
    stops inside gfortran's dummy-argument descriptor setup, where the
    dummies aren't readable yet and single-stepping doesn't reliably escape.
    So it instead `advance`s to the first body statement (`errmsg=''`/
@@ -173,6 +175,37 @@ Intel assumptions (gdb 8.2, ifort 19.1, Izumi):
   gfortran-only; under Intel it bails with a note rather than misreading a
   descriptor (Intel has not been observed to drop dummy locations).
 
+## Comparing shared portable subroutines
+
+Some CCPP schemes wrap *portable* science code that CAM and CAM-SIMA share
+verbatim but reach through different wrappers — e.g. `modal_aero_calcsize_ccpp`
+(SIMA) and `modal_aero_calcsize_sub` (CAM) both call the portable
+`modal_aero_calcsize_run`. CAM never calls the `<scheme>_run` CCPP wrapper, so
+the wrapper symbol is absent from the CAM binary and the scheme would be
+reported "SIMA-only (no CAM symbol)". The real comparison point is the shared
+portable subroutine, which has an identical signature in both binaries.
+
+Retarget such a scheme by annotating its `<scheme>` line in the SDF with a
+**same-line XML comment** naming the portable subroutine:
+
+```xml
+<scheme>modal_aero_calcsize_ccpp</scheme>  <!-- dropsonde:portable=modal_aero_calcsize_run -->
+```
+
+The comment is invisible to the CCPP framework (no schema change). dropsonde
+then plants the breakpoint on the portable subroutine in *both* binaries
+(tagging it with the SDF scheme name, so ordering and the report are
+unchanged) and sources arg intents from the portable `.F90` declarations
+(portable subroutines have no `.meta`). Non-annotated schemes are unaffected
+and keep using `<scheme>_run` and `.meta` intents.
+
+Notes and limits: this fits *driver-level* portable subroutines called once
+per (dechunked) timestep, not per-column kernels called in a loop. Derived-type
+dummy args (e.g. `class(aerosol_state)`) are recorded but not captured (gdb
+can't read them portably). Wrapper-only post-processing (e.g. mapping
+tendencies into the constituent array) is *not* compared at the portable
+boundary — only the shared science inputs/outputs are.
+
 ## Reading the report
 
 In order of appearance:
@@ -180,7 +213,11 @@ In order of appearance:
 - **schemes compared** — SDF schemes whose `_run` symbol resolved in both
   binaries. SIMA-only schemes (no CAM symbol — usually CCPP-only glue
   like `*_stub`, `*_default`) are listed and skipped; a CAM-only entry
-  would mean the SIMA build is missing a scheme.
+  would mean the SIMA build is missing a scheme. A scheme is also SIMA-only
+  when CAM and CAM-SIMA share the *science* but call it through different
+  wrappers — CAM never calls the `<scheme>_run` CCPP wrapper, so it has no
+  matching symbol. See [Comparing shared portable subroutines](#comparing-shared-portable-subroutines)
+  to retarget such a scheme to the portable subroutine both models call.
 - **constituent mapping** — the recovered `q(:,:,i) <-> q(:,:,j)` index
   permutation with both names. Unmatched species are listed and excluded
   from per-species comparison (extend `SPECIAL_CONST_MAP` in `differ.py`

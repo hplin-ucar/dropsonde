@@ -28,6 +28,11 @@ ROLE = CFG["role"]            # "cam" | "sima"
 OUT = CFG["out_dir"]
 SCHEMES = CFG["schemes"]      # unique scheme names, suite order
 KILL_AFTER = CFG.get("kill_after_steps", 0)  # 0 = run to natural exit
+# {scheme: portable_symbol}: schemes whose breakpoint is planted on a shared
+# portable subroutine (called by both the CAM and CAM-SIMA wrappers) instead
+# of the SIMA-only <scheme>_run CCPP wrapper. See parse_portable_map in the
+# dropsonde driver.
+PORTABLE = CFG.get("portable", {}) or {}
 
 # gdb (Derecho gfortran, calibrated 2026-06-12) reports Fortran array
 # ranges outermost-first, i.e. REVERSED relative to subscript order, while
@@ -693,9 +698,10 @@ def dump_constituents():
 # --------------------------------------------------------------------------
 
 class EntryBP(gdb.Breakpoint):
-    def __init__(self, spec, scheme):
+    def __init__(self, spec, scheme, target):
         super(EntryBP, self).__init__(spec)
-        self.scheme = scheme
+        self.scheme = scheme    # SDF scheme name (the capture/differ tag)
+        self.target = target    # symbol the breakpoint is actually planted on
 
 
 class StepBP(gdb.Breakpoint):
@@ -765,12 +771,22 @@ def setup():
 
     resolved = 0
     for s in SCHEMES:
-        # gfortran bare DWARF name first (the calibrated Derecho fast path),
-        # then its linker name, then the module-qualified spelling gdb
-        # demangles Intel symbols to (module_mp_<scheme>_run_ -> module::run).
-        bp = _make_bp(EntryBP,
-                      (s + "_run", "__{0}_MOD_{0}_run".format(s),
-                       _qualified(s + "_run")), s)
+        portable = PORTABLE.get(s)
+        if portable:
+            # Compare at the shared portable subroutine that both wrappers
+            # call. Its module name differs from the symbol, so the
+            # __mod_MOD_proc linker guess can't be formed; the bare DWARF name
+            # (gfortran) and the demangled module::proc (Intel) suffice.
+            bp = _make_bp(EntryBP, (portable, _qualified(portable)),
+                          s, portable)
+        else:
+            # gfortran bare DWARF name first (the calibrated Derecho fast
+            # path), then its linker name, then the module-qualified spelling
+            # gdb demangles Intel symbols to (module_mp_<scheme>_run_ ->
+            # module::run).
+            bp = _make_bp(EntryBP,
+                          (s + "_run", "__{0}_MOD_{0}_run".format(s),
+                           _qualified(s + "_run")), s, s + "_run")
         if bp is None:
             MANIFEST["breakpoints"][s] = "missing"
         else:
@@ -840,7 +856,7 @@ def main():
                     # was unreachable), we're now in the caller -- fall
                     # back to capturing from wherever we are, but warn.
                     fn = frame.function()
-                    if fn and entry.scheme + "_run" not in fn.name:
+                    if fn and entry.target not in fn.name:
                         note("{}: advance escaped frame (now in {}); "
                              "skipping capture".format(
                                  entry.scheme, fn.name))

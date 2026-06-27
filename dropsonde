@@ -24,6 +24,7 @@ Python 3.6 compatible; stdlib only (no numpy anywhere).
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -52,6 +53,129 @@ def parse_sdf(path):
     if not schemes:
         sys.exit("error: no <scheme> entries found in {}".format(path))
     return schemes
+
+
+# Optional, non-schema-changing SDF annotation that retargets a scheme's
+# capture from its CCPP <scheme>_run wrapper to a shared *portable*
+# subroutine that BOTH CAM and CAM-SIMA call (through different wrappers).
+# The CCPP wrapper symbol exists only in the SIMA binary, so such schemes are
+# otherwise reported "SIMA-only (no CAM symbol)"; the portable subroutine has
+# an identical signature in both binaries and is the real comparison point.
+# Convention -- an XML comment on the SAME LINE as the <scheme>:
+#   <scheme>modal_aero_calcsize_ccpp</scheme>  <!-- dropsonde:portable=modal_aero_calcsize_run -->
+# ElementTree drops comments (and gdb's Python 3.6 can't retain them), so the
+# mapping is read by a raw-text scan that pairs each annotation with the
+# <scheme> on its line.
+_PORTABLE_RE = re.compile(
+    r"<scheme>\s*([^<\s]+)\s*</scheme>.*?"
+    r"dropsonde:portable\s*=\s*([A-Za-z]\w*)")
+
+
+def parse_portable_map(path):
+    """{scheme: portable_symbol} from same-line dropsonde:portable comments."""
+    mapping = {}
+    try:
+        with open(path, errors="replace") as f:
+            for ln in f:
+                m = _PORTABLE_RE.search(ln)
+                if m:
+                    mapping[m.group(1)] = m.group(2)
+    except OSError as exc:
+        print("dropsonde: WARNING: could not read SDF for portable "
+              "annotations: {}".format(exc))
+    return mapping
+
+
+_END_SUBR_RE = re.compile(r"^\s*end\s+subroutine\b", re.I)
+_INTENT_RE = re.compile(r"intent\s*\(\s*(in|out|inout)\s*\)", re.I)
+_IDENT_RE = re.compile(r"\s*([A-Za-z]\w*)")
+
+
+def _split_top_commas(s):
+    """Split on commas not inside parentheses, so array dims like (:,:) on a
+    multi-name declaration stay attached to their variable."""
+    parts, depth, cur = [], 0, ""
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
+def _subroutine_intents(path, sym):
+    """{arg_lower: intent} from the Fortran declarations of subroutine `sym`
+    in `path`, or None if `sym` is not defined there. Handles '&'
+    continuations, '!' comments, multiple names per declaration, and
+    array-dim commas. Derived-type (type()/class()) dummies are recorded too
+    but are harmless -- the gdb side skips them."""
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    sub_re = re.compile(r"^\s*subroutine\s+{}\b".format(re.escape(sym)), re.I)
+    start = None
+    for i, ln in enumerate(lines):
+        if sub_re.match(ln):
+            start = i
+            break
+    if start is None:
+        return None
+    intents = {}
+    buf = ""
+    for ln in lines[start:]:
+        if not buf and _END_SUBR_RE.match(ln):
+            break
+        code = ln.split("!", 1)[0].strip()
+        if code.endswith("&"):
+            buf += " " + code[:-1]
+            continue
+        buf += " " + code
+        m = _INTENT_RE.search(buf)
+        if m:
+            _head, sep, names = buf.partition("::")
+            if sep:
+                for piece in _split_top_commas(names):
+                    im = _IDENT_RE.match(piece)
+                    if im:
+                        intents[im.group(1).lower()] = m.group(1).lower()
+        buf = ""
+    return intents
+
+
+def parse_fortran_intents(meta_root, portable):
+    """{scheme: {arg: intent}} for the portable subroutines named in
+    `portable` ({scheme: symbol}), read from their Fortran intent()
+    declarations. Portable subroutines have no .meta, so intents come from the
+    .F90 source; keyed by SCHEME so the differ (scheme-keyed) is unchanged."""
+    if not portable:
+        return {}
+    parsed = {sym.lower(): None for sym in portable.values()}
+    for dirpath, _dirs, filenames in os.walk(meta_root):
+        if all(v is not None for v in parsed.values()):
+            break
+        for fn in filenames:
+            if not fn.lower().endswith((".f90", ".f")):
+                continue
+            fpath = os.path.join(dirpath, fn)
+            for symlow in [k for k, v in parsed.items() if v is None]:
+                got = _subroutine_intents(fpath, symlow)
+                if got is not None:
+                    parsed[symlow] = got
+    out = {}
+    for scheme, sym in portable.items():
+        got = parsed.get(sym.lower())
+        if got:
+            out[scheme] = got
+    return out
 
 
 def parse_meta_intents(meta_root, schemes):
@@ -106,7 +230,7 @@ def find_meta_root(sdf_abs):
         d = parent
 
 
-def launch(role, casedir, schemes, outdir, kill_after_steps):
+def launch(role, casedir, schemes, outdir, kill_after_steps, portable):
     exe = os.path.join(casedir, "bld", "cesm.exe")
     rundir = os.path.join(casedir, "run")
     if not os.path.isfile(exe):
@@ -119,7 +243,8 @@ def launch(role, casedir, schemes, outdir, kill_after_steps):
     cfgpath = os.path.join(roledir, "config.json")
     with open(cfgpath, "w") as f:
         json.dump({"role": role, "out_dir": roledir, "schemes": schemes,
-                   "kill_after_steps": kill_after_steps}, f, indent=1)
+                   "kill_after_steps": kill_after_steps,
+                   "portable": portable}, f, indent=1)
 
     env = dict(os.environ, DROPSONDE_CONFIG=cfgpath)
     # Some sites (e.g. Izumi) point PYTHONHOME/PYTHONPATH at an anaconda whose
@@ -182,13 +307,32 @@ def main():
         print("dropsonde: WARNING: no schemes/ directory found above the SDF; "
               "falling back to {} -- set --meta-root if .meta files live "
               "elsewhere".format(meta_root))
-    intents = parse_meta_intents(meta_root, uniq)
+    # Schemes carrying a same-line `dropsonde:portable=` SDF comment are
+    # compared at their shared portable subroutine, not the CCPP wrapper.
+    # Those get intents from the portable .F90 (no .meta exists for it);
+    # all other schemes use .meta exactly as before.
+    portable = {s: sym for s, sym in parse_portable_map(sdf_abs).items()
+                if s in uniq}
+    meta_schemes = [s for s in uniq if s not in portable]
+    intents = parse_meta_intents(meta_root, meta_schemes)
     print("dropsonde: intents for {}/{} schemes ({} args) from .meta "
-          "under {}".format(len(intents), len(uniq),
+          "under {}".format(len(intents), len(meta_schemes),
                             sum(len(v) for v in intents.values()),
                             meta_root))
+    if portable:
+        fort = parse_fortran_intents(meta_root, portable)
+        intents.update(fort)
+        print("dropsonde: portable overrides ({}): {}".format(
+            len(portable),
+            ", ".join("{}->{}".format(s, portable[s]) for s in portable)))
+        no_int = [s for s in portable if s not in fort]
+        if no_int:
+            print("dropsonde: WARNING: no Fortran intents found for portable "
+                  "target(s): {} -- entry intent(out) args will be compared "
+                  "(noisy)".format(", ".join(
+                      "{}({})".format(s, portable[s]) for s in no_int)))
     if not intents:
-        print("dropsonde: WARNING: no .meta intents found; entry values of "
+        print("dropsonde: WARNING: no intents found; entry values of "
               "intent(out) args will be compared (noisy) -- set "
               "--meta-root")
 
@@ -230,6 +374,7 @@ def main():
     with open(os.path.join(outdir, "suite.json"), "w") as f:
         json.dump({"schemes": schemes, "steps": args.steps,
                    "sdf": sdf_abs, "intents": intents,
+                   "portable": portable,
                    "version": version,
                    "cam_case": cam_abs,
                    "sima_case": sima_abs,
@@ -241,10 +386,12 @@ def main():
     runs = []
     if not args.skip_cam:
         runs.append(("cam",
-                      launch("cam", args.cam, uniq, outdir, args.steps + 1)))
+                      launch("cam", args.cam, uniq, outdir, args.steps + 1,
+                             portable)))
     if not args.skip_sima:
         runs.append(("sima",
-                      launch("sima", args.sima, uniq, outdir, args.steps)))
+                      launch("sima", args.sima, uniq, outdir, args.steps,
+                             portable)))
     if runs:
         print("dropsonde: waiting for runs to finish ...")
         try:
