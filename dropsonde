@@ -158,6 +158,13 @@ def main():
                          "(default: the nearest ancestor of the SDF that "
                          "contains a schemes/ directory, i.e. the "
                          "ncar_ccpp/atmospheric_physics root)")
+    ap.add_argument("--skip-cam", action="store_true",
+                    help="skip the CAM gdb run and reuse existing CAM "
+                         "captures in --out (useful when iterating on the "
+                         "SIMA side only)")
+    ap.add_argument("--skip-sima", action="store_true",
+                    help="skip the SIMA gdb run and reuse existing SIMA "
+                         "captures in --out")
     args = ap.parse_args()
 
     schemes = parse_sdf(args.sdf)
@@ -187,39 +194,77 @@ def main():
 
     outdir = os.path.abspath(args.out)
     os.makedirs(outdir, exist_ok=True)
+    cam_abs = os.path.abspath(args.cam)
+    sima_abs = os.path.abspath(args.sima)
+
+    # --skip-cam / --skip-sima: validate that the existing captures in --out
+    # came from the same case directories the user is pointing at now.
+    for skip, role, case_abs in ((args.skip_cam, "cam", cam_abs),
+                                 (args.skip_sima, "sima", sima_abs)):
+        if not skip:
+            continue
+        manifest = os.path.join(outdir, role, "manifest.json")
+        if not os.path.isfile(manifest):
+            sys.exit("error: --skip-{0} but no existing {0} manifest in "
+                     "{1} (run without --skip-{0} first)".format(
+                         role, outdir))
+        suite_path = os.path.join(outdir, "suite.json")
+        if os.path.isfile(suite_path):
+            with open(suite_path) as f:
+                prev = json.load(f)
+            key = role + "_case"
+            prev_case = prev.get(key)
+            if prev_case and os.path.abspath(prev_case) != case_abs:
+                sys.exit(
+                    "error: --skip-{} but --{} points to\n"
+                    "  {}\n"
+                    "while the existing captures came from\n"
+                    "  {}\n"
+                    "These must match (re-run without --skip-{} to "
+                    "recapture, or point --{} at the original case)"
+                    .format(role, role, case_abs, prev_case, role, role))
+        print("dropsonde: reusing existing {} captures in {}".format(
+            role, outdir))
+
     version = git_version()
     with open(os.path.join(outdir, "suite.json"), "w") as f:
         json.dump({"schemes": schemes, "steps": args.steps,
                    "sdf": sdf_abs, "intents": intents,
                    "version": version,
-                   "cam_case": os.path.abspath(args.cam),
-                   "sima_case": os.path.abspath(args.sima),
+                   "cam_case": cam_abs,
+                   "sima_case": sima_abs,
                    "meta_root": meta_root}, f, indent=1)
 
     # CAM dumps steps+1 timesteps (its first is skipped); SIMA dumps steps.
     # The gdb side kills each run at the start of the timestep after that,
     # so STOP_N only needs to be long enough (e.g. CAM's 6-step minimum).
-    runs = [launch("cam", args.cam, uniq, outdir, args.steps + 1),
-            launch("sima", args.sima, uniq, outdir, args.steps)]
-    print("dropsonde: waiting for runs to finish ...")
-    try:
-        for (proc, logpath, log), role in zip(runs, ("cam", "sima")):
-            rc = proc.wait()
-            log.close()
-            if rc != 0:
-                print("dropsonde: warning: {} gdb exited with rc {} "
-                      "(see {})".format(role, rc, logpath))
-    except KeyboardInterrupt:
-        print("\ndropsonde: interrupted; terminating gdb sessions and "
-              "comparing what was captured ...")
-        for (proc, _, log), _role in zip(runs, ("cam", "sima")):
-            try:
-                proc.terminate()
-                proc.wait()
-            except Exception:
-                pass
-            finally:
+    runs = []
+    if not args.skip_cam:
+        runs.append(("cam",
+                      launch("cam", args.cam, uniq, outdir, args.steps + 1)))
+    if not args.skip_sima:
+        runs.append(("sima",
+                      launch("sima", args.sima, uniq, outdir, args.steps)))
+    if runs:
+        print("dropsonde: waiting for runs to finish ...")
+        try:
+            for role, (proc, logpath, log) in runs:
+                rc = proc.wait()
                 log.close()
+                if rc != 0:
+                    print("dropsonde: warning: {} gdb exited with rc {} "
+                          "(see {})".format(role, rc, logpath))
+        except KeyboardInterrupt:
+            print("\ndropsonde: interrupted; terminating gdb sessions and "
+                  "comparing what was captured ...")
+            for _role, (proc, _, log) in runs:
+                try:
+                    proc.terminate()
+                    proc.wait()
+                except Exception:
+                    pass
+                finally:
+                    log.close()
 
     sys.path.insert(0, HERE)
     import differ
