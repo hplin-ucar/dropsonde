@@ -253,6 +253,46 @@ def arg_symbols(frame):
 
 _END_SUB_RE = re.compile(r"^\s*end\s+subroutine\b", re.I)
 
+# Heuristic classification of a source line as executable, used only to
+# sanity-check the errmsg-sentinel assumption below. Declarations carry '::'
+# or open with a declaration keyword; executable statements open with a
+# control keyword or look like an assignment.
+_DECL_KEYWORD_RE = re.compile(
+    r"^\s*(real|integer|logical|character|complex|double\s+precision|"
+    r"type\s*[(,:]|class\s*[(,:]|use\b|implicit\b|save\b|parameter\b|"
+    r"dimension\b|external\b|intrinsic\b|pointer\b|allocatable\b|target\b|"
+    r"optional\b|public\b|private\b|protected\b|procedure\b|import\b|"
+    r"interface\b|abstract\b|end\b|data\b|equivalence\b|common\b|"
+    r"namelist\b|format\b|entry\b|include\b|sequence\b|contiguous\b|"
+    r"volatile\b|value\b|enum\b|enumerator\b)", re.I)
+_EXEC_LOOK_RE = re.compile(
+    r"^\s*(call\b|if\s*\(|do\b|select\s+case|where\s*\(|associate\s*\(|"
+    r"forall\s*\(|block\b|[a-z]\w*(\s*\([^)]*\))?\s*=[^=>])", re.I)
+
+
+def _exec_lines_before(lines, start, stop):
+    """1-based line numbers in [start, stop) that look like executable
+    statements. The drive loop assumes the errmsg=''/errflg=0 sentinel is the
+    FIRST executable statement of the body; anything executable before it
+    means entry capture happens mid-body (intent(inout) inputs possibly
+    already mutated) -- a convention, not a guarantee, for portable (non-CCPP
+    -wrapper) subroutines, so it is checked and warned about rather than
+    trusted. Skips blanks, comments, preprocessor lines, continuation lines,
+    and declarations."""
+    suspects = []
+    cont = False
+    for idx in range(start - 1, stop - 1):
+        code = lines[idx].split("!", 1)[0].strip()
+        was_cont = cont
+        cont = code.endswith("&")
+        if was_cont or not code or code.startswith("#"):
+            continue
+        if "::" in code or _DECL_KEYWORD_RE.match(code):
+            continue
+        if _EXEC_LOOK_RE.match(code):
+            suspects.append(idx + 1)
+    return suspects
+
 
 def _first_body_line(scheme, frame):
     """(filename, line) of the first executable statement of the scheme's
@@ -279,6 +319,15 @@ def _first_body_line(scheme, frame):
             if _ERR_INIT_RE.match(lines[idx]):
                 result = (fname, idx + 1)
                 break
+        if result is not None:
+            suspects = _exec_lines_before(lines, start, result[1])
+            if suspects:
+                note("{}: WARNING: {} executable-looking line(s) precede "
+                     "the errmsg/errflg init at {}:{} (first: line {}); "
+                     "entry capture happens there and may reflect mid-body "
+                     "state".format(scheme, len(suspects),
+                                    os.path.basename(fname), result[1],
+                                    suspects[0]))
     except Exception as exc:
         note("{}: body-line scan failed: {}".format(scheme, exc))
     if result is not None:
@@ -402,6 +451,13 @@ def _capture_abi(scheme, hit, name, sym, idx, frame, info):
         if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
             info["why"] = "derived-type array via ABI not captured"
             return
+        # Known gap: an EXPLICIT-shape stack-passed dummy (b(ncol,pver)) is a
+        # raw data pointer, not a descriptor, and gdb's type info here does
+        # not distinguish the two. Decoding data bytes as a descriptor is
+        # expected to fail _descriptor_plan's plausibility gates (rank 1-7 at
+        # +28, non-null base, non-negative extents) -- probabilistic, not
+        # principled. If a capture from this path ever looks wrong, check
+        # whether the dummy is explicit-shape.
         plan, err = _descriptor_plan(ptr, elem)
         if plan is None:
             info["kind"] = "error"
@@ -727,10 +783,15 @@ def _qualified(short):
 
 
 def _make_bp(cls, specs, *args):
-    """Create a breakpoint, trying each spec. The Python API ignores
-    'set breakpoint pending off' and silently creates PENDING breakpoints
-    for missing symbols (calibrated on gdb 16.2), so check and delete."""
+    """Create a breakpoint, trying each spec. A spec may be a callable
+    (evaluated only if every earlier spec failed): _qualified sweeps the
+    whole symbol table per call, so the gfortran fast path must not pay for
+    the Intel fallback. The Python API ignores 'set breakpoint pending off'
+    and silently creates PENDING breakpoints for missing symbols (calibrated
+    on gdb 16.2), so check and delete."""
     for spec in specs:
+        if callable(spec):
+            spec = spec()
         if not spec:
             continue
         try:
@@ -770,7 +831,7 @@ def setup():
         # demangles Intel symbols to (module_mp_<scheme>_run_ -> module::run).
         bp = _make_bp(EntryBP,
                       (s + "_run", "__{0}_MOD_{0}_run".format(s),
-                       _qualified(s + "_run")), s)
+                       lambda s=s: _qualified(s + "_run")), s)
         if bp is None:
             MANIFEST["breakpoints"][s] = "missing"
         else:
@@ -779,7 +840,7 @@ def setup():
     note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
 
     step_bp = _make_bp(StepBP, ("cam_run1", "__cam_comp_MOD_cam_run1",
-                                _qualified("cam_run1")))
+                                lambda: _qualified("cam_run1")))
     if step_bp is None:
         note("WARNING: cam_run1 sentinel not found; hits will not be "
              "timestep-tagged and the run will not auto-terminate")
