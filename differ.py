@@ -42,6 +42,43 @@ ELSIZE = {"f8": 8, "f4": 4, "i8": 8, "i4": 4, "i2": 2, "i1": 1}
 # instantly anyway; iulog is each model's own log unit number.
 SKIP_ARGS = {"errmsg", "errflg", "iulog"}
 
+# --- portable MAM aerosol routines (modal_aero_gasaerexch/rename) -----------
+# These are called from two different constituent-index conventions. CAM passes
+# the mozart vmr/vmrcw arrays (gas_pcnst wide, loffset=imozart-1) with pointer
+# arrays in full pcnst-space; SIMA passes one packed constituent array
+# (loffset=0). Inside the routine every constituent is reached as
+# array(:,:, pointer - loffset). So the constituent axis of these args cannot be
+# compared byte-for-byte: it must be realigned per species by shifting each
+# model's own loffset (see the _portable_* helpers). A hit is treated as
+# MAM-convention when it carries a `loffset` argument on both sides.
+
+# constituent-indexed args, tagged by which per-model array they live in:
+#   'q'    = interstitial (CAM mozart vmr)
+#   'qqcw' = cloud-borne  (CAM separate vmrcw array; SIMA packs it alongside q)
+PORTABLE_CONST_ARG_ROLE = {
+    "q": "q", "dqdt": "q", "dqdt_other": "q", "dotendrn": "q",
+    "qsrflx": "q", "qsrflx_gaexch": "q", "dqdt_rnpos": "q", "dotend": "q",
+    "qqcw": "qqcw", "dqqcwdt": "qqcw", "dqqcwdt_other": "qqcw",
+    "dotendqqcwrn": "qqcw", "qqcwsrflx": "qqcw",
+}
+
+# Index-space / sentinel args: their values are in each model's own constituent
+# space (pcnst vs packed) or are unused-slot fill, so they are expected to
+# differ and carry no physics signal. Noted, never counted as divergences.
+PORTABLE_CONVENTION_ARGS = {
+    "loffset", "num_q",
+    "lmassptr_amode", "lmassptrcw_amode", "numptr_amode", "numptrcw_amode",
+    "lspecfrma_renamexf", "lspecfrmc_renamexf",
+    "lspectooa_renamexf", "lspectooc_renamexf",
+    "modeptr_stracoar",
+}
+
+# Mode/species physical-constant tables, shape (nspec_max, ntot_amode). Unused
+# (species,mode) slots hold different padding fill in each model; the valid
+# slots (a real species) should match. Compared only over slots where both
+# models have a positive lmassptr_amode entry.
+PORTABLE_METADATA_ARGS = {"specmw_amode", "specdens_amode"}
+
 
 def load_role(outdir, role):
     d = os.path.join(outdir, role)
@@ -243,8 +280,133 @@ def kdesc(info):
     return "{} ({})".format(k, why) if why else str(k)
 
 
+def _species_slab(data, elsize, extents, axis, si):
+    """Bytes for the si-th (0-based) species along `axis` of a Fortran-order
+    (column-major) dump. Last-axis species are a contiguous block (fast path);
+    an interior axis (e.g. qsrflx (ncol,nspec,nsrflx)) is a strided gather."""
+    inner = 1
+    for e in extents[:axis]:
+        inner *= e
+    block = inner * elsize                      # bytes per species step
+    if axis == len(extents) - 1:
+        return data[si * block:(si + 1) * block]
+    outer = 1
+    for e in extents[axis + 1:]:
+        outer *= e
+    period = block * extents[axis]              # bytes per step of the next axis
+    base = si * block
+    return b"".join(data[base + o * period:base + o * period + block]
+                    for o in range(outer))
+
+
+def _const_axis(sext, cext, sima_names):
+    """Axis carrying the constituent index for a portable MAM arg, or None.
+    Anchored on SIMA, whose packed array length == number of registered
+    constituents; every other axis must agree between the two models."""
+    if len(sext) != len(cext) or not sima_names:
+        return None
+    for k in range(len(sext)):
+        if (sext[k] == len(sima_names) and
+                sext[:k] == cext[:k] and sext[k + 1:] == cext[k + 1:]):
+            return k
+    return None
+
+
+def _portable_ctx(srec, crec, sman, cman, const_ctx):
+    """Per-hit realignment context for a MAM-convention hit, or None. Carries
+    each side's loffset, the interstitial species pairs already shifted into
+    per-model local (array) index space, and the valid mode/species mask used
+    for the physical-constant tables."""
+    sa = srec["args"].get("loffset")
+    ca = crec["args"].get("loffset")
+    if not sa or not ca:
+        return None
+    loff_s = sa.get("entry_value")
+    loff_c = ca.get("entry_value")
+    if loff_s is None or loff_c is None:
+        return None
+    _cam_names, _sima_names, pairs = const_ctx
+    # pairs are 0-based (cam_full, sima_full); local index = full - loffset
+    q_local = [(sj - loff_s, ci - loff_c, cn, sn)
+               for (ci, sj, cn, sn) in pairs
+               if sj - loff_s >= 0 and ci - loff_c >= 0]
+    # valid (species,mode) slots: a real species has lmassptr_amode > 0 in both
+    valid = set()
+    la = srec["args"].get("lmassptr_amode")
+    lc = crec["args"].get("lmassptr_amode")
+    if (la and lc and la.get("entry_file") and lc.get("entry_file") and
+            la.get("dtype") == lc.get("dtype")):
+        sv = unpack(blob(sman, la["entry_file"]), la["dtype"])
+        cv = unpack(blob(cman, lc["entry_file"]), lc["dtype"])
+        for k in range(min(len(sv), len(cv))):
+            if sv[k] > 0 and cv[k] > 0:
+                valid.add(k)
+    return {"loff_s": loff_s, "loff_c": loff_c,
+            "q_local": q_local, "valid": valid}
+
+
+def _compare_interstitial(label, hit, phase, arg, sdata, cdata, dt, sext, cext,
+                          axis, local_pairs, los, rep):
+    """Compare a constituent-indexed interstitial/gas array per mapped species,
+    each side indexed in its own local (array) space."""
+    elsize = ELSIZE[dt]
+    n_s, n_c = sext[axis], cext[axis]
+    res_ext = [e for i, e in enumerate(sext) if i != axis]
+    res_los = [l for i, l in enumerate(los) if i != axis]
+    lines, diff_names = [], []
+    for sj, ci, cn, sn in local_pairs:
+        if not (0 <= sj < n_s and 0 <= ci < n_c):
+            continue
+        ss = _species_slab(sdata, elsize, sext, axis, sj)
+        cs = _species_slab(cdata, elsize, cext, axis, ci)
+        if not res_ext:                        # one element per species
+            txt = None
+            if ss != cs:
+                txt = "sima={} cam={}".format(fmt_val(unpack(ss, dt)[0]),
+                                              fmt_val(unpack(cs, dt)[0]))
+        else:
+            txt = array_diff_text(ss, cs, dt, res_ext, res_los)
+        if txt:
+            diff_names.append(cn)
+            lines.append("{} (cam idx {}, sima idx {}) <-> {}: {}".format(
+                cn, ci + 1, sj + 1, sn, txt))
+    if lines:
+        rep.diff(label, hit, phase, arg,
+                 "constituent-indexed array (interstitial, per-model local "
+                 "index), {}/{} mapped species differ: {}".format(
+                     len(lines), len(local_pairs), ", ".join(diff_names)),
+                 lines)
+
+
+def _compare_metadata_valid(label, hit, phase, arg, sdata, cdata, dt, ext,
+                            los, valid, rep):
+    """Compare a mode/species constant table over valid slots only; unused
+    padding slots hold different fill in each model and are ignored."""
+    va, vb = unpack(sdata, dt), unpack(cdata, dt)
+    count, worst = 0, None
+    for k in range(min(len(va), len(vb))):
+        if k not in valid:
+            continue
+        x, y = va[k], vb[k]
+        if x == y or (x != x and y != y):
+            continue
+        count += 1
+        d = abs(x - y)
+        if d != d:
+            d = float("inf")
+        if worst is None or d > worst[0]:
+            worst = (d, k, x, y)
+    if count:
+        d, li, x, y = worst
+        rep.diff(label, hit, phase, arg,
+                 "{}/{} valid slots differ (unused padding ignored), max "
+                 "|diff| {:.3e} at {}: sima={} cam={}".format(
+                     count, len(valid), d, lin_to_sub(li, ext, los),
+                     fmt_val(x), fmt_val(y)))
+
+
 def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
-                 const_ctx, rep, intent=None):
+                 const_ctx, rep, intent=None, port=None):
     fkey = phase + "_file"
     vkey = phase + "_value"
     cam_names, sima_names, pairs = const_ctx
@@ -278,6 +440,22 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
         cext = cinfo["extents"]
         sdata = blob(sman, sfile)
         cdata = blob(cman, cfile)
+
+        # portable MAM args: realign the constituent axis into each model's own
+        # local (array) index space before comparing (see PORTABLE_* tables).
+        if port is not None:
+            if arg in PORTABLE_METADATA_ARGS:
+                _compare_metadata_valid(label, hit, phase, arg, sdata, cdata,
+                                        dt, sext, sinfo["los"], port["valid"],
+                                        rep)
+                return
+            if PORTABLE_CONST_ARG_ROLE.get(arg) == "q":
+                axis = _const_axis(sext, cext, const_ctx[1])
+                if axis is not None:
+                    _compare_interstitial(label, hit, phase, arg, sdata, cdata,
+                                          dt, sext, cext, axis, port["q_local"],
+                                          sinfo["los"], rep)
+                    return
 
         # constituent-indexed array: last dim is the constituent index,
         # e.g. q(ncol,pver,pcnst), fluxes cflx(ncol,pcnst), or per-species
@@ -373,6 +551,8 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
     hit = srec.get("_occ", srec["hit"])
     sch_int = (intents or {}).get(srec["scheme"], {})
     rep.cur_scheme = srec["scheme"]
+    port = _portable_ctx(srec, crec, sman, cman, const_ctx)
+    conv, cloudborne = set(), set()
     entry_diffed = set()
     for phase in ("entry", "exit"):
         suppressed = []
@@ -390,12 +570,19 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
                     rep.note("{} (hit {}): arg {} absent on CAM side".format(
                         label, hit, arg))
                 continue
+            if port is not None:
+                if arg in PORTABLE_CONVENTION_ARGS:
+                    conv.add(arg)
+                    continue
+                if PORTABLE_CONST_ARG_ROLE.get(arg) == "qqcw":
+                    cloudborne.add(arg)
+                    continue
             if phase == "exit" and arg in entry_diffed:
                 suppressed.append(arg)
                 continue
             pre = rep.n_diffs
             _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
-                         const_ctx, rep, it)
+                         const_ctx, rep, it, port)
             if phase == "entry" and rep.n_diffs > pre:
                 entry_diffed.add(arg)
         if phase == "exit" and suppressed:
@@ -407,6 +594,14 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
             rep.first_pair_seen = True
             if rep.n_diffs > 0:
                 rep.alignment_suspect = True
+    if conv:
+        rep.note("{} (hit {}): index-space/convention args not compared "
+                 "(expected to differ between models): {}".format(
+                     label, hit, ", ".join(sorted(conv))))
+    if cloudborne:
+        rep.note("{} (hit {}): cloud-borne args not yet compared "
+                 "(cross-array remap pending): {}".format(
+                     label, hit, ", ".join(sorted(cloudborne))))
 
 
 def shared_caller_map(cam, sima):
