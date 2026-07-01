@@ -312,11 +312,60 @@ def _const_axis(sext, cext, sima_names):
     return None
 
 
+def _int_arg(man, args, name):
+    """Decoded integer entry values of a pointer arg, or None if not captured."""
+    info = args.get(name)
+    if not info or not info.get("entry_file"):
+        return None
+    return unpack(blob(man, info["entry_file"]), info["dtype"])
+
+
+def _cloudborne_pairs(srec, crec, sman, cman, loff_s, loff_c, valid,
+                      sima_names):
+    """Cloud-borne (qqcw) species pairs (sima_local, cam_local, name, name) in
+    each model's local index space. CAM keeps cloud-borne in a separate vmrcw
+    array with no registered constituent name, so alignment is driven by the
+    captured mode/species pointer arrays keyed by (species,mode) slot -- the
+    same logical MAM table in both models -- rather than the constituent map.
+    lmassptrcw_amode/numptrcw_amode hold pcnst-space indices; local = ptr -
+    loffset. Species names come from SIMA's registered cloud-borne (*_c*)
+    constituents for reporting."""
+    pairs = []
+
+    def add(sptr, cptr):
+        # pointers are 1-based pcnst-space indices; the routine reads
+        # array(:,:, ptr - loffset), so the 0-based local index is
+        # ptr - loffset - 1.
+        if sptr is None or cptr is None:
+            return
+        sj, ci = sptr - loff_s - 1, cptr - loff_c - 1
+        if sj < 0 or ci < 0:
+            return
+        nm = sima_names[sptr - 1] if 0 < sptr <= len(sima_names) else "?"
+        pairs.append((sj, ci, nm, nm))
+
+    # mass species: valid (species,mode) slots only (padding holds fill)
+    lms = _int_arg(sman, srec["args"], "lmassptrcw_amode")
+    lmc = _int_arg(cman, crec["args"], "lmassptrcw_amode")
+    if lms is not None and lmc is not None:
+        for k in sorted(valid):
+            if k < len(lms) and k < len(lmc):
+                add(lms[k], lmc[k])
+    # number species: one per aerosol mode
+    nms = _int_arg(sman, srec["args"], "numptrcw_amode")
+    nmc = _int_arg(cman, crec["args"], "numptrcw_amode")
+    if nms is not None and nmc is not None:
+        for k in range(min(len(nms), len(nmc))):
+            if nms[k] > 0 and nmc[k] > 0:
+                add(nms[k], nmc[k])
+    return pairs
+
+
 def _portable_ctx(srec, crec, sman, cman, const_ctx):
     """Per-hit realignment context for a MAM-convention hit, or None. Carries
     each side's loffset, the interstitial species pairs already shifted into
-    per-model local (array) index space, and the valid mode/species mask used
-    for the physical-constant tables."""
+    per-model local (array) index space, the valid mode/species mask used for
+    the physical-constant tables, and the cloud-borne (qqcw) species pairs."""
     sa = srec["args"].get("loffset")
     ca = crec["args"].get("loffset")
     if not sa or not ca:
@@ -325,7 +374,7 @@ def _portable_ctx(srec, crec, sman, cman, const_ctx):
     loff_c = ca.get("entry_value")
     if loff_s is None or loff_c is None:
         return None
-    _cam_names, _sima_names, pairs = const_ctx
+    _cam_names, sima_names, pairs = const_ctx
     # pairs are 0-based (cam_full, sima_full); local index = full - loffset
     q_local = [(sj - loff_s, ci - loff_c, cn, sn)
                for (ci, sj, cn, sn) in pairs
@@ -341,14 +390,17 @@ def _portable_ctx(srec, crec, sman, cman, const_ctx):
         for k in range(min(len(sv), len(cv))):
             if sv[k] > 0 and cv[k] > 0:
                 valid.add(k)
-    return {"loff_s": loff_s, "loff_c": loff_c,
-            "q_local": q_local, "valid": valid}
+    qqcw_local = _cloudborne_pairs(srec, crec, sman, cman, loff_s, loff_c,
+                                   valid, sima_names)
+    return {"loff_s": loff_s, "loff_c": loff_c, "q_local": q_local,
+            "valid": valid, "qqcw_local": qqcw_local}
 
 
-def _compare_interstitial(label, hit, phase, arg, sdata, cdata, dt, sext, cext,
-                          axis, local_pairs, los, rep):
-    """Compare a constituent-indexed interstitial/gas array per mapped species,
-    each side indexed in its own local (array) space."""
+def _compare_species_axis(label, hit, phase, arg, sdata, cdata, dt, sext, cext,
+                          axis, local_pairs, los, rep, space):
+    """Compare a constituent-indexed array per mapped species, each side
+    indexed in its own local (array) space. `space` labels which set of pairs
+    is used ('interstitial' or 'cloud-borne')."""
     elsize = ELSIZE[dt]
     n_s, n_c = sext[axis], cext[axis]
     res_ext = [e for i, e in enumerate(sext) if i != axis]
@@ -372,8 +424,8 @@ def _compare_interstitial(label, hit, phase, arg, sdata, cdata, dt, sext, cext,
                 cn, ci + 1, sj + 1, sn, txt))
     if lines:
         rep.diff(label, hit, phase, arg,
-                 "constituent-indexed array (interstitial, per-model local "
-                 "index), {}/{} mapped species differ: {}".format(
+                 "constituent-indexed array ({}, per-model local "
+                 "index), {}/{} mapped species differ: {}".format(space,
                      len(lines), len(local_pairs), ", ".join(diff_names)),
                  lines)
 
@@ -449,12 +501,16 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
                                         dt, sext, sinfo["los"], port["valid"],
                                         rep)
                 return
-            if PORTABLE_CONST_ARG_ROLE.get(arg) == "q":
+            role = PORTABLE_CONST_ARG_ROLE.get(arg)
+            local = {"q": port["q_local"],
+                     "qqcw": port["qqcw_local"]}.get(role)
+            if local is not None:
                 axis = _const_axis(sext, cext, const_ctx[1])
                 if axis is not None:
-                    _compare_interstitial(label, hit, phase, arg, sdata, cdata,
-                                          dt, sext, cext, axis, port["q_local"],
-                                          sinfo["los"], rep)
+                    space = "interstitial" if role == "q" else "cloud-borne"
+                    _compare_species_axis(label, hit, phase, arg, sdata, cdata,
+                                          dt, sext, cext, axis, local,
+                                          sinfo["los"], rep, space)
                     return
 
         # constituent-indexed array: last dim is the constituent index,
@@ -552,7 +608,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
     sch_int = (intents or {}).get(srec["scheme"], {})
     rep.cur_scheme = srec["scheme"]
     port = _portable_ctx(srec, crec, sman, cman, const_ctx)
-    conv, cloudborne = set(), set()
+    conv = set()
     entry_diffed = set()
     for phase in ("entry", "exit"):
         suppressed = []
@@ -570,13 +626,9 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
                     rep.note("{} (hit {}): arg {} absent on CAM side".format(
                         label, hit, arg))
                 continue
-            if port is not None:
-                if arg in PORTABLE_CONVENTION_ARGS:
-                    conv.add(arg)
-                    continue
-                if PORTABLE_CONST_ARG_ROLE.get(arg) == "qqcw":
-                    cloudborne.add(arg)
-                    continue
+            if port is not None and arg in PORTABLE_CONVENTION_ARGS:
+                conv.add(arg)
+                continue
             if phase == "exit" and arg in entry_diffed:
                 suppressed.append(arg)
                 continue
@@ -598,10 +650,6 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
         rep.note("{} (hit {}): index-space/convention args not compared "
                  "(expected to differ between models): {}".format(
                      label, hit, ", ".join(sorted(conv))))
-    if cloudborne:
-        rep.note("{} (hit {}): cloud-borne args not yet compared "
-                 "(cross-array remap pending): {}".format(
-                     label, hit, ", ".join(sorted(cloudborne))))
 
 
 def shared_caller_map(cam, sima):
@@ -878,12 +926,14 @@ def _report(outdir, suite_order, steps, intents=None):
         print("")
         print("  *** WARNING: {} CAM and {} SIMA constituents are "
               "UNMATCHED on both sides.".format(len(cam_un), len(sima_un)))
-        print("  *** These species will NOT be compared in "
-              "constituent-indexed arrays.")
-        print("  *** This often indicates a missing entry in "
-              "SPECIAL_CONST_MAP (differ.py) or a")
-        print("  *** duplicate/mismatched standard name in the "
-              "registry (see example 3 in docs/).")
+        print("  *** They are not name-matched, so they are not compared "
+              "via the constituent map (portable")
+        print("  *** MAM cloud-borne *_c* species are an expected exception: "
+              "they carry no CAM constituent")
+        print("  *** name and are realigned separately from the pointer "
+              "arrays). Otherwise this often means a")
+        print("  *** missing SPECIAL_CONST_MAP entry (differ.py) or a "
+              "duplicate standard name (see example 3 in docs/).")
         print("  *** Unmatched CAM:  {}".format(
             ", ".join(cn for _, cn in cam_un)))
         print("  *** Unmatched SIMA: {}".format(

@@ -71,33 +71,54 @@ class Builder(object):
 
 SCHEME = "modal_aero_rename_ccpp"
 
+# One aerosol mode with one mass species (so4) plus a number, each with an
+# interstitial (*_a*) and a cloud-borne (*_c*) form. Pointer arrays hold
+# 1-based pcnst-space indices; the routine reads array(:,:, ptr - loffset).
+#
+#   CAM  : vmr/vmrcw are gas_pcnst=3 wide, loffset=1. Cloud-borne lives in a
+#          separate vmrcw at the SAME index as its interstitial partner and is
+#          not a registered constituent.  full 1-based: Q,so4_a1,num_a1,H2SO4
+#   SIMA : one packed array, loffset=0, all species (incl. *_c*) registered.
+#          full 1-based: H2SO4,so4_a1,num_a1,Q,so4_c1,num_c1
+CAM_CNST = ["Q", "so4_a1", "num_a1", "H2SO4"]
+SIMA_CNST = ["H2SO4", "so4_a1", "num_a1", "Q", "so4_c1", "num_c1"]
+
 
 def args_for(b, is_cam):
-    # CAM: 3-wide vmr (gas_pcnst), loffset=1, full indices 2,3,4 -> local 1,2,3
-    #      = bc_a1, so4_a1, H2SO4 (Q at full idx 1 is out of the vmr range).
-    # SIMA: 4-wide packed array, loffset=0, permuted order.
     if is_cam:
-        q = f8(1.0, 1.0) + f8(2.0, 2.0) + f8(3.0, 3.0)        # bc, so4, H2SO4
-        specmw = f8(10.0, 20.0, 30.0, 111.0)                  # slot 4 = padding
-        lmassptr = i4(1, 3, 2, -999999)                       # slot 4 invalid
-        qqcw = f8(0.0, 0.0) + f8(0.0, 0.0) + f8(0.0, 0.0)
+        # q local (full-1): 0=so4_a1, 1=num_a1, 2=H2SO4  (Q at full 1 excluded)
+        q = f8(1.0, 1.0) + f8(2.0, 2.0) + f8(3.0, 3.0)
+        # qqcw local: 0=so4_c1, 1=num_c1, 2=unused
+        qqcw = f8(10.0, 10.0) + f8(20.0, 20.0) + f8(0.0, 0.0)
+        specmw = f8(115.0, 999.0)                 # slot 2 = unused padding
+        lmassptr = i4(2, -999999)                 # so4_a1 @ full 2; slot 2 pad
+        lmassptrcw = i4(2, 0)                      # cloud uses interstitial idx
+        numptr = i4(3)                             # num_a1 @ full 3
+        numptrcw = i4(3)                           # cloud uses interstitial idx
         loff, nq = 1, 3
-        nspec = 3
     else:
-        # sima order: H2SO4(0), so4_a1(1), bc_a1(2), Q(3)
-        q = f8(3.0, 3.0) + f8(2.0, 99.0) + f8(1.0, 1.0) + f8(7.0, 7.0)
-        specmw = f8(10.0, 20.0, 30.0, 222.0)                  # slot 4 = padding
-        lmassptr = i4(1, 3, 2, -1)                            # slot 4 invalid
-        qqcw = f8(0.0, 0.0) + f8(0.0, 0.0) + f8(0.0, 0.0) + f8(0.0, 0.0)
-        loff, nq = 0, 4
-        nspec = 4
+        # q local: 0=H2SO4,1=so4_a1,2=num_a1,3=Q,4=so4_c1,5=num_c1
+        q = (f8(3.0, 3.0) + f8(1.0, 99.0) + f8(2.0, 2.0) +
+             f8(7.0, 7.0) + f8(5.0, 5.0) + f8(6.0, 6.0))     # so4_a1 differs
+        qqcw = (f8(0.0, 0.0) + f8(0.0, 0.0) + f8(0.0, 0.0) +
+                f8(0.0, 0.0) + f8(10.0, 10.0) + f8(20.0, 77.0))  # num_c1 differs
+        specmw = f8(115.0, 888.0)                 # slot 2 = unused padding
+        lmassptr = i4(2, -1)
+        lmassptrcw = i4(5, -1)                     # so4_c1 @ full 5
+        numptr = i4(3)
+        numptrcw = i4(6)                           # num_c1 @ full 6
+        loff, nq = 0, 6
+    nspec = nq
     return {
         "loffset": b.scal(loff),
         "num_q": b.scal(nq),
         "q": b.arr([2, 1, nspec], q),
         "qqcw": b.arr([2, 1, nspec], qqcw),
-        "specmw_amode": b.arr([2, 2], specmw),
-        "lmassptr_amode": b.arr([2, 2], lmassptr, "i4"),
+        "specmw_amode": b.arr([2, 1], specmw),
+        "lmassptr_amode": b.arr([2, 1], lmassptr, "i4"),
+        "lmassptrcw_amode": b.arr([2, 1], lmassptrcw, "i4"),
+        "numptr_amode": b.arr([1], numptr, "i4"),
+        "numptrcw_amode": b.arr([1], numptrcw, "i4"),
     }
 
 
@@ -107,8 +128,8 @@ def main():
     sima = Builder(outdir, "sima")
     for b in (cam, sima):
         b.man["breakpoints"] = {SCHEME: SCHEME + "_run"}
-    cam.man["constituents"] = ["Q", "bc_a1", "so4_a1", "H2SO4"]
-    sima.man["constituents"] = ["H2SO4", "so4_a1", "bc_a1", "Q"]
+    cam.man["constituents"] = CAM_CNST
+    sima.man["constituents"] = SIMA_CNST
 
     cam.hit(SCHEME, 0, 1, "tphysac", args_for(cam, True))    # step1 = garbage
     cam.hit(SCHEME, 0, 2, "tphysac", args_for(cam, True))    # step2 = real
@@ -134,25 +155,28 @@ def main():
             s, out)
 
     # interstitial realignment: only so4_a1 differs, labelled with both indices
-    need("1/3 mapped species differ: so4_a1")
-    need("so4_a1 (cam idx 2, sima idx 2) <-> so4_a1:")
+    need("(interstitial, per-model local index), 1/3 mapped species differ: "
+         "so4_a1")
+    need("so4_a1 (cam idx 1, sima idx 2) <-> so4_a1:")
+    # cloud-borne realignment via pointer arrays: only num_c1 differs
+    need("(cloud-borne, per-model local index), 1/2 mapped species differ: "
+         "num_c1")
+    need("num_c1 (cam idx 2, sima idx 6) <-> num_c1:")
     # matching / out-of-range species must not show up as differences
-    absent("differ: bc_a1")
     absent("H2SO4 (cam")
     absent(" Q (cam")
+    absent("so4_c1 (cam")     # cloud-borne match: no per-species diff line
     # convention args -> a note, never a divergence
     need("index-space/convention args not compared")
-    for a in ("lmassptr_amode", "loffset", "num_q"):
+    for a in ("lmassptr_amode", "lmassptrcw_amode", "numptr_amode",
+              "numptrcw_amode", "loffset", "num_q"):
         need(a)
         absent("arg {}:".format(a))
-    # constant table compared over valid slots only (padding slot 4 ignored)
+    # constant table compared over valid slots only (padding slot 2 ignored)
     absent("specmw_amode")
-    # cloud-borne deferred
-    need("cloud-borne args not yet compared")
-    need("qqcw")
 
-    print("portable test passed: interstitial per-species realignment, "
-          "convention notes, valid-slot metadata, cloud-borne deferral")
+    print("portable test passed: interstitial + cloud-borne per-species "
+          "realignment, convention notes, valid-slot metadata")
 
 
 if __name__ == "__main__":
