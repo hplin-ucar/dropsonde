@@ -121,7 +121,12 @@ def _subroutine_intents(path, sym):
             lines = f.readlines()
     except OSError:
         return None
-    sub_re = re.compile(r"^\s*subroutine\s+{}\b".format(re.escape(sym)), re.I)
+    # Prefix keywords (pure/module/...) are legal on portable subroutines;
+    # match them explicitly -- a generic word-prefix would also match
+    # 'end subroutine <sym>'.
+    sub_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|non_recursive|module)"
+        r"\s+)*subroutine\s+{}\b".format(re.escape(sym)), re.I)
     start = None
     for i, ln in enumerate(lines):
         if sub_re.match(ln):

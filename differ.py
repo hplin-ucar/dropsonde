@@ -240,14 +240,14 @@ def _disp_scheme(scheme, portable):
 
 
 class Reporter(object):
-    def __init__(self):
+    def __init__(self, portable=None):
         self.n_diffs = 0
         self.first_printed = False
         self.alignment_suspect = False
         self.first_pair_seen = False
         self.cur_scheme = None
         self.by_scheme = {}  # scheme -> [entry_diffs, exit_diffs]
-        self.portable = {}   # scheme -> portable_sub, for display labels
+        self.portable = portable or {}  # scheme -> portable_sub, for labels
 
     def diff(self, scheme, hit, phase, arg, text, extra_lines=None):
         self.n_diffs += 1
@@ -1100,8 +1100,7 @@ def _report(outdir, suite_order, steps, intents=None):
     # --- stream-order comparison ----------------------------------------
     print("")
     print("comparison (execution order):")
-    rep = Reporter()
-    rep.portable = portable
+    rep = Reporter(portable)
     n_pairs = 0
     first_srec = None
     matched_cam = {}  # group key -> set of cam occurrences already paired
