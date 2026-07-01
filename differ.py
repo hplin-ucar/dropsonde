@@ -42,42 +42,72 @@ ELSIZE = {"f8": 8, "f4": 4, "i8": 8, "i4": 4, "i2": 2, "i1": 1}
 # instantly anyway; iulog is each model's own log unit number.
 SKIP_ARGS = {"errmsg", "errflg", "iulog"}
 
-# --- portable MAM aerosol routines (modal_aero_gasaerexch/rename) -----------
-# These are called from two different constituent-index conventions. CAM passes
-# the mozart vmr/vmrcw arrays (gas_pcnst wide, loffset=imozart-1) with pointer
-# arrays in full pcnst-space; SIMA passes one packed constituent array
-# (loffset=0). Inside the routine every constituent is reached as
-# array(:,:, pointer - loffset). So the constituent axis of these args cannot be
-# compared byte-for-byte: it must be realigned per species by shifting each
-# model's own loffset (see the _portable_* helpers). A hit is treated as
-# MAM-convention when it carries a `loffset` argument on both sides.
+# --- constituent-index realignment specs (--realign) ------------------------
+# Some portable subroutines are called from two different constituent-index
+# conventions (e.g. MAM's modal_aero_gasaerexch/rename: CAM passes the mozart
+# vmr/vmrcw arrays, gas_pcnst wide with loffset=imozart-1 and pointer arrays
+# in full pcnst-space; SIMA passes one packed constituent array, loffset=0).
+# Inside the routine every constituent is reached as
+# array(:,:, pointer - loffset), so the constituent axis cannot be compared
+# byte-for-byte: it must be realigned per species by shifting each model's own
+# offset. Which args are constituent-indexed, which carry index-space values,
+# and which pointer arrays drive alignment is scheme-family knowledge and
+# lives in a JSON spec (see docs/realign_mam.json), copied by the dropsonde
+# driver into <out>/realign.json. Edit that copy and re-run
+# `python3 differ.py <out>` to iterate without re-running the models.
+# Realignment applies only to hits of portable-annotated schemes that carry
+# the spec's offset arg on both sides.
 
-# constituent-indexed args, tagged by which per-model array they live in:
-#   'q'    = interstitial (CAM mozart vmr)
-#   'qqcw' = cloud-borne  (CAM separate vmrcw array; SIMA packs it alongside q)
-PORTABLE_CONST_ARG_ROLE = {
-    "q": "q", "dqdt": "q", "dqdt_other": "q", "dotendrn": "q",
-    "qsrflx": "q", "qsrflx_gaexch": "q", "dqdt_rnpos": "q", "dotend": "q",
-    "qqcw": "qqcw", "dqqcwdt": "qqcw", "dqqcwdt_other": "qqcw",
-    "dotendqqcwrn": "qqcw", "qqcwsrflx": "qqcw",
-}
 
-# Index-space / sentinel args: their values are in each model's own constituent
-# space (pcnst vs packed) or are unused-slot fill, so they are expected to
-# differ and carry no physics signal. Noted, never counted as divergences.
-PORTABLE_CONVENTION_ARGS = {
-    "loffset", "num_q",
-    "lmassptr_amode", "lmassptrcw_amode", "numptr_amode", "numptrcw_amode",
-    "lspecfrma_renamexf", "lspecfrmc_renamexf",
-    "lspectooa_renamexf", "lspectooc_renamexf",
-    "modeptr_stracoar",
-}
+def load_realign(path):
+    """Parsed realign spec from `path`, or None if the file doesn't exist.
+    An invalid spec terminates with a clear message -- silently ignoring a
+    typo'd spec would produce a report that looks wrong for other reasons."""
+    if not os.path.isfile(path):
+        return None
 
-# Mode/species physical-constant tables, shape (nspec_max, ntot_amode). Unused
-# (species,mode) slots hold different padding fill in each model; the valid
-# slots (a real species) should match. Compared only over slots where both
-# models have a positive lmassptr_amode entry.
-PORTABLE_METADATA_ARGS = {"specmw_amode", "specdens_amode"}
+    def bad(msg):
+        sys.exit("dropsonde: invalid realign spec {}: {}".format(path, msg))
+
+    try:
+        with open(path) as f:
+            spec = json.load(f)
+    except ValueError as exc:
+        bad(exc)
+    if spec.get("spec") != "dropsonde-realign-v1":
+        bad('missing/unknown spec tag (want "spec": "dropsonde-realign-v1")')
+    if not isinstance(spec.get("offset_arg"), str):
+        bad("offset_arg must name the per-model index-offset argument")
+    spaces = spec.get("spaces")
+    if not isinstance(spaces, dict) or not spaces:
+        bad("spaces must map space names to {label, pairing, args}")
+    arg_space = {}  # arg name -> space name
+    for name, sp in spaces.items():
+        pairing = sp.get("pairing")
+        if pairing not in ("constituent-map", "pointer-arrays"):
+            bad("space {!r}: pairing must be 'constituent-map' or "
+                "'pointer-arrays'".format(name))
+        if pairing == "pointer-arrays" and not (
+                sp.get("mass_ptr") and sp.get("num_ptr")):
+            bad("space {!r}: pointer-arrays pairing needs mass_ptr and "
+                "num_ptr argument names".format(name))
+        for a in sp.get("args") or []:
+            if a in arg_space:
+                bad("arg {!r} mapped to both spaces {!r} and {!r}".format(
+                    a, arg_space[a], name))
+            arg_space[a] = name
+    if not arg_space:
+        bad("no args mapped to any space")
+    needs_mask = (spec.get("metadata_args") or
+                  any(sp.get("pairing") == "pointer-arrays"
+                      for sp in spaces.values()))
+    if needs_mask and not isinstance(spec.get("valid_slot_mask"), str):
+        bad("valid_slot_mask (pointer array marking real species slots) is "
+            "required by metadata_args and pointer-arrays pairing")
+    spec["_arg_space"] = arg_space
+    spec["_convention"] = set(spec.get("convention_args") or [])
+    spec["_metadata"] = set(spec.get("metadata_args") or [])
+    return spec
 
 
 def load_role(outdir, role):
@@ -320,22 +350,22 @@ def _int_arg(man, args, name):
     return unpack(blob(man, info["entry_file"]), info["dtype"])
 
 
-def _cloudborne_pairs(srec, crec, sman, cman, loff_s, loff_c, valid,
-                      sima_names):
-    """Cloud-borne (qqcw) species pairs (sima_local, cam_local, name, name) in
-    each model's local index space. CAM keeps cloud-borne in a separate vmrcw
-    array with no registered constituent name, so alignment is driven by the
-    captured mode/species pointer arrays keyed by (species,mode) slot -- the
-    same logical MAM table in both models -- rather than the constituent map.
-    lmassptrcw_amode/numptrcw_amode hold pcnst-space indices; local = ptr -
-    loffset. Species names come from SIMA's registered cloud-borne (*_c*)
+def _pointer_pairs(srec, crec, sman, cman, loff_s, loff_c, valid,
+                   sima_names, mass_ptr, num_ptr):
+    """Species pairs (sima_local, cam_local, name, name) in each model's
+    local index space, aligned from captured mode/species pointer arrays
+    keyed by (species,mode) slot -- the same logical table in both models --
+    rather than the constituent map. Used for species with no registered
+    constituent name on the CAM side (e.g. MAM cloud-borne, which CAM keeps
+    in a separate vmrcw array). The pointer arrays hold full-space 1-based
+    indices; local = ptr - offset. Species names come from SIMA's registered
     constituents for reporting."""
     pairs = []
 
     def add(sptr, cptr):
-        # pointers are 1-based pcnst-space indices; the routine reads
-        # array(:,:, ptr - loffset), so the 0-based local index is
-        # ptr - loffset - 1.
+        # pointers are 1-based full-space indices; the routine reads
+        # array(:,:, ptr - offset), so the 0-based local index is
+        # ptr - offset - 1.
         if sptr is None or cptr is None:
             return
         sj, ci = sptr - loff_s - 1, cptr - loff_c - 1
@@ -345,15 +375,15 @@ def _cloudborne_pairs(srec, crec, sman, cman, loff_s, loff_c, valid,
         pairs.append((sj, ci, nm, nm))
 
     # mass species: valid (species,mode) slots only (padding holds fill)
-    lms = _int_arg(sman, srec["args"], "lmassptrcw_amode")
-    lmc = _int_arg(cman, crec["args"], "lmassptrcw_amode")
+    lms = _int_arg(sman, srec["args"], mass_ptr)
+    lmc = _int_arg(cman, crec["args"], mass_ptr)
     if lms is not None and lmc is not None:
         for k in sorted(valid):
             if k < len(lms) and k < len(lmc):
                 add(lms[k], lmc[k])
     # number species: one per aerosol mode
-    nms = _int_arg(sman, srec["args"], "numptrcw_amode")
-    nmc = _int_arg(cman, crec["args"], "numptrcw_amode")
+    nms = _int_arg(sman, srec["args"], num_ptr)
+    nmc = _int_arg(cman, crec["args"], num_ptr)
     if nms is not None and nmc is not None:
         for k in range(min(len(nms), len(nmc))):
             if nms[k] > 0 and nmc[k] > 0:
@@ -361,13 +391,13 @@ def _cloudborne_pairs(srec, crec, sman, cman, loff_s, loff_c, valid,
     return pairs
 
 
-def _portable_ctx(srec, crec, sman, cman, const_ctx):
-    """Per-hit realignment context for a MAM-convention hit, or None. Carries
-    each side's loffset, the interstitial species pairs already shifted into
-    per-model local (array) index space, the valid mode/species mask used for
-    the physical-constant tables, and the cloud-borne (qqcw) species pairs."""
-    sa = srec["args"].get("loffset")
-    ca = crec["args"].get("loffset")
+def _portable_ctx(srec, crec, sman, cman, const_ctx, spec):
+    """Per-hit realignment context for a hit matching the realign spec, or
+    None. Carries the spec, each side's offset, per-space species pairs
+    shifted into per-model local (array) index space, and the valid
+    mode/species slot mask used for the physical-constant tables."""
+    sa = srec["args"].get(spec["offset_arg"])
+    ca = crec["args"].get(spec["offset_arg"])
     if not sa or not ca:
         return None
     loff_s = sa.get("entry_value")
@@ -375,32 +405,40 @@ def _portable_ctx(srec, crec, sman, cman, const_ctx):
     if loff_s is None or loff_c is None:
         return None
     _cam_names, sima_names, pairs = const_ctx
-    # pairs are 0-based (cam_full, sima_full); local index = full - loffset
-    q_local = [(sj - loff_s, ci - loff_c, cn, sn)
-               for (ci, sj, cn, sn) in pairs
-               if sj - loff_s >= 0 and ci - loff_c >= 0]
-    # valid (species,mode) slots: a real species has lmassptr_amode > 0 in both
+    # valid (species,mode) slots: a real species has a positive
+    # valid_slot_mask pointer entry in both models
     valid = set()
-    la = srec["args"].get("lmassptr_amode")
-    lc = crec["args"].get("lmassptr_amode")
-    if (la and lc and la.get("entry_file") and lc.get("entry_file") and
-            la.get("dtype") == lc.get("dtype")):
-        sv = unpack(blob(sman, la["entry_file"]), la["dtype"])
-        cv = unpack(blob(cman, lc["entry_file"]), lc["dtype"])
-        for k in range(min(len(sv), len(cv))):
-            if sv[k] > 0 and cv[k] > 0:
-                valid.add(k)
-    qqcw_local = _cloudborne_pairs(srec, crec, sman, cman, loff_s, loff_c,
-                                   valid, sima_names)
-    return {"loff_s": loff_s, "loff_c": loff_c, "q_local": q_local,
-            "valid": valid, "qqcw_local": qqcw_local}
+    mask = spec.get("valid_slot_mask")
+    if mask:
+        la = srec["args"].get(mask)
+        lc = crec["args"].get(mask)
+        if (la and lc and la.get("entry_file") and lc.get("entry_file") and
+                la.get("dtype") == lc.get("dtype")):
+            sv = unpack(blob(sman, la["entry_file"]), la["dtype"])
+            cv = unpack(blob(cman, lc["entry_file"]), lc["dtype"])
+            for k in range(min(len(sv), len(cv))):
+                if sv[k] > 0 and cv[k] > 0:
+                    valid.add(k)
+    local = {}
+    for name, sp in spec["spaces"].items():
+        if sp["pairing"] == "constituent-map":
+            # pairs are 0-based (cam_full, sima_full); local = full - offset
+            local[name] = [(sj - loff_s, ci - loff_c, cn, sn)
+                           for (ci, sj, cn, sn) in pairs
+                           if sj - loff_s >= 0 and ci - loff_c >= 0]
+        else:
+            local[name] = _pointer_pairs(
+                srec, crec, sman, cman, loff_s, loff_c, valid, sima_names,
+                sp["mass_ptr"], sp["num_ptr"])
+    return {"spec": spec, "loff_s": loff_s, "loff_c": loff_c,
+            "valid": valid, "local": local}
 
 
 def _compare_species_axis(label, hit, phase, arg, sdata, cdata, dt, sext, cext,
                           axis, local_pairs, los, rep, space):
     """Compare a constituent-indexed array per mapped species, each side
-    indexed in its own local (array) space. `space` labels which set of pairs
-    is used ('interstitial' or 'cloud-borne')."""
+    indexed in its own local (array) space. `space` is the realign-spec
+    label for the set of pairs used (e.g. 'interstitial', 'cloud-borne')."""
     elsize = ELSIZE[dt]
     n_s, n_c = sext[axis], cext[axis]
     res_ext = [e for i, e in enumerate(sext) if i != axis]
@@ -493,24 +531,23 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
         sdata = blob(sman, sfile)
         cdata = blob(cman, cfile)
 
-        # portable MAM args: realign the constituent axis into each model's own
-        # local (array) index space before comparing (see PORTABLE_* tables).
+        # realign-spec args: realign the constituent axis into each model's
+        # own local (array) index space before comparing.
         if port is not None:
-            if arg in PORTABLE_METADATA_ARGS:
+            spec = port["spec"]
+            if arg in spec["_metadata"]:
                 _compare_metadata_valid(label, hit, phase, arg, sdata, cdata,
                                         dt, sext, sinfo["los"], port["valid"],
                                         rep)
                 return
-            role = PORTABLE_CONST_ARG_ROLE.get(arg)
-            local = {"q": port["q_local"],
-                     "qqcw": port["qqcw_local"]}.get(role)
-            if local is not None:
+            space = spec["_arg_space"].get(arg)
+            if space is not None:
                 axis = _const_axis(sext, cext, const_ctx[1])
                 if axis is not None:
-                    space = "interstitial" if role == "q" else "cloud-borne"
-                    _compare_species_axis(label, hit, phase, arg, sdata, cdata,
-                                          dt, sext, cext, axis, local,
-                                          sinfo["los"], rep, space)
+                    _compare_species_axis(
+                        label, hit, phase, arg, sdata, cdata, dt, sext, cext,
+                        axis, port["local"][space], sinfo["los"], rep,
+                        spec["spaces"][space].get("label", space))
                     return
 
         # constituent-indexed array: last dim is the constituent index,
@@ -591,7 +628,8 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
                      "sima={} cam={}".format(fmt_val(sv), fmt_val(cv)))
 
 
-def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
+def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
+                realign=None):
     """Compare one aligned hit pair; entry args first, then exit.
 
     With .meta intents available, intent(out) args are not compared at
@@ -607,7 +645,12 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
     hit = srec.get("_occ", srec["hit"])
     sch_int = (intents or {}).get(srec["scheme"], {})
     rep.cur_scheme = srec["scheme"]
-    port = _portable_ctx(srec, crec, sman, cman, const_ctx)
+    # realignment only ever applies to portable-annotated schemes -- the
+    # convention mismatch arises from the two models' different wrappers, and
+    # scoping keeps an unrelated scheme with a same-named offset arg out
+    port = None
+    if realign is not None and srec["scheme"] in rep.portable:
+        port = _portable_ctx(srec, crec, sman, cman, const_ctx, realign)
     conv = set()
     entry_diffed = set()
     for phase in ("entry", "exit"):
@@ -626,7 +669,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None):
                     rep.note("{} (hit {}): arg {} absent on CAM side".format(
                         label, hit, arg))
                 continue
-            if port is not None and arg in PORTABLE_CONVENTION_ARGS:
+            if port is not None and arg in port["spec"]["_convention"]:
                 conv.add(arg)
                 continue
             if phase == "exit" and arg in entry_diffed:
@@ -843,6 +886,7 @@ def _report(outdir, suite_order, steps, intents=None):
     except (IOError, ValueError):
         suite_meta = {}
     portable = suite_meta.get("portable", {}) or {}
+    realign = load_realign(os.path.join(outdir, "realign.json"))
 
     def disp(s):
         return _disp_scheme(s, portable)
@@ -860,6 +904,11 @@ def _report(outdir, suite_order, steps, intents=None):
     if sima_case:
         print("SIMA case: {}".format(sima_case))
     print("steps:     {}".format(steps))
+    if realign is not None:
+        print("realign:   {} args realigned per species, {} convention, "
+              "{} metadata (realign.json)".format(
+                  len(realign["_arg_space"]), len(realign["_convention"]),
+                  len(realign["_metadata"])))
 
     cam = load_role(outdir, "cam")
     sima = load_role(outdir, "sima")
@@ -927,11 +976,11 @@ def _report(outdir, suite_order, steps, intents=None):
         print("  *** WARNING: {} CAM and {} SIMA constituents are "
               "UNMATCHED on both sides.".format(len(cam_un), len(sima_un)))
         print("  *** They are not name-matched, so they are not compared "
-              "via the constituent map (portable")
-        print("  *** MAM cloud-borne *_c* species are an expected exception: "
-              "they carry no CAM constituent")
-        print("  *** name and are realigned separately from the pointer "
-              "arrays). Otherwise this often means a")
+              "via the constituent map (species")
+        print("  *** realigned from pointer arrays by a realign spec -- "
+              "e.g. MAM cloud-borne *_c* -- are an")
+        print("  *** expected exception: they carry no CAM constituent "
+              "name). Otherwise this often means a")
         print("  *** missing SPECIAL_CONST_MAP entry (differ.py) or a "
               "duplicate standard name (see example 3 in docs/).")
         print("  *** Unmatched CAM:  {}".format(
@@ -1169,7 +1218,7 @@ def _report(outdir, suite_order, steps, intents=None):
                     continue
         if first_srec is None:
             first_srec = srec
-        compare_hit(srec, crec, sima, cam, const_ctx, rep, intents)
+        compare_hit(srec, crec, sima, cam, const_ctx, rep, intents, realign)
         n_pairs += 1
 
     # --- summary ----------------------------------------------------------

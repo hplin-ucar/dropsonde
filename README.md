@@ -46,6 +46,7 @@ Everything is written out in `--out` (default `./dropsonde_out`):
 ```
 report.txt    the printed report, archived verbatim
 suite.json    scheme order, --steps, parsed intents, portable overrides
+realign.json  copy of the --realign spec, if one was given
 cam/, sima/   manifest.json + gdb.log + one .bin dump per argument
               per phase (entry/exit)
 ```
@@ -207,6 +208,41 @@ dummy args (e.g. `class(aerosol_state)`) are recorded but not captured (gdb
 can't read them portably). Wrapper-only post-processing (e.g. mapping
 tendencies into the constituent array) is *not* compared at the portable
 boundary — only the shared science inputs/outputs are.
+
+### Realigning constituent index conventions (`--realign`)
+
+Some portable subroutines are additionally called from two different
+*constituent index conventions*. The MAM aerosol routines
+(`modal_aero_gasaerexch`/`_rename`) are the archetype: CAM passes the mozart
+`vmr`/`vmrcw` arrays (`gas_pcnst` wide, `loffset = imozart-1`, mode/species
+pointer arrays indexed in full `pcnst` space) while CAM-SIMA passes one packed
+constituent array (`loffset = 0`). The routine reaches every constituent as
+`array(:,:, ptr - loffset)`, so the constituent axis of these args cannot be
+compared byte-for-byte and would otherwise drown the report in false
+shape/value diffs.
+
+`--realign spec.json` teaches the differ to realign such args per species.
+The spec (see `docs/realign_mam.json`, which covers MAM — a CARMA spec would
+follow the same shape) names:
+
+- `offset_arg` — the per-model index-offset dummy (`loffset`);
+- `spaces` — groups of constituent-indexed args and how species pair across
+  the models: `constituent-map` (shift the name-matched constituent map by
+  each model's offset) or `pointer-arrays` (pair via captured mode/species
+  pointer arrays such as `lmassptrcw_amode`/`numptrcw_amode`, for species
+  with no registered constituent name — e.g. MAM cloud-borne, which CAM
+  keeps in a separate unregistered `vmrcw` array);
+- `convention_args` — index-space/sentinel args expected to differ between
+  the models (reported as a note, never counted as divergences);
+- `metadata_args` + `valid_slot_mask` — physical-constant tables compared
+  over real (species,mode) slots only, ignoring per-model padding fill.
+
+The spec is validated before the models launch and copied to
+`<out>/realign.json`, where the differ reads it — edit that copy and re-run
+`python3 differ.py <out>` to iterate without re-running the models (drop a
+spec there by hand to reprocess an existing dump). Realignment applies only
+to hits of portable-annotated schemes that carry the offset arg on both
+sides; everything else compares exactly as before.
 
 ## Reading the report
 

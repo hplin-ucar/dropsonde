@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -295,6 +296,12 @@ def main():
     ap.add_argument("--skip-sima", action="store_true",
                     help="skip the SIMA gdb run and reuse existing SIMA "
                          "captures in --out")
+    ap.add_argument("--realign", default=None, metavar="SPEC.json",
+                    help="constituent-index realignment spec for portable "
+                         "subroutines called from different index "
+                         "conventions (e.g. docs/realign_mam.json for the "
+                         "MAM aerosol routines); copied to <out>/"
+                         "realign.json, where the differ reads it")
     args = ap.parse_args()
 
     schemes = parse_sdf(args.sdf)
@@ -346,6 +353,25 @@ def main():
     cam_abs = os.path.abspath(args.cam)
     sima_abs = os.path.abspath(args.sima)
 
+    # --realign: validate up front (differ.load_realign exits with a clear
+    # message on a bad spec -- fail before the model runs, not after) and
+    # copy into --out, where the differ reads it. Editing <out>/realign.json
+    # and re-running `python3 differ.py <out>` iterates without re-running
+    # the models. Without --realign, drop any stale copy from a prior run.
+    sys.path.insert(0, HERE)
+    import differ
+    realign_dest = os.path.join(outdir, "realign.json")
+    realign_abs = None
+    if args.realign:
+        realign_abs = os.path.abspath(args.realign)
+        differ.load_realign(realign_abs)
+        if realign_abs != realign_dest:
+            shutil.copyfile(realign_abs, realign_dest)
+    elif os.path.isfile(realign_dest):
+        os.remove(realign_dest)
+        print("dropsonde: removed stale {} (no --realign given)".format(
+            realign_dest))
+
     # --skip-cam / --skip-sima: validate that the existing captures in --out
     # came from the same case directories the user is pointing at now.
     for skip, role, case_abs in ((args.skip_cam, "cam", cam_abs),
@@ -380,6 +406,7 @@ def main():
         json.dump({"schemes": schemes, "steps": args.steps,
                    "sdf": sdf_abs, "intents": intents,
                    "portable": portable,
+                   "realign": realign_abs,
                    "version": version,
                    "cam_case": cam_abs,
                    "sima_case": sima_abs,
@@ -418,8 +445,6 @@ def main():
                 finally:
                     log.close()
 
-    sys.path.insert(0, HERE)
-    import differ
     ok = differ.report(outdir, schemes, args.steps, intents)
     sys.exit(0 if ok else 1)
 

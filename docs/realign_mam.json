@@ -1,0 +1,28 @@
+{
+  "spec": "dropsonde-realign-v1",
+  "description": "MAM portable aerosol routines (modal_aero_gasaerexch/rename). CAM passes the mozart vmr/vmrcw arrays (gas_pcnst wide, loffset=imozart-1, pointer arrays in full pcnst-space); SIMA passes one packed constituent array (loffset=0). The routine reads array(:,:, ptr - loffset), so the constituent axis is realigned per species by each model's own offset.",
+  "offset_arg": "loffset",
+  "valid_slot_mask": "lmassptr_amode",
+  "spaces": {
+    "q": {
+      "label": "interstitial",
+      "pairing": "constituent-map",
+      "args": ["q", "dqdt", "dqdt_other", "dotendrn", "qsrflx",
+               "qsrflx_gaexch", "dqdt_rnpos", "dotend"]
+    },
+    "qqcw": {
+      "label": "cloud-borne",
+      "pairing": "pointer-arrays",
+      "mass_ptr": "lmassptrcw_amode",
+      "num_ptr": "numptrcw_amode",
+      "args": ["qqcw", "dqqcwdt", "dqqcwdt_other", "dotendqqcwrn",
+               "qqcwsrflx"]
+    }
+  },
+  "convention_args": ["loffset", "num_q",
+    "lmassptr_amode", "lmassptrcw_amode", "numptr_amode", "numptrcw_amode",
+    "lspecfrma_renamexf", "lspecfrmc_renamexf",
+    "lspectooa_renamexf", "lspectooc_renamexf",
+    "modeptr_stracoar"],
+  "metadata_args": ["specmw_amode", "specdens_amode"]
+}

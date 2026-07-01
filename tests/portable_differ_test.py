@@ -1,7 +1,8 @@
-# Synthetic test of differ.py's portable MAM constituent realignment.
-# Builds fake manifests for a routine called from two different constituent
-# index conventions (CAM: gas_pcnst vmr, loffset>0; SIMA: packed array,
-# loffset=0) and checks that differ.py:
+# Synthetic test of differ.py's constituent realignment (--realign), using
+# the shipped MAM spec (docs/realign_mam.json) so the spec file itself stays
+# under test. Builds fake manifests for a routine called from two different
+# constituent index conventions (CAM: gas_pcnst vmr, loffset>0; SIMA: packed
+# array, loffset=0) and checks that differ.py:
 #   - realigns the interstitial constituent axis per species via each model's
 #     own loffset and finds an injected per-species difference with the right
 #     cam/sima index labels
@@ -123,13 +124,24 @@ def args_for(b, is_cam):
 
 
 def main():
-    outdir = tempfile.mkdtemp(prefix="dropsonde_port_")
+    # outdir is nested so the report archive (written to <outdir>/../reports)
+    # lands inside the tempdir and is cleaned up with it
+    root = tempfile.mkdtemp(prefix="dropsonde_port_")
+    outdir = os.path.join(root, "out")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cam = Builder(outdir, "cam")
     sima = Builder(outdir, "sima")
     for b in (cam, sima):
         b.man["breakpoints"] = {SCHEME: SCHEME + "_run"}
     cam.man["constituents"] = CAM_CNST
     sima.man["constituents"] = SIMA_CNST
+    # realignment is scoped to portable-annotated schemes and driven by the
+    # spec copied into the dump dir, exactly as the dropsonde driver does it
+    shutil.copyfile(os.path.join(repo, "docs", "realign_mam.json"),
+                    os.path.join(outdir, "realign.json"))
+    with open(os.path.join(outdir, "suite.json"), "w") as f:
+        json.dump({"schemes": [SCHEME], "steps": 1,
+                   "portable": {SCHEME: "modal_aero_rename_run"}}, f)
 
     cam.hit(SCHEME, 0, 1, "tphysac", args_for(cam, True))    # step1 = garbage
     cam.hit(SCHEME, 0, 2, "tphysac", args_for(cam, True))    # step2 = real
@@ -145,7 +157,7 @@ def main():
     finally:
         sys.stdout = old
     out = buf.getvalue()
-    shutil.rmtree(outdir)
+    shutil.rmtree(root)
 
     def need(s):
         assert s in out, "expected in report:\n  {!r}\n---\n{}".format(s, out)
