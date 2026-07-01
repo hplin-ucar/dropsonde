@@ -198,7 +198,9 @@ def main():
     sima_abs = os.path.abspath(args.sima)
 
     # --skip-cam / --skip-sima: validate that the existing captures in --out
-    # came from the same case directories the user is pointing at now.
+    # came from the same case directory, SDF, and --steps the user is
+    # pointing at now -- suite.json is rewritten below with the NEW values,
+    # so a mismatch would silently relabel stale captures.
     for skip, role, case_abs in ((args.skip_cam, "cam", cam_abs),
                                  (args.skip_sima, "sima", sima_abs)):
         if not skip:
@@ -212,17 +214,24 @@ def main():
         if os.path.isfile(suite_path):
             with open(suite_path) as f:
                 prev = json.load(f)
-            key = role + "_case"
-            prev_case = prev.get(key)
-            if prev_case and os.path.abspath(prev_case) != case_abs:
-                sys.exit(
-                    "error: --skip-{} but --{} points to\n"
-                    "  {}\n"
-                    "while the existing captures came from\n"
-                    "  {}\n"
-                    "These must match (re-run without --skip-{} to "
-                    "recapture, or point --{} at the original case)"
-                    .format(role, role, case_abs, prev_case, role, role))
+            checks = ((role + "_case", case_abs, "--" + role),
+                      ("sdf", sdf_abs, "--sdf"),
+                      ("steps", args.steps, "--steps"))
+            for key, now, flag in checks:
+                prev_val = prev.get(key)
+                if prev_val is None:
+                    continue
+                if key != "steps":
+                    prev_val = os.path.abspath(prev_val)
+                if prev_val != now:
+                    sys.exit(
+                        "error: --skip-{} but {} is\n"
+                        "  {}\n"
+                        "while the existing captures came from\n"
+                        "  {}\n"
+                        "These must match (re-run without --skip-{} to "
+                        "recapture, or restore the original {})"
+                        .format(role, flag, now, prev_val, role, flag))
         print("dropsonde: reusing existing {} captures in {}".format(
             role, outdir))
 
