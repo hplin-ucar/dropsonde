@@ -20,6 +20,9 @@ CAM-SIMA driven with the CAM snapshots have answer differences compared to CAM.
 
 1. Build the models: `DEBUG=TRUE,NTASKS=1,NTHRDS=1`, with chunks disabled for CAM.
    **Important:** CAM and CAM-SIMA must be running the same underlying atmos_phys code.
+   To chase a drift that only exists in production builds, one side may
+   instead be a production (`-O2`) build rebuilt with `-g` appended — see
+   [Optimized (production) binaries](#optimized-production-binaries).
 2. Run `./preview_namelists`.
 3. Run `dropsonde` where it is checked out: point it to the case directories on scratch with the SDF file:
 
@@ -75,6 +78,9 @@ Copy aside any logs you want to keep before running.
   the same compiler (caller symbols and constituent capture are matched
   across the pair). The compiler is auto-detected from the DWARF producer
   string; no flag needed. NAG is not yet supported (see Known limitations).
+  A production (`-O2 -g`) CAM-SIMA build against a DEBUG CAM is also
+  supported (GNU only) — see
+  [Optimized (production) binaries](#optimized-production-binaries).
 - `STOP_N` only needs to be *long enough* (CAM's 6-step coupling minimum
   is fine): each gdb session counts timesteps via a sentinel breakpoint on
   `cam_run1` and kills its run once it has what it needs (CAM:
@@ -175,6 +181,73 @@ Intel assumptions (gdb 8.2, ifort 19.1, Izumi):
 - The System V AMD64 ABI fallback is gfortran-descriptor-specific and so
   gfortran-only; under Intel it bails with a note rather than misreading a
   descriptor (Intel has not been observed to drop dummy locations).
+
+## Optimized (production) binaries
+
+Motivation: a ulp-scale drift that exists at `-O2` but vanishes in DEBUG
+builds can only be localized by dropsonding the production binary itself.
+Production CESM builds carry no DWARF, so first rebuild the affected
+component with `-g` appended to the *unchanged* production flags — for
+gfortran `-g` does not alter code generation, so the rebuilt binary computes
+the identical drifting arithmetic (verifiable: its `.text` section is
+byte-identical to the original's, `objcopy -O binary --only-section=.text`
+each and `cmp`). In a CIME case, append `-g` to `FFLAGS`/`CFLAGS` in the
+case's `Macros.make` (auto-generated; the durable place is the
+`if (NOT DEBUG)` block of `cmake_macros/gnu.cmake`, but a `case.setup
+--reset` re-copies that directory from the repo), then
+`./case.build --clean atm && ./case.build`. Only the component holding the
+schemes, the `cam_run1` sentinel, and the constituent tables (i.e. atm)
+needs `-g`.
+
+dropsonde detects optimization per binary before the run starts, from the
+DWARF producer string of the first scheme's compilation unit (gfortran
+embeds the flags, e.g. `GNU Fortran2008 14.3.0 ... -O2 -ffp-contract=off
+-g`). A `-O[123sz]` flag switches that gdb session — and only that one; a
+DEBUG CAM alongside keeps the normal path — to a separate capture strategy,
+because two -O2 facts break the normal one (calibrated on gdb 16.2 /
+gfortran 12.5 & 14.3):
+
+- gdb's prologue-skip breakpoint can land where the DWARF locations of
+  descriptor-backed dummies are not yet valid: bounds read as garbage
+  ("value requires 50679360 bytes") on some schemes and fine on others.
+- Fortran subscript evaluation (`parse_and_eval("q3(1,1,1)")`, the basis of
+  the normal stride probing) aborts gdb 16.2 outright — an internal error
+  (`PROP_CONST` assertion) on the dynamic-stride DWARF gfortran emits at
+  -O2. Not catchable from Python; it must never be attempted.
+
+The optimized-mode capture instead breaks at the raw function entry
+(`*0x<addr>`, the function block's start), the one PC where the System V
+AMD64 ABI guarantees every argument's location regardless of DWARF quality:
+dummy `i` of n is the pointer in `rdi,rsi,rdx,rcx,r8,r9` (i <= 6) or at
+`[rsp + 8*(i-6)]` (the return address sits at `[rsp]`). DWARF supplies only
+static facts — argument names, declaration order, element types, assumed-
+vs explicit-shape. Assumed-shape pointers are gfortran descriptors, decoded
+with the same layout as the -O0 ABI fallback; scalars are read through
+their reference pointer (also re-read at exit); compile-time-constant
+explicit shapes are captured as contiguous; runtime-bound explicit-shape,
+character, and derived-type dummies are recorded as skipped with a reason.
+Exit capture still uses a `FinishBreakpoint` planted on the entry frame,
+which unwinds fine at the first instruction. SIMA constituent names are
+decoded from raw memory (like the Intel path) via the linker symbol
+`__cam_constituents_MOD_const_props` — `&const_props` resolves through
+DWARF `data_location` to the *data*, not the descriptor, and subscripting
+module pointer-arrays risks the same gdb abort.
+
+Caveats specific to optimized binaries:
+
+- Cross-TU scheme calls (the CCPP norm — no LTO in CESM builds) always
+  reach the out-of-line symbol and populate full descriptors. A scheme
+  called from within its *own* translation unit may be inlined (breakpoint
+  never fires for that call site), and gcc's same-TU IPA may elide
+  descriptor fields the callee provably never reads (the raw decode then
+  reports an implausible descriptor). The SDF-level schemes of the MAM
+  suites are all cross-TU.
+- A caller that tail-calls the scheme is not on the stack at entry, so the
+  hit's `caller` is the caller's caller; the differ buckets unshared
+  callers to `<toplevel>` anyway, so pairing is unaffected.
+- Scalars promoted to registers after their first use don't affect entry
+  capture (the by-reference pointer is read before any body code runs), and
+  the pointed-to caller storage stays valid for the exit re-read.
 
 ## Comparing shared portable subroutines
 
@@ -325,9 +398,14 @@ about a finding requires re-running the models.
 Micro-calibration: `tests/cal.f90` + `tests/cal_run.sh` (any machine
 with gdb + a Fortran compiler; Derecho login nodes work) checks breakpoint
 resolution, caller capture, extent/stride probing, and constituent-name
-capture. The compiler is selectable via `$FC` (default `gfortran`):
-`FC=ifort bash cal_run.sh`. Passes clean under gfortran (Derecho, gdb
-16.2) and ifort 19.1 (Izumi, gdb 8.2). Under gfortran on gdb 8.2 the SIMA
+capture. The compiler is selectable via `$FC` (default `gfortran`) and the
+flags via `$FCFLAGS` (default `-g -O0`): `FC=ifort bash cal_run.sh`. The
+optimized-binary mode is calibrated with the production flags plus `-g
+-fno-inline`: `FCFLAGS="-O2 -ffp-contract=off -g -fno-inline" bash
+cal_run.sh` (on Derecho, `module load gcc/14.3.0` first — the default
+`gfortran` is an ncarcompilers wrapper that may dispatch to Intel). Passes
+clean under gfortran (Derecho, gdb 16.2; -O0 and -O2 modes, gcc 12.5 and
+14.3) and ifort 19.1 (Izumi, gdb 8.2). Under gfortran on gdb 8.2 the SIMA
 constituent names read as `<unreadable>` (that gdb's gfortran deferred-
 length-character support is too old); the gdb 16.2 gfortran path is
 unaffected.
@@ -355,6 +433,9 @@ noise. A fully-clean model pair has not yet been tested.
   backend (arg demangling + dope-vector decode + `.meta`-sourced shapes)
   is future work. (Intel on Izumi, by contrast, is supported.)
 - Negative-stride (reversed) array slices are skipped with a note.
+- Optimized (-O2) binaries: GNU-only; character dummies and explicit-shape
+  dummies with runtime bounds are skipped with a reason (see
+  [Optimized (production) binaries](#optimized-production-binaries)).
 - One subcycle scheme called with *different arguments* per sub-step
   aligns fine (hits are sequence-matched), but the report labels hits by
   per-scheme index, not subcycle position.

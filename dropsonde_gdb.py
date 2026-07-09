@@ -91,6 +91,22 @@ def note(msg):
 
 _COMPILER = [None]
 
+# Optimized-binary (production, e.g. gnu -O2) support. gfortran's DWARF
+# producer string carries the compile flags, so optimization is detected
+# pre-run from the CU of the first scheme symbol that resolves; None means
+# the probe could not decide (treated as not optimized). At -O2 the normal
+# capture path is unusable: the prologue-skip breakpoint can land where the
+# DWARF locations of descriptor-backed dummies are invalid (bounds read as
+# garbage), and Fortran subscript evaluation (parse_and_eval("a(1,1)"))
+# aborts gdb 16.2 outright with an internal error on the dynamic stride
+# properties gfortran emits at -O2. So optimized binaries are captured at
+# the raw function entry instruction instead, where the System V AMD64 ABI
+# guarantees every by-reference argument pointer's location; DWARF is used
+# only for static facts (arg names, declaration order, element types,
+# assumed- vs explicit-shape).
+OPTIMIZED = [None]
+_OPT_FLAG_RE = re.compile(r"(?:^|\s)-O([123sz])(?:\s|$)")
+
 
 def compiler():
     """'gnu' | 'intel' | 'nag' | 'unknown' for the binary under debug."""
@@ -490,6 +506,197 @@ def _capture_abi(scheme, hit, name, sym, idx, frame, info):
         info["entry_value"] = read_scalar(ptr, dt)
 
 
+# --------------------------------------------------------------------------
+# optimized-binary capture (raw-entry ABI reads; see OPTIMIZED above)
+# --------------------------------------------------------------------------
+
+ARG_REGS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
+
+
+def _cu_producer(spec):
+    """DWARF producer string of the compilation unit defining `spec`, or
+    None. Works pre-run off the static symbol table."""
+    try:
+        _unparsed, sals = gdb.decode_line(spec)
+        return sals[0].symtab.producer or None
+    except Exception:
+        return None
+
+
+def probe_optimized(specs_per_scheme):
+    """Set OPTIMIZED[0] from the first scheme spec whose CU producer is
+    readable. gfortran producers carry the compile flags (e.g. 'GNU
+    Fortran2008 14.3.0 ... -O2 -ffp-contract=off -g')."""
+    for specs in specs_per_scheme:
+        for spec in specs:
+            if callable(spec):
+                continue        # _qualified sweep: too costly for a probe
+            prod = _cu_producer(spec)
+            if prod is None:
+                continue
+            m = _OPT_FLAG_RE.search(prod)
+            OPTIMIZED[0] = bool(m)
+            note("optimization probe: {} (producer: {})".format(
+                "-O" + m.group(1) if m else "not optimized", prod[:90]))
+            return
+    note("optimization probe: no scheme CU producer readable; assuming "
+         "not optimized")
+
+
+def _entry_addr(spec):
+    """Raw entry-point address of the function `spec` resolves to (the
+    function block's start), or None. 'break <spec>' would stop at the
+    post-prologue-skip address, where -O2 DWARF locations may not be valid
+    yet; the ABI argument slots are only guaranteed at the first
+    instruction."""
+    try:
+        _unparsed, sals = gdb.decode_line(spec)
+    except gdb.error:
+        return None
+    if not sals:
+        return None
+    if len(sals) > 1:
+        note("WARNING: {} resolves to {} locations; using the first".format(
+            spec, len(sals)))
+    try:
+        blk = gdb.block_for_pc(sals[0].pc)
+    except Exception:
+        return None
+    while blk is not None and blk.function is None:
+        blk = blk.superblock
+    if blk is None:
+        return None
+    return int(blk.start)
+
+
+def _make_entry_bp_optimized(specs, scheme, target):
+    """EntryBP at the raw entry address of the first spec that resolves."""
+    for spec in specs:
+        if callable(spec):
+            spec = spec()
+        if not spec:
+            continue
+        addr = _entry_addr(spec)
+        if addr is None:
+            continue
+        return EntryBP("*{:#x}".format(addr), scheme, target)
+    return None
+
+
+def _abi_arg_ptr(frame, idx):
+    """Pointer argument `idx` (1-based, declaration order) read at the
+    function's FIRST instruction, where the System V AMD64 locations are
+    unconditionally valid: args 1-6 in registers, 7+ in consecutive 8-byte
+    stack slots above the return address at [rsp]."""
+    if idx <= N_INT_REG:
+        return int(frame.read_register(ARG_REGS[idx - 1])) \
+            & 0xFFFFFFFFFFFFFFFF
+    rsp = int(frame.read_register("rsp")) & 0xFFFFFFFFFFFFFFFF
+    return _read_u64(rsp + 8 * (idx - N_INT_REG))
+
+
+def _record_array(info, scheme, hit, name, plan):
+    """Fill an arg record from a capture plan and dump the entry bytes."""
+    info["kind"] = "array"
+    info["dtype"] = plan["dtype"]
+    info["los"] = plan["los"]
+    info["extents"] = plan["extents"]
+    info["strides"] = plan["strides"]
+    info["plan"] = plan
+    info["entry_file"] = write_blob(scheme, hit, name, "in", read_array(plan))
+
+
+def _static_shape_plan(ptr, st):
+    """Capture plan for a compile-time-constant explicit-shape dummy: a raw
+    contiguous data pointer, shape fully known from the static DWARF type."""
+    dims, base = array_dims(st)
+    dt = dtype_of(base)
+    if dt is None:
+        return None, "unsupported element type: {}".format(base)
+    if DIM_ORDER == "reversed":
+        dims = dims[::-1]
+    los = [d[0] for d in dims]
+    extents = [d[1] - d[0] + 1 for d in dims]
+    if any(e <= 0 for e in extents):
+        return None, "implausible static extents: {}".format(extents)
+    strides = []
+    acc = base.sizeof
+    for e in extents:
+        strides.append(acc)
+        acc *= e
+    return {"addr": ptr, "elsize": base.sizeof, "dtype": dt, "los": los,
+            "extents": extents, "strides": strides}, None
+
+
+def handle_entry_optimized(scheme, frame):
+    """Entry capture for an optimized binary, stopped at the function's
+    first instruction. Mirrors handle_entry's record shape exactly (the
+    exit re-read and the differ are unchanged), but never evaluates a
+    dummy's value or subscripts through gdb -- every dynamic fact comes
+    from the ABI argument pointers and the gfortran descriptors they
+    reference."""
+    hit = HIT_COUNT.get(scheme, 0)
+    HIT_COUNT[scheme] = hit + 1
+    try:
+        caller = frame.older().name() or "?"
+    except Exception:
+        caller = "?"
+    rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
+           "caller": caller, "args": {}}
+    frame.select()
+    for idx, sym in enumerate(arg_symbols(frame), start=1):
+        name = sym.name
+        info = {"kind": "skipped", "abi": True}
+        rec["args"][name] = info
+        try:
+            if name.startswith("_"):
+                info["why"] = "hidden character-length arg (by value)"
+                continue
+            st = sym.type.strip_typedefs()
+            ptr = _abi_arg_ptr(frame, idx)
+            if ptr == 0:
+                info["why"] = "null argument pointer (absent optional?)"
+                continue
+            if is_character(st):
+                info["why"] = "character arg not captured in optimized mode"
+                continue
+            if st.code == gdb.TYPE_CODE_ARRAY:
+                elem = _element_type(st)
+                if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+                    info["why"] = "derived-type array not captured"
+                    continue
+                if ":" in str(sym.type):
+                    # assumed shape: the argument is a descriptor pointer
+                    plan, err = _descriptor_plan(ptr, elem)
+                elif not getattr(st, "dynamic", False):
+                    plan, err = _static_shape_plan(ptr, st)
+                else:
+                    info["why"] = ("explicit-shape dummy with runtime "
+                                   "bounds not captured in optimized mode")
+                    continue
+                if plan is None:
+                    info["kind"] = "error"
+                    info["why"] = err
+                    continue
+                _record_array(info, scheme, hit, name, plan)
+            elif st.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+                info["why"] = "derived-type arg not captured"
+            else:
+                dt = dtype_of(st)
+                if dt is None:
+                    info["why"] = "unsupported type: {}".format(st)
+                    continue
+                info["kind"] = "scalar"
+                info["dtype"] = dt
+                info["addr"] = ptr
+                info["entry_value"] = read_scalar(ptr, dt)
+        except Exception as exc:
+            info["kind"] = "error"
+            info["why"] = str(exc)
+    MANIFEST["hits"].append(rec)
+    return rec
+
+
 def handle_entry(scheme, frame):
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
@@ -689,6 +896,72 @@ def _intel_const_names(prefix, n):
     return names
 
 
+def _static_addr(name):
+    """Address of a (minimal/linker) symbol via 'info address' text --
+    gdb 16.2's Python API has no lookup_minimal_symbol."""
+    try:
+        out = gdb.execute("info address {}".format(name), to_string=True)
+    except gdb.error:
+        return None
+    m = re.search(r"0x[0-9a-fA-F]+", out)
+    return int(m.group(0), 16) if m else None
+
+
+def _gnu_const_names(prefix, n):
+    """SIMA constituent standard names decoded from raw memory using the
+    gfortran descriptor layout. Used for optimized binaries, where Fortran
+    subscript evaluation (const_props(i)%...) can abort gdb 16.2 with an
+    internal error on -O2 dynamic-stride DWARF; module data itself is
+    unoptimized, so the raw layout is the same as debug builds'.
+
+    The descriptor is the module variable itself, found by its LINKER name:
+    gdb resolves &const_props through the DWARF data_location to the array
+    DATA, not the descriptor. const_props is a rank-1 pointer array of
+    constituent_prop_ptr_t; element i sits at descriptor base + i*stride,
+    its %prop pointer at the component's offset within the element. %prop
+    points to a properties type whose var_std_name is
+    character(len=:),allocatable: a data pointer at the component offset,
+    with the length in the hidden sibling member _var_std_name_length
+    gfortran appends to the derived type."""
+    desc_addr = _static_addr("__cam_constituents_MOD_const_props")
+    if desc_addr is None:
+        raise gdb.error("no __cam_constituents_MOD_const_props symbol")
+    v = gdb.parse_and_eval("&{}const_props".format(prefix))
+    base = _read_u64(desc_addr + _D_BASE)
+    elem_len = _read_i64(desc_addr + _D_ELEM_LEN)
+    if base == 0 or elem_len <= 0:
+        raise gdb.error("implausible const_props descriptor: base={:#x} "
+                        "elem_len={}".format(base, elem_len))
+    stride = _read_i64(desc_addr + _D_DIM0) * elem_len
+    # peel pointer/array layers to the constituent_prop_ptr_t element type
+    et = v.type.strip_typedefs()
+    while et.code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_ARRAY):
+        et = et.target().strip_typedefs()
+    prop_off, prop_t = _field_offset(et, "prop")
+    vsn_off, _vsn_t = _field_offset(prop_t.target(), "var_std_name")
+    try:
+        len_off, _ = _field_offset(prop_t.target(), "_var_std_name_length")
+    except gdb.error:
+        len_off = None
+    names = []
+    for i in range(n):
+        prop_ptr = _read_u64(base + i * stride + prop_off)
+        if prop_ptr == 0:
+            names.append("<null prop>")
+            continue
+        data_ptr = _read_u64(prop_ptr + vsn_off)
+        if len_off is not None:
+            length = _read_i64(prop_ptr + len_off)
+        else:
+            length = _read_i64(prop_ptr + vsn_off + 8)
+        if data_ptr == 0 or not (0 < length <= 1024):
+            names.append("<unreadable: len={}>".format(length))
+            continue
+        raw = bytes(gdb.selected_inferior().read_memory(data_ptr, length))
+        names.append(raw.decode("latin-1").strip())
+    return names
+
+
 def dump_constituents():
     try:
         if ROLE == "cam":
@@ -733,6 +1006,9 @@ def dump_constituents():
                 # gdb 8.2 can't index Intel's pointer-array descriptor; decode
                 # const_props from raw memory.
                 names = _intel_const_names(base, n)
+            elif OPTIMIZED[0]:
+                # -O2 subscript evaluation can abort gdb; decode raw instead.
+                names = _gnu_const_names(base, n)
             else:
                 names = []
                 for i in range(1, n + 1):
@@ -830,7 +1106,7 @@ def setup():
     gdb.events.stop.connect(_on_stop)
     gdb.events.exited.connect(_on_exit)
 
-    resolved = 0
+    plans = []
     for s in SCHEMES:
         portable = PORTABLE.get(s)
         if portable:
@@ -838,21 +1114,29 @@ def setup():
             # call. Its module name differs from the symbol, so the
             # __mod_MOD_proc linker guess can't be formed; the bare DWARF name
             # (gfortran) and the demangled module::proc (Intel) suffice.
-            bp = _make_bp(EntryBP,
-                          (portable, lambda p=portable: _qualified(p)),
-                          s, portable)
+            plans.append((s, portable,
+                          (portable, lambda p=portable: _qualified(p))))
         else:
             # gfortran bare DWARF name first (the calibrated Derecho fast
             # path), then its linker name, then the module-qualified spelling
             # gdb demangles Intel symbols to (module_mp_<scheme>_run_ ->
             # module::run).
-            bp = _make_bp(EntryBP,
+            plans.append((s, s + "_run",
                           (s + "_run", "__{0}_MOD_{0}_run".format(s),
-                           lambda s=s: _qualified(s + "_run")), s, s + "_run")
+                           lambda s=s: _qualified(s + "_run"))))
+
+    probe_optimized([specs for _s, _t, specs in plans])
+    resolved = 0
+    for s, target, specs in plans:
+        if OPTIMIZED[0]:
+            bp = _make_entry_bp_optimized(specs, s, target)
+        else:
+            bp = _make_bp(EntryBP, specs, s, target)
         if bp is None:
             MANIFEST["breakpoints"][s] = "missing"
         else:
-            MANIFEST["breakpoints"][s] = bp.location
+            MANIFEST["breakpoints"][s] = "{} ({})".format(
+                bp.location, target) if OPTIMIZED[0] else bp.location
             resolved += 1
     note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
 
@@ -899,6 +1183,21 @@ def main():
             except gdb.error:
                 pass
             break
+        elif OPTIMIZED[0]:
+            # Optimized binary: the breakpoint is at the raw entry
+            # instruction, the one PC where the ABI argument slots are
+            # guaranteed; capture immediately (no advance -- moving even one
+            # instruction may clobber the argument registers).
+            frame = gdb.newest_frame()
+            try:
+                rec = handle_entry_optimized(entry.scheme, frame)
+                ExitBP(frame, rec)
+            except Exception as exc:
+                note("entry capture failed for {}: {}".format(
+                    entry.scheme, exc))
+            if not const_done:
+                dump_constituents()
+                const_done = True
         else:
             # gdb's prologue skip stops inside the argument-descriptor setup,
             # where dummies raise "Location address is not set" and stepping

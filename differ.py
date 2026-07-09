@@ -42,6 +42,15 @@ ELSIZE = {"f8": 8, "f4": 4, "i8": 8, "i4": 4, "i2": 2, "i1": 1}
 # instantly anyway; iulog is each model's own log unit number.
 SKIP_ARGS = {"errmsg", "errflg", "iulog"}
 
+
+def skip_arg(arg):
+    """Args never compared: CCPP error plumbing, and gfortran's hidden
+    compiler-generated arguments (leading underscore, e.g. the _errmsg
+    character length), which capture asymmetrically when a debug-build
+    manifest (hidden args read as scalars) meets an optimized-build one
+    (hidden args skipped)."""
+    return arg in SKIP_ARGS or arg.startswith("_")
+
 # --- constituent-index realignment specs (--realign) ------------------------
 # Some portable subroutines are called from two different constituent-index
 # conventions (e.g. MAM's modal_aero_gasaerexch/rename: CAM passes the mozart
@@ -502,6 +511,16 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
     cam_names, sima_names, pairs = const_ctx
     kind = sinfo.get("kind")
     if kind != cinfo.get("kind"):
+        # Neither side captured data (skipped/error, e.g. an absent optional
+        # skipped by one capture mode and errored by the other): there is
+        # nothing to compare, so this is a note, not a verdict.
+        captured = ("array", "scalar", "char")
+        if kind not in captured and cinfo.get("kind") not in captured:
+            if phase == "entry":
+                rep.note("{} (hit {}): arg {} not captured on either side: "
+                         "sima {} / cam {}".format(
+                             label, hit, arg, kdesc(sinfo), kdesc(cinfo)))
+            return
         if phase == "entry":
             rep.diff(label, hit, phase, arg,
                      "argument kind mismatch: sima {} vs cam {}".format(
@@ -656,7 +675,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
     for phase in ("entry", "exit"):
         suppressed = []
         for arg, sinfo in srec["args"].items():
-            if arg in SKIP_ARGS:
+            if skip_arg(arg):
                 continue
             it = sch_int.get(arg)
             if it == "out" and phase == "entry":
@@ -741,7 +760,7 @@ def count_matching_entry_args(srec, crec, sman, cman, sch_int=None,
     same = 0
     total = 0
     for arg, sinfo in srec["args"].items():
-        if arg in SKIP_ARGS:
+        if skip_arg(arg):
             continue
         if sch_int and sch_int.get(arg) == "out":
             continue

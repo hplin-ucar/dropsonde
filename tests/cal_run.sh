@@ -6,6 +6,13 @@
 # accept -g -O0. Used to calibrate per machine (Derecho gfortran, Izumi
 # Intel, ...).
 #
+# Flags selectable via $FCFLAGS (default "-g -O0"). To calibrate the
+# optimized-binary capture mode (production builds), use the production
+# flags plus -g and -fno-inline, e.g.:
+#   FCFLAGS="-O2 -ffp-contract=off -g -fno-inline" bash cal_run.sh
+# (-fno-inline stands in for the cross-TU calls of the real model, keeping
+# the nested inner hit out-of-line.)
+#
 # Expected when everything works:
 #   cam role  (kill_after_steps=1): outer+inner step-1 hits only, then
 #             "collected 1 timesteps; terminating run"; 5 constituent names
@@ -14,11 +21,26 @@
 #             ext=[3,3] with a non-contiguous stride, and
 #             CHECK a = (1,2,3,5,6,7,9,10,11); all CHECK b == 2a: True;
 #             3 constituent names std_name_1..3
+# Optimized (-O2) runs differ by design: breakpoints show as *0x<addr>, and
+# b (explicit-shape, runtime bounds) is skipped, so CHECK b lines vanish.
 set -e
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 FC=${FC:-gfortran}
-echo "=== compiling cal.f90 with $FC ==="
-$FC -g -O0 -o cal "$SCRIPT_DIR/cal.f90"
+FCFLAGS=${FCFLAGS:--g -O0}
+echo "=== compiling cal.f90 with $FC $FCFLAGS ==="
+if echo "$FCFLAGS" | grep -qE -- "-O[123sz]"; then
+  # Optimized calibration: split the program unit into its own translation
+  # unit. In the real model every SDF scheme call is cross-TU (no LTO), so
+  # callers populate full array descriptors; single-TU -O2 lets gcc IPA
+  # dead-store-eliminate descriptor fields the callee provably never reads,
+  # which is unrepresentative and breaks the raw-descriptor decode.
+  awk "/^program cal/{exit} {print}" "$SCRIPT_DIR/cal.f90" > cal_mods.f90
+  awk "/^program cal/{f=1} f{print}" "$SCRIPT_DIR/cal.f90" > cal_main.f90
+  $FC $FCFLAGS -c cal_mods.f90
+  $FC $FCFLAGS cal_main.f90 cal_mods.o -o cal
+else
+  $FC $FCFLAGS -o cal "$SCRIPT_DIR/cal.f90"
+fi
 KILL_cam=1
 KILL_sima=0
 for role in cam sima; do
@@ -65,12 +87,12 @@ for role in ('cam', 'sima'):
                       i.get('why', '')))
         ai = r['args'].get('a', {})
         bi = r['args'].get('b', {})
-        if (r['scheme'] == 'inner' and 'entry_file' in ai
-                and 'exit_file' in bi):
+        if r['scheme'] == 'inner' and 'entry_file' in ai:
             av = vals(d, ai['entry_file'])
-            bv = vals(d, bi['exit_file'])
-            ok = (len(av) == len(bv) and
-                  all(abs(y - 2 * x) < 1e-12 for x, y in zip(av, bv)))
             print('   CHECK a:', tuple(int(x) for x in av))
-            print('   CHECK b == 2a:', ok)
+            if 'exit_file' in bi:
+                bv = vals(d, bi['exit_file'])
+                ok = (len(av) == len(bv) and
+                      all(abs(y - 2 * x) < 1e-12 for x, y in zip(av, bv)))
+                print('   CHECK b == 2a:', ok)
 EOF

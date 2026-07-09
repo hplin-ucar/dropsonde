@@ -25,9 +25,13 @@ end module cam_constituents
 
 module cam_comp
   implicit none
+  integer :: nstep_count = 0
 contains
   subroutine cam_run1()
-    ! timestep sentinel: dropsonde counts hits here
+    ! timestep sentinel: dropsonde counts hits here. The counter gives the
+    ! body a side effect so -O2 IPA cannot elide the calls in the optimized
+    ! calibration build (-fno-inline alone does not keep a no-op call).
+    nstep_count = nstep_count + 1
   end subroutine cam_run1
 end module cam_comp
 
