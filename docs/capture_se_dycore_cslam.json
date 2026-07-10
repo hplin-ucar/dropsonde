@@ -1,0 +1,13 @@
+{
+  "spec": "dropsonde-capture-v1",
+  "comment": "SE-CSLAM (pg grids) variant of capture_se_dycore.json: adds the fvm_struct tracer state (c/dp_fvm include the nhc halo ring; psc is nc x nc; se_flux spans nhe). fvm components are fixed-shape in CAM and allocatable in CAM-SIMA, like elem_state_t. Kept out of the np4 spec on purpose: with CSLAM off the fvm dummies are unallocated and a spec entry would only add per-hit error notes.",
+  "types": {
+    "element_t": ["state%v", "state%t", "state%dp3d", "state%psdry",
+                  "state%phis", "state%qdp",
+                  "derived%fm", "derived%ft", "derived%fq"],
+    "fvm_struct": ["c", "dp_fvm", "psc", "se_flux"],
+    "timelevel_t": ["nm1", "n0", "np1", "nstep"],
+    "hvcoord_t": ["ps0", "hyai", "hyam", "hybi", "hybm"],
+    "derivative_t": ["dvv"]
+  }
+}

@@ -84,6 +84,36 @@ emit `<scheme>` entries with `portable=<itself>` for that region's call
 tree) and re-run. `--skip-cam`/`--skip-sima` reuse captures while
 iterating on the spec.
 
+## SE-CSLAM (physgrid, e.g. ne16pg3)
+
+On `pg` grids CSLAM advects the tracers; use
+`docs/suite_se_dycore_cslam.xml` + `docs/capture_se_dycore_cslam.json`
+(GLL dynamics chain unchanged; `prim_advec_tracers_remap`/`euler_step`/
+`advance_hypervis_scalar` replaced by `prim_advec_tracers_fvm` →
+`run_consistent_se_cslam`; `fvm_struct` state captured). pg-specific
+gotchas:
+
+- **Hit counts**: CSLAM is supercycled — tracer advection runs every
+  `fvm_supercycling` (and `fvm_supercycling_jet`) rsteps, so add those to
+  the namelist-parity checklist; a mismatch shows as differing
+  `prim_advec_tracers_fvm` hit counts.
+- **Tracer split**: GLL `elem%state%qdp` carries only the thermodynamic
+  active species (`qsize = thermodynamic_active_species_num`, CAM: from
+  air_composition; CAM-SIMA: its port) while `fvm%c` carries all advected
+  tracers (`ntrac`). A count mismatch between the models appears as a
+  shape mismatch on `qdp`/`qwater` — that is itself the finding, not tool
+  noise.
+- **Halos**: `fvm%c`/`dp_fvm`/`se_flux` include halo rings (lbounds
+  `1-nhc` etc., visible in the reported subscripts). Halo cells hold
+  exchange leftovers; treat a worst-diff at a subscript outside `1..nc`
+  with suspicion and look for the first *interior* diff.
+- The fvm dummies are fixed-shape in CAM but allocatable in CAM-SIMA —
+  handled transparently (same as `elem_state_t`), shapes still compare.
+- Zooming further: the stages inside `run_consistent_se_cslam`
+  (reconstruction, swept-area remap in `fvm_consistent_se_cslam.F90`)
+  can be added as pseudo-SDF entries the same way if the divergence lands
+  there.
+
 ## Old-gdb sites
 
 gdb <= 8.x (e.g. Izumi's 8.2) cannot read the DWARF5 that gcc >= 11
