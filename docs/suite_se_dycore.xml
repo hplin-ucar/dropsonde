@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Pseudo-SDF for the SE dycore: NOT a CCPP suite. Each <scheme> is a dycore
+  subroutine with the same name, module, and signature in BOTH CAM and
+  CAM-SIMA; the dropsonde:portable=<itself> annotation plants the breakpoint
+  on the bare symbol (instead of <scheme>_run) and reads intents from the
+  Fortran source. Document order = first-call order within one physics step;
+  repeated/nested calls pair by timestep + caller bucket + occurrence.
+
+  Use with (each option with its usual leading dashes; XML comments cannot
+  contain them literally):
+    sdf docs/suite_se_dycore.xml, capture docs/capture_se_dycore.json,
+    step-offset 0, meta-root $CAM/src/dynamics/se
+  See docs/se_dycore_guide.md. Keep entries INSIDE dyn_run: in CAM-SIMA,
+  d_p_coupling runs before the cam_run1 timestep sentinel.
+
+  To zoom into a suspect region, generate a finer pseudo-SDF externally
+  (script or LLM): one <scheme> per subroutine of that region's call tree,
+  each annotated portable=itself, in first-call order.
+-->
+<suite name="se_dycore" version="1.0">
+  <group name="dynamics">
+    <scheme>prim_run_subcycle</scheme>          <!-- dropsonde:portable=prim_run_subcycle -->
+    <scheme>applycamforcing</scheme>            <!-- dropsonde:portable=applycamforcing -->
+    <scheme>prim_step</scheme>                  <!-- dropsonde:portable=prim_step -->
+    <scheme>prim_advance_exp</scheme>           <!-- dropsonde:portable=prim_advance_exp -->
+    <scheme>compute_and_apply_rhs</scheme>      <!-- dropsonde:portable=compute_and_apply_rhs -->
+    <scheme>advance_hypervis_dp</scheme>        <!-- dropsonde:portable=advance_hypervis_dp -->
+    <scheme>prim_advec_tracers_remap</scheme>   <!-- dropsonde:portable=prim_advec_tracers_remap -->
+    <scheme>euler_step</scheme>                 <!-- dropsonde:portable=euler_step -->
+    <scheme>advance_hypervis_scalar</scheme>    <!-- dropsonde:portable=advance_hypervis_scalar -->
+    <scheme>vertical_remap</scheme>             <!-- dropsonde:portable=vertical_remap -->
+  </group>
+</suite>

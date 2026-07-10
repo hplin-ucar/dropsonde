@@ -51,6 +51,15 @@ def skip_arg(arg):
     (hidden args skipped)."""
     return arg in SKIP_ARGS or arg.startswith("_")
 
+
+def _arg_intent(sch_int, arg):
+    """Intent of an arg; a derived-type component pseudo-arg (elem%state%v,
+    from a --capture spec) falls back to the intent of its root dummy."""
+    it = sch_int.get(arg)
+    if it is None and "%" in arg:
+        it = sch_int.get(arg.split("%", 1)[0])
+    return it
+
 # --- constituent-index realignment specs (--realign) ------------------------
 # Some portable subroutines are called from two different constituent-index
 # conventions (e.g. MAM's modal_aero_gasaerexch/rename: CAM passes the mozart
@@ -273,9 +282,12 @@ def _disp_scheme(scheme, portable):
     """Display label for a scheme. When the scheme is compared at a shared
     portable subroutine (dropsonde:portable SDF annotation), show
     'scheme -> portable_sub' so the report makes clear what is actually being
-    compared; otherwise just the scheme name."""
+    compared; otherwise just the scheme name. Pseudo-SDF entries that
+    retarget to themselves (portable=<scheme>, the SE dycore convention)
+    add no information, so they show plain."""
     sym = (portable or {}).get(scheme)
-    return "{} -> {}".format(scheme, sym) if sym else scheme
+    return "{} -> {}".format(scheme, sym) if sym and sym != scheme \
+        else scheme
 
 
 class Reporter(object):
@@ -677,7 +689,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
         for arg, sinfo in srec["args"].items():
             if skip_arg(arg):
                 continue
-            it = sch_int.get(arg)
+            it = _arg_intent(sch_int, arg)
             if it == "out" and phase == "entry":
                 continue
             if it == "in" and phase == "exit":
@@ -762,7 +774,7 @@ def count_matching_entry_args(srec, crec, sman, cman, sch_int=None,
     for arg, sinfo in srec["args"].items():
         if skip_arg(arg):
             continue
-        if sch_int and sch_int.get(arg) == "out":
+        if sch_int and _arg_intent(sch_int, arg) == "out":
             continue
         cinfo = crec["args"].get(arg)
         if cinfo is None or sinfo.get("kind") != cinfo.get("kind"):
@@ -906,6 +918,11 @@ def _report(outdir, suite_order, steps, intents=None):
         suite_meta = {}
     portable = suite_meta.get("portable", {}) or {}
     realign = load_realign(os.path.join(outdir, "realign.json"))
+    # SIMA step t pairs with CAM step t+offset. 1 (the default) matches
+    # FPHYStest snapshot runs, where CAM's first step is skipped; 0 is for
+    # two models running freely from identical initial conditions (e.g.
+    # SE dycore comparisons). Set by --step-offset at capture time.
+    offset = suite_meta.get("step_offset", 1)
 
     def disp(s):
         return _disp_scheme(s, portable)
@@ -922,7 +939,8 @@ def _report(outdir, suite_order, steps, intents=None):
     sima_case = suite_meta.get("sima_case")
     if sima_case:
         print("SIMA case: {}".format(sima_case))
-    print("steps:     {}".format(steps))
+    print("steps:     {} (sima step t <-> cam step t+{})".format(
+        steps, offset))
     if realign is not None:
         print("realign:   {} args realigned per species, {} convention, "
               "{} metadata (realign.json)".format(
@@ -1010,7 +1028,7 @@ def _report(outdir, suite_order, steps, intents=None):
 
     # --- alignment ------------------------------------------------------
     # Hits are tagged with the timestep (cam_run1 sentinel) and bucketed
-    # by caller: sima step t pairs with cam step t+1, occurrence-by-
+    # by caller: sima step t pairs with cam step t+offset, occurrence-by-
     # occurrence within each (scheme, step, bucket).
     if not any(r.get("step", 0) >= 1 for r in sima["hits"]):
         print("")
@@ -1037,7 +1055,7 @@ def _report(outdir, suite_order, steps, intents=None):
 
     print("")
     print("call alignment (hits per compared step; sima step t pairs "
-          "with cam step t+1;")
+          "with cam step t+{};".format(offset))
     print("indented rows are calls made from inside the parent scheme):")
     width = max(len(disp(s)) for s in compared) + 2
 
@@ -1064,10 +1082,10 @@ def _report(outdir, suite_order, steps, intents=None):
             buckets = set(b for (ss, tt, b) in sima_g
                           if ss == s and tt == t)
             buckets |= set(b for (ss, tt, b) in cam_g
-                           if ss == s and tt == t + 1)
+                           if ss == s and tt == t + offset)
             for b in sorted(buckets):
                 n_s = len(sima_g.get((s, t, b), []))
-                n_c = len(cam_g.get((s, t + 1, b), []))
+                n_c = len(cam_g.get((s, t + offset, b), []))
                 e = info.setdefault(s, {"top": None, "via": []})
                 if b == "<toplevel>":
                     e["top"] = (n_s, n_c)
@@ -1176,7 +1194,7 @@ def _report(outdir, suite_order, steps, intents=None):
         t = srec.get("step", 0)
         if t < 1 or t > steps:
             continue
-        key = (srec["scheme"], t + 1, srec["_bucket"])
+        key = (srec["scheme"], t + offset, srec["_bucket"])
         cam_list = cam_g.get(key, [])
         n_s = len(sima_g.get((srec["scheme"], t, srec["_bucket"]), []))
         if len(cam_list) == n_s:
@@ -1196,7 +1214,7 @@ def _report(outdir, suite_order, steps, intents=None):
             # Strategy 1: SDF-order pairing -- find the CAM call that
             # follows the last SDF predecessor in CAM's execution order
             result = find_cam_by_sdf_order(
-                srec["scheme"], t + 1, cam_list, used)
+                srec["scheme"], t + offset, cam_list, used)
             if result is not None:
                 k, crec, pred = result
                 used.add(k)

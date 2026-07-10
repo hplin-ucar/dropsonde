@@ -317,6 +317,22 @@ spec there by hand to reprocess an existing dump). Realignment applies only
 to hits of portable-annotated schemes that carry the offset arg on both
 sides; everything else compares exactly as before.
 
+## Comparing non-CCPP code: the SE dycore
+
+The portable mechanism generalizes to code that was never CCPP at all. A
+*pseudo-SDF* whose every `<scheme>` is a plain subroutine annotated
+`dropsonde:portable=<itself>` plants breakpoints on the bare symbols and
+sources intents from the Fortran source; a `--capture` spec expands
+derived-type dummies (`element_t` arrays and friends) into per-component
+pseudo-args (`elem%state%v`) that compare like any array; and
+`--step-offset 0` pairs step t with step t (two models running freely from
+identical initial conditions, instead of the FPHYStest snapshot offset).
+`docs/suite_se_dycore.xml` + `docs/capture_se_dycore.json` cover the SE
+dycore chain from `prim_run_subcycle` down; the workflow, report-reading
+notes, blind spots, and costs are in
+[docs/se_dycore_guide.md](docs/se_dycore_guide.md). Debug (`-O0`) builds
+only.
+
 ## Reading the report
 
 In order of appearance:
@@ -410,6 +426,15 @@ constituent names read as `<unreadable>` (that gdb's gfortran deferred-
 length-character support is too old); the gdb 16.2 gfortran path is
 unaffected.
 
+Derived-type expansion (`--capture`) has its own micro-calibration,
+`tests/cal_se.f90` + `tests/cal_se_run.sh`, shaped like the SE dycore
+(fixed and allocatable `element_t` components, timelevel rotation, a null
+`fvm` pointer array, no errmsg idiom). Passes clean on Izumi (gdb 8.2)
+under gfortran 12.4 and ifort 20.0.1. gdb <= 8.x cannot read the DWARF5
+that gcc >= 11 emits by default — build with `-gdwarf-4` on such sites
+(model and calibration alike; ifort's default DWARF is fine, and so is
+Derecho's gdb 16).
+
 Full-model calibration (2026-06, CAM5 UW PBL suite
 `suite_vdiff_bretherton_park`, ne3, FHIST_C5 vs FPHYStest): all
 end-to-end mechanics verified. With clean snapshots the suite was
@@ -420,8 +445,10 @@ noise. A fully-clean model pair has not yet been tested.
 ## Known limitations
 
 - Derived-type and pointer dummy arguments are skipped (recorded in the
-  manifest with reason). CCPP-compliant schemes should not have them,
-  except `ccpp_constituent_prop_ptr_t` arrays, which are skipped too.
+  manifest with reason) unless a `--capture` spec names their type and
+  component paths (see the SE dycore section). CCPP-compliant schemes
+  should not have them, except `ccpp_constituent_prop_ptr_t` arrays,
+  which are skipped too.
 - NAG unsupported for now: it lowers Fortran to C (DWARF producer is
   `GNU C...`), mangles names `module_MP_<proc>` with C-mangled,
   pointer-typed dummies (`a_Dummy`, `ncol_`), and the Fortran name `a` is

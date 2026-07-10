@@ -184,6 +184,33 @@ def parse_fortran_intents(meta_root, portable):
     return out
 
 
+def load_capture(path):
+    """{derived_type_name_lower: [component paths]} from a
+    dropsonde-capture-v1 JSON spec (--capture). Exits with a clear message
+    on a malformed spec -- fail before the model runs, not after."""
+    def bad(msg):
+        sys.exit("dropsonde: invalid capture spec {}: {}".format(path, msg))
+    try:
+        with open(path) as f:
+            spec = json.load(f)
+    except (OSError, ValueError) as exc:
+        bad(exc)
+    if spec.get("spec") != "dropsonde-capture-v1":
+        bad('missing/unknown spec tag (want "spec": "dropsonde-capture-v1")')
+    types = spec.get("types")
+    if not isinstance(types, dict) or not types:
+        bad("types must map derived-type names to component-path lists")
+    out = {}
+    for tname, paths in types.items():
+        if (not isinstance(paths, list) or not paths or
+                not all(isinstance(p, str) and p.strip() for p in paths)):
+            bad("type {!r}: component paths must be a non-empty list of "
+                "strings".format(tname))
+        out[tname.strip().lower()] = [p.strip().lower().replace(" ", "")
+                                      for p in paths]
+    return out
+
+
 def parse_meta_intents(meta_root, schemes):
     """{scheme: {arg: intent}} for the schemes' _run phases, from CCPP
     .meta files found under meta_root. Lets the differ skip intent(out)
@@ -236,7 +263,8 @@ def find_meta_root(sdf_abs):
         d = parent
 
 
-def launch(role, casedir, schemes, outdir, kill_after_steps, portable):
+def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
+           capture):
     exe = os.path.join(casedir, "bld", "cesm.exe")
     rundir = os.path.join(casedir, "run")
     if not os.path.isfile(exe):
@@ -250,7 +278,7 @@ def launch(role, casedir, schemes, outdir, kill_after_steps, portable):
     with open(cfgpath, "w") as f:
         json.dump({"role": role, "out_dir": roledir, "schemes": schemes,
                    "kill_after_steps": kill_after_steps,
-                   "portable": portable}, f, indent=1)
+                   "portable": portable, "capture": capture}, f, indent=1)
 
     env = dict(os.environ, DROPSONDE_CONFIG=cfgpath)
     # Some sites (e.g. Izumi) point PYTHONHOME/PYTHONPATH at an anaconda whose
@@ -302,7 +330,23 @@ def main():
                          "conventions (e.g. docs/realign_mam.json for the "
                          "MAM aerosol routines); copied to <out>/"
                          "realign.json, where the differ reads it")
+    ap.add_argument("--capture", default=None, metavar="SPEC.json",
+                    help="derived-type capture spec: JSON mapping derived-"
+                         "type names to the component paths worth comparing "
+                         "(e.g. element_t -> state%%v); matching derived-"
+                         "type dummies are expanded into per-component "
+                         "pseudo-args instead of being skipped. Needed for "
+                         "non-CCPP code like the SE dycore (see docs/"
+                         "capture_se_dycore.json). Debug (-O0) builds only")
+    ap.add_argument("--step-offset", type=int, default=1, metavar="N",
+                    help="CAM timestep pairing with SIMA step t is t+N "
+                         "(default 1: FPHYStest snapshot runs, where CAM's "
+                         "first step is skipped; use 0 when both models "
+                         "run freely from identical initial conditions, "
+                         "e.g. SE dycore comparisons)")
     args = ap.parse_args()
+    if args.step_offset < 0:
+        sys.exit("error: --step-offset must be >= 0")
 
     schemes = parse_sdf(args.sdf)
     uniq = []
@@ -348,6 +392,13 @@ def main():
               "intent(out) args will be compared (noisy) -- set "
               "--meta-root")
 
+    capture = load_capture(args.capture) if args.capture else {}
+    if capture:
+        print("dropsonde: capture spec: {} derived type(s): {}".format(
+            len(capture),
+            ", ".join("{} ({} paths)".format(t, len(p))
+                      for t, p in sorted(capture.items()))))
+
     outdir = os.path.abspath(args.out)
     os.makedirs(outdir, exist_ok=True)
     cam_abs = os.path.abspath(args.cam)
@@ -391,12 +442,13 @@ def main():
                 prev = json.load(f)
             checks = ((role + "_case", case_abs, "--" + role),
                       ("sdf", sdf_abs, "--sdf"),
-                      ("steps", args.steps, "--steps"))
+                      ("steps", args.steps, "--steps"),
+                      ("step_offset", args.step_offset, "--step-offset"))
             for key, now, flag in checks:
                 prev_val = prev.get(key)
                 if prev_val is None:
                     continue
-                if key != "steps":
+                if key not in ("steps", "step_offset"):
                     prev_val = os.path.abspath(prev_val)
                 if prev_val != now:
                     sys.exit(
@@ -413,26 +465,30 @@ def main():
     version = git_version()
     with open(os.path.join(outdir, "suite.json"), "w") as f:
         json.dump({"schemes": schemes, "steps": args.steps,
+                   "step_offset": args.step_offset,
                    "sdf": sdf_abs, "intents": intents,
                    "portable": portable,
+                   "capture": capture,
                    "realign": realign_abs,
                    "version": version,
                    "cam_case": cam_abs,
                    "sima_case": sima_abs,
                    "meta_root": meta_root}, f, indent=1)
 
-    # CAM dumps steps+1 timesteps (its first is skipped); SIMA dumps steps.
-    # The gdb side kills each run at the start of the timestep after that,
-    # so STOP_N only needs to be long enough (e.g. CAM's 6-step minimum).
+    # CAM dumps steps+offset timesteps (SIMA step t pairs with CAM step
+    # t+offset); SIMA dumps steps. The gdb side kills each run at the start
+    # of the timestep after that, so STOP_N only needs to be long enough
+    # (e.g. CAM's 6-step minimum).
     runs = []
     if not args.skip_cam:
         runs.append(("cam",
-                      launch("cam", args.cam, uniq, outdir, args.steps + 1,
-                             portable)))
+                      launch("cam", args.cam, uniq, outdir,
+                             args.steps + args.step_offset, portable,
+                             capture)))
     if not args.skip_sima:
         runs.append(("sima",
                       launch("sima", args.sima, uniq, outdir, args.steps,
-                             portable)))
+                             portable, capture)))
     if runs:
         print("dropsonde: waiting for runs to finish ...")
         try:

@@ -33,6 +33,12 @@ KILL_AFTER = CFG.get("kill_after_steps", 0)  # 0 = run to natural exit
 # of the SIMA-only <scheme>_run CCPP wrapper. See parse_portable_map in the
 # dropsonde driver.
 PORTABLE = CFG.get("portable", {}) or {}
+# {derived_type_name_lower: [component paths]}: derived-type dummies whose
+# type matches a key are expanded into per-component pseudo-args
+# (e.g. elem%state%v) instead of being skipped. Authored as a JSON spec
+# (--capture); needed for non-CCPP code like the SE dycore, where the model
+# state travels in element_t arrays rather than plain-array arguments.
+CAPTURE = CFG.get("capture", {}) or {}
 
 # gdb (Derecho gfortran, calibrated 2026-06-12) reports Fortran array
 # ranges outermost-first, i.e. REVERSED relative to subscript order, while
@@ -210,8 +216,20 @@ def array_plan(name, val):
             "extents": extents, "strides": strides}, None
 
 
+# A synthesized derived-type plan can span the whole element array (GBs)
+# for a component that is a small fraction of it; batch the outermost
+# (largest-stride) dimension so no single gdb read exceeds this.
+CHUNK_SPAN = 64 << 20
+
+
 def read_array(plan):
     """Read the logical array contents as contiguous subscript-major bytes."""
+    if plan.get("addrs") is not None:
+        # per-element plans (allocatable derived-type component): same
+        # inner shape at per-element heap addresses, outermost dim last
+        inner = plan["inner"]
+        return b"".join(read_array(dict(inner, addr=a))
+                        for a in plan["addrs"])
     extents = plan["extents"]
     strides = plan["strides"]
     elsize = plan["elsize"]
@@ -221,6 +239,16 @@ def read_array(plan):
     if total == 0:
         return b""
     span = sum(s * (e - 1) for s, e in zip(strides, extents)) + elsize
+    if (span > CHUNK_SPAN and len(extents) > 1 and strides[-1] > 0 and
+            strides[-1] == max(strides)):
+        nb = max(1, CHUNK_SPAN // strides[-1])
+        out = []
+        for j0 in range(0, extents[-1], nb):
+            cnt = min(nb, extents[-1] - j0)
+            sub = dict(plan, addr=plan["addr"] + j0 * strides[-1],
+                       extents=extents[:-1] + [cnt])
+            out.append(read_array(sub))
+        return b"".join(out)
     raw = bytes(gdb.selected_inferior().read_memory(plan["addr"], span))
 
     contig = True
@@ -253,10 +281,185 @@ def read_scalar(addr, dt):
 
 def write_blob(scheme, hit, arg, phase, data):
     FILE_IDX[0] += 1
-    fn = "{:05d}_{}_h{}_{}_{}.bin".format(FILE_IDX[0], scheme, hit, arg, phase)
+    fn = "{:05d}_{}_h{}_{}_{}.bin".format(
+        FILE_IDX[0], scheme, hit, arg.replace("%", "."), phase)
     with open(os.path.join(OUT, fn), "wb") as f:
         f.write(data)
     return fn
+
+
+# --------------------------------------------------------------------------
+# derived-type dummy expansion (--capture spec)
+#
+# Non-CCPP code like the SE dycore passes its state in derived types
+# (element_t arrays: elem(:)%state%v ...) rather than plain-array arguments.
+# A capture spec maps a derived-type NAME to the component paths worth
+# comparing; matching dummies are expanded into per-component pseudo-args
+# ("elem%state%v") whose records look exactly like plain array/scalar args,
+# so the exit re-read and the differ are unchanged. Components at a fixed
+# offset in the element (compile-time shape) become one strided plan over
+# all elements; allocatable components live at per-element heap addresses
+# and get a per-element address list (read_array's "addrs" path). Addresses
+# are probed empirically per hit, like every other capture.
+# --------------------------------------------------------------------------
+
+def _capturable_struct(t):
+    """Lowercase derived-type name if `t` is a struct, pointer-to-struct, or
+    array-of-struct dummy; None otherwise."""
+    t = t.strip_typedefs()
+    if t.code == gdb.TYPE_CODE_PTR:
+        t = t.target().strip_typedefs()
+    if t.code == gdb.TYPE_CODE_ARRAY:
+        t = _element_type(t)
+    if t.code not in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+        return None
+    name = t.name or t.tag or ""
+    name = name.split("::")[-1].strip().lower()
+    return name or None
+
+
+def _expr_plan(expr):
+    """('array', plan) | ('scalar', (addr, dtype)) | (None, None) plus an
+    error string, for a component-path gdb expression like 'tl%n0' or
+    'elem(3)%state%v'."""
+    v = gdb.parse_and_eval(expr)
+    t = v.type.strip_typedefs()
+    if is_character(t):
+        return None, None, "character component not captured"
+    if t.code == gdb.TYPE_CODE_ARRAY:
+        plan, err = array_plan(expr, v)
+        if plan is None:
+            return None, None, err
+        return "array", plan, None
+    if t.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION,
+                  gdb.TYPE_CODE_PTR):
+        return None, None, ("component is a derived type; extend the "
+                            "capture path into its numeric members")
+    dt = dtype_of(t)
+    if dt is None:
+        return None, None, "unsupported component type: {}".format(t)
+    if v.address is None:
+        return None, None, "component has no address"
+    return "scalar", (int(v.address), dt), None
+
+
+def _as_rank0_plan(payload):
+    """A scalar component as a rank-0 plan, so array-of-struct expansion
+    can treat scalar and array components uniformly (the element dimension
+    is appended either way)."""
+    addr, dt = payload
+    return {"addr": addr, "elsize": int(dt[1:]), "dtype": dt,
+            "los": [], "extents": [], "strides": []}
+
+
+def _expand_struct_scalar(scheme, hit, name, paths, rec):
+    """Pseudo-args for the components of a (scalar) derived-type dummy."""
+    for path in paths:
+        key = "{}%{}".format(name, path)
+        info = {"kind": "skipped"}
+        rec["args"][key] = info
+        try:
+            kind, payload, err = _expr_plan(key)
+            if kind == "array":
+                _record_array(info, scheme, hit, key, payload)
+            elif kind == "scalar":
+                addr, dt = payload
+                info["kind"] = "scalar"
+                info["dtype"] = dt
+                info["addr"] = addr
+                info["entry_value"] = read_scalar(addr, dt)
+            else:
+                info["why"] = err
+        except Exception as exc:
+            info["kind"] = "error"
+            info["why"] = str(exc)
+
+
+def _expand_struct_array(scheme, hit, name, val, paths, rec):
+    """Pseudo-args for the components of an array-of-struct dummy (e.g.
+    elem(:)). Each component is captured across ALL elements, the element
+    index appended as the outermost (last, slowest-varying) dimension."""
+    dims, _base = array_dims(val.type)
+    if len(dims) != 1:
+        raise gdb.error("rank-{} derived-type array not supported".format(
+            len(dims)))
+    lo, hi = dims[0]
+    n = hi - lo + 1
+    if n <= 0:
+        for path in paths:
+            rec["args"]["{}%{}".format(name, path)] = {
+                "kind": "skipped", "why": "empty derived-type array"}
+        return
+    estride = None
+    if n > 1:
+        a0 = gdb.parse_and_eval("{}({})".format(name, lo)).address
+        a1 = gdb.parse_and_eval("{}({})".format(name, lo + 1)).address
+        if a0 is not None and a1 is not None:
+            estride = int(a1) - int(a0)
+    for path in paths:
+        key = "{}%{}".format(name, path)
+        info = {"kind": "skipped"}
+        rec["args"][key] = info
+        try:
+            kind, payload, err = _expr_plan(
+                "{}({})%{}".format(name, lo, path))
+            if kind is None:
+                info["why"] = err
+                continue
+            p0 = payload if kind == "array" else _as_rank0_plan(payload)
+            if n > 1:
+                # shape must be uniform across elements (same allocation
+                # code ran for each); spot-check the last element
+                kind_l, payload_l, err_l = _expr_plan(
+                    "{}({})%{}".format(name, hi, path))
+                if kind_l != kind:
+                    raise gdb.error("component kind varies across "
+                                    "elements: {}".format(err_l or kind_l))
+                pl = (payload_l if kind == "array"
+                      else _as_rank0_plan(payload_l))
+                if (pl["extents"] != p0["extents"] or
+                        pl["strides"] != p0["strides"]):
+                    raise gdb.error(
+                        "component shape varies across elements: "
+                        "{}/{} vs {}/{}".format(
+                            p0["extents"], p0["strides"],
+                            pl["extents"], pl["strides"]))
+            delta = None
+            if n > 1:
+                kind1, payload1, _err1 = _expr_plan(
+                    "{}({})%{}".format(name, lo + 1, path))
+                if kind1 == kind:
+                    p1 = (payload1 if kind == "array"
+                          else _as_rank0_plan(payload1))
+                    delta = p1["addr"] - p0["addr"]
+            if n == 1 or (delta is not None and delta == estride and
+                          delta > 0):
+                # fixed-offset component: one strided plan covers all
+                # elements
+                plan = {"addr": p0["addr"], "elsize": p0["elsize"],
+                        "dtype": p0["dtype"], "los": p0["los"] + [lo],
+                        "extents": p0["extents"] + [n],
+                        "strides": p0["strides"] + [estride or 0]}
+            else:
+                # allocatable/pointer component: per-element heap
+                # addresses; probe each element's base once
+                addrs = [p0["addr"]]
+                for i in range(lo + 1, hi + 1):
+                    e = "{}({})%{}".format(name, i, path)
+                    if kind == "array":
+                        addrs.append(elem_addr(e, p0["los"]))
+                    else:
+                        addrs.append(
+                            int(gdb.parse_and_eval(e).address))
+                plan = {"elsize": p0["elsize"], "dtype": p0["dtype"],
+                        "los": p0["los"] + [lo],
+                        "extents": p0["extents"] + [n],
+                        "strides": p0["strides"] + [0],
+                        "inner": p0, "addrs": addrs}
+            _record_array(info, scheme, hit, key, plan)
+        except Exception as exc:
+            info["kind"] = "error"
+            info["why"] = str(exc)
 
 
 # --------------------------------------------------------------------------
@@ -334,8 +537,10 @@ def _first_body_line(scheme, frame):
         fname = frame.find_sal().symtab.fullname()
         with open(fname) as fh:
             lines = fh.readlines()
+        end = len(lines) + 1
         for idx in range(start - 1, len(lines)):
             if _END_SUB_RE.match(lines[idx]):
+                end = idx + 1
                 break
             if _ERR_INIT_RE.match(lines[idx]):
                 result = (fname, idx + 1)
@@ -349,6 +554,16 @@ def _first_body_line(scheme, frame):
                      "state".format(scheme, len(suspects),
                                     os.path.basename(fname), result[1],
                                     suspects[0]))
+        else:
+            # Non-CCPP subroutines (e.g. the SE dycore) have no errmsg
+            # idiom; the first executable-looking statement is an equally
+            # safe advance target -- 'advance' stops BEFORE the line runs,
+            # so the dummies are live and still unmodified.
+            suspects = _exec_lines_before(lines, start, end)
+            if suspects:
+                result = (fname, suspects[0])
+                note("{}: no errmsg idiom; using first executable "
+                     "statement".format(scheme))
     except Exception as exc:
         note("{}: body-line scan failed: {}".format(scheme, exc))
     if result is not None:
@@ -714,7 +929,23 @@ def handle_entry(scheme, frame):
         try:
             val = sym.value(frame)
             t = val.type.strip_typedefs()
-            if t.code == gdb.TYPE_CODE_ARRAY and not is_character(t):
+            stname = _capturable_struct(t)
+            if stname is not None:
+                paths = CAPTURE.get(stname)
+                if not paths:
+                    info["why"] = ("derived type {} (no capture spec "
+                                   "entry)".format(stname))
+                elif t.code == gdb.TYPE_CODE_ARRAY:
+                    info["why"] = ("derived-type array {}: expanded into "
+                                   "{} component pseudo-args".format(
+                                       stname, len(paths)))
+                    _expand_struct_array(scheme, hit, name, val, paths, rec)
+                else:
+                    info["why"] = ("derived type {}: expanded into {} "
+                                   "component pseudo-args".format(
+                                       stname, len(paths)))
+                    _expand_struct_scalar(scheme, hit, name, paths, rec)
+            elif t.code == gdb.TYPE_CODE_ARRAY and not is_character(t):
                 plan, err = array_plan(name, val)
                 if plan is None:
                     info["why"] = err
