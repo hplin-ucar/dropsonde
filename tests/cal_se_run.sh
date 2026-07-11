@@ -15,6 +15,12 @@
 #             rotate between steps; fvm (null pointer) skips gracefully;
 #             entry capture lands on the first executable statement
 #             ("no errmsg idiom" note in gdb.log)
+#   compute_like's deriv/inv_cp/qwater/qidx are FORCED through the ABI
+#             capture paths (force_abi config; big-frame subroutines like
+#             the SE dycore's compute_and_apply_rhs take them for real when
+#             gfortran drops the stack dummies' DWARF locations) and must
+#             match prim_step_like's normal-path captures of the same
+#             arrays (deriv0/inv_cp0/qwater0/qidx0) byte for byte
 set -e
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 FC=${FC:-gfortran}
@@ -34,7 +40,9 @@ for role in cam sima; do
  "capture": {"element_t": ["state%v", "state%t", "state%qdp",
                            "derived%ft", "spheremp", "localid", "tag"],
              "timelevel_t": ["n0", "np1"],
-             "hvcoord_t": ["hyai", "ps0"]},
+             "hvcoord_t": ["hyai", "ps0"],
+             "derivative_t": ["dvv"]},
+ "force_abi": ["deriv", "inv_cp", "qwater", "qidx"],
  "kill_after_steps": $kill_steps}
 EOF
   # -u PYTHONHOME/PYTHONPATH: some sites (e.g. Izumi) point these at an
@@ -188,6 +196,35 @@ for role in ('cam', 'sima'):
     log = open(os.path.join(d, 'gdb.log')).read()
     check('no errmsg idiom; using first executable statement' in log,
           'entry advance used the first-executable-statement fallback')
+
+    # --- forced-ABI capture (big-frame dropped-location analog) -----------
+    ca = cl[0]['args']
+    check(ca['deriv%dvv'].get('kind') == 'array' and
+          ca['deriv%dvv'].get('extents') == [NP, NP] and
+          ca['deriv%dvv'].get('abi'),
+          'deriv%dvv captured via ABI base + field offsets')
+    check(vals(d, ca['deriv%dvv']['entry_file']) ==
+          (11.0, 21.0, 12.0, 22.0), 'deriv%dvv values (dim order)')
+    check(ca['inv_cp'].get('kind') == 'array' and
+          ca['inv_cp'].get('extents') == [NP, NP, NLEV, NELEM] and
+          ca['inv_cp'].get('los') == [1, 1, 1, 1] and
+          ca['inv_cp'].get('abi'),
+          'inv_cp declared-shape ABI plan (nets:nete bounds)')
+    check(ca['qwater'].get('kind') == 'array' and
+          ca['qwater'].get('extents') == [NP, NP, NLEV, QSIZE, NELEM],
+          'qwater declared-shape ABI plan (module-var + nets:nete bounds)')
+    check(ivals(d, ca['qidx']['entry_file'],
+                int(ca['qidx']['dtype'][1:])) == (2, 1),
+          'qidx (integer, module-var bound) values')
+    pa = psl[0]['args']
+    for fa, fn in (('deriv%dvv', 'deriv0%dvv'), ('inv_cp', 'inv_cp0'),
+                   ('qwater', 'qwater0'), ('qidx', 'qidx0')):
+        check(open(os.path.join(d, ca[fa]['entry_file']), 'rb').read() ==
+              open(os.path.join(d, pa[fn]['entry_file']), 'rb').read(),
+              '{} ABI capture == normal-path {} capture'.format(fa, fn))
+    check(all(ca[a].get('exit_file') for a in
+              ('deriv%dvv', 'inv_cp', 'qwater', 'qidx')),
+          'forced-ABI args re-read at exit')
 
 print('cal_se: ALL CHECKS PASSED')
 EOF

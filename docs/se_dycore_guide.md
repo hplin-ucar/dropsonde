@@ -53,11 +53,23 @@ localized answer difference.
 - Repeated calls (subcycles, RK stages) pair by occurrence within
   (timestep, caller); nested rows show as `via <caller>` exactly like
   nested physics calls.
-- `elem%state%qdp`'s constituent axis is compared raw (index m vs index
-  m). Water vapor is slot 1 in both models, but check the report's
-  constituent-mapping table: if the remaining tracers are ordered
-  differently, a Qdp diff on those slots is an indexing artifact, not a
-  divergence.
+- `elem%state%qdp` / `elem%derived%fq`: when the two models register
+  DIFFERENT constituent counts (e.g. CAM carries test tracers SIMA does
+  not), the constituent axis is compared through the report's
+  constituent-mapping table, one mapped species at a time; unmatched
+  species are skipped, so CAM-only tracers no longer hide the water
+  species behind a shape-mismatch line. With EQUAL counts the axis is
+  still compared raw (index m vs m) -- check the mapping table for
+  reordering artifacts in that case.
+- Entry "diffs" whose values are NaN/denormal/huge on both sides
+  (omega_cn-style intent(inout) diagnostics the dycore only writes) are
+  downgraded to a [note] and do NOT suppress the exit comparison; the
+  exit is then compared over the elements the scheme actually wrote.
+- Stack-passed args of big-frame subroutines (compute_and_apply_rhs's
+  qwater/inv_cp_full/kappa/qidx, deriv%dvv) lose their gfortran -O0 DWARF
+  locations and are recovered from the ABI argument slots plus the source
+  declaration's bounds; a remaining "capture errored" [note] there means
+  that recovery failed too -- check gdb.log.
 
 ## Blind spots
 
@@ -100,9 +112,11 @@ gotchas:
 - **Tracer split**: GLL `elem%state%qdp` carries only the thermodynamic
   active species (`qsize = thermodynamic_active_species_num`, CAM: from
   air_composition; CAM-SIMA: its port) while `fvm%c` carries all advected
-  tracers (`ntrac`). A count mismatch between the models appears as a
-  shape mismatch on `qdp`/`qwater` — that is itself the finding, not tool
-  noise.
+  tracers (`ntrac`). A count mismatch between the models is compared per
+  mapped species (see above) when the counts equal each model's
+  registered-constituent count; a `qdp` axis that matches NEITHER model's
+  registry (wrong `qsize`) still reports as a shape mismatch — that is
+  itself the finding, not tool noise.
 - **Halos**: `fvm%c`/`dp_fvm`/`se_flux` include halo rings (lbounds
   `1-nhc` etc., visible in the reported subscripts). Halo cells hold
   exchange leftovers; treat a worst-diff at a subscript outside `1..nc`

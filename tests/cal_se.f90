@@ -43,6 +43,9 @@ end module cam_comp
 module se_element_mod
   implicit none
   integer, parameter :: np = 2, nlev = 3, qsize = 2, timelevels = 2
+  ! runtime-valued dimension (thermodynamic_active_species_num analog):
+  ! bounds a dummy whose extent gdb cannot resolve statically
+  integer :: qsize_mod = 0
 
   type state_t
     real(8) :: v(np, np, 2, nlev, timelevels)   ! fixed shape (CAM style)
@@ -53,6 +56,11 @@ module se_element_mod
   type derived_t
     real(8) :: ft(np, np, nlev)
   end type derived_t
+
+  type derivative_t
+    real(8) :: dvv(np, np)                      ! fixed shape (deriv%dvv)
+    real(8) :: legdg(np, np)                    ! offset probe for dvv
+  end type derivative_t
 
   type element_t
     integer :: localid
@@ -76,26 +84,46 @@ module se_dycore
   use se_element_mod
   implicit none
 contains
-  subroutine compute_like(elem, nets, nete, np1, dt2, hvcoord)
+  subroutine compute_like(elem, nets, nete, np1, dt2, hvcoord, deriv, &
+       inv_cp, qwater, qidx)
+    ! deriv (arg 7), inv_cp (8), qwater (9), qidx (10) mirror the SE
+    ! dycore's compute_and_apply_rhs stack-passed dummies: a scalar
+    ! derived-type dummy with fixed-shape components, and explicit-shape
+    ! arrays whose bounds mix compile-time parameters (np, nlev), a module
+    ! VARIABLE (qsize_mod), and sibling dummies (nets:nete). The cal run
+    ! forces them through the ABI capture paths (force_abi config).
     type(element_t), intent(inout) :: elem(:)
     integer, intent(in) :: nets, nete, np1
     real(8), intent(in) :: dt2
     type(hvcoord_t), intent(in) :: hvcoord
+    type(derivative_t), intent(in) :: deriv
+    real(8), intent(in) :: inv_cp(np, np, nlev, nets:nete)
+    real(8), intent(in) :: qwater(np, np, nlev, qsize_mod, nets:nete)
+    integer, intent(in) :: qidx(qsize_mod)
     integer :: ie
     do ie = nets, nete
       elem(ie)%state%v(:, :, :, :, np1) = elem(ie)%state%v(:, :, :, :, np1) &
-           + dt2 * hvcoord%ps0
+           + dt2 * hvcoord%ps0 + deriv%dvv(1, 1) * inv_cp(1, 1, 1, ie) &
+           * qwater(1, 1, 1, qidx(1), ie) * 0.0_8
       elem(ie)%derived%ft = elem(ie)%derived%ft + hvcoord%hyai(1)
     end do
   end subroutine compute_like
 
-  subroutine prim_step_like(elem, fvm, nets, nete, dt, tl, hvcoord)
+  subroutine prim_step_like(elem, fvm, nets, nete, dt, tl, hvcoord, &
+       deriv0, inv_cp0, qwater0, qidx0)
+    ! same arrays as compute_like's forced-ABI dummies, under different
+    ! names so THESE capture via the normal DWARF path: the calibration
+    ! compares the two captures byte-for-byte
     type(element_t), intent(inout) :: elem(:)
     type(element_t), pointer :: fvm(:)
     integer, intent(in) :: nets, nete
     real(8), intent(in) :: dt
     type(timelevel_t), intent(in) :: tl
     type(hvcoord_t), intent(in) :: hvcoord
+    type(derivative_t), intent(in) :: deriv0
+    real(8), intent(in) :: inv_cp0(np, np, nlev, nets:nete)
+    real(8), intent(in) :: qwater0(np, np, nlev, qsize_mod, nets:nete)
+    integer, intent(in) :: qidx0(qsize_mod)
     integer :: ie
     do ie = nets, nete
       elem(ie)%state%t(:, :, :, tl%np1) = elem(ie)%state%t(:, :, :, tl%n0) + dt
@@ -103,7 +131,8 @@ contains
            * 2.0_8
       elem(ie)%localid = elem(ie)%localid + 1
     end do
-    call compute_like(elem, nets, nete, tl%np1, dt * 0.5_8, hvcoord)
+    call compute_like(elem, nets, nete, tl%np1, dt * 0.5_8, hvcoord, &
+         deriv0, inv_cp0, qwater0, qidx0)
   end subroutine prim_step_like
 end module se_dycore
 
@@ -119,7 +148,10 @@ program cal_se
   type(element_t), pointer :: fvm_null(:) => null()
   type(timelevel_t) :: tl
   type(hvcoord_t) :: hv
-  integer :: ie, i, k
+  type(derivative_t) :: deriv
+  real(8), allocatable :: inv_cp(:, :, :, :), qwater(:, :, :, :, :)
+  integer, allocatable :: qidx(:)
+  integer :: ie, i, j, k, q
 
   cnst_name = [character(len=16) :: 'Q', 'CLDLIQ', 'RAINQM']
   allocate(const_props(2))
@@ -154,11 +186,38 @@ program cal_se
   hv%hyai = [(0.1_8 * i, i = 1, nlev + 1)]
   hv%ps0 = 1000.0_8
 
+  qsize_mod = 2
+  allocate(inv_cp(np, np, nlev, nelem))
+  allocate(qwater(np, np, nlev, qsize_mod, nelem))
+  allocate(qidx(qsize_mod))
+  do j = 1, np
+    do i = 1, np
+      deriv%dvv(i, j) = 10.0_8 * i + j
+      deriv%legdg(i, j) = 0.0_8
+    end do
+  end do
+  do ie = 1, nelem
+    do k = 1, nlev
+      do j = 1, np
+        do i = 1, np
+          inv_cp(i, j, k, ie) = 1000.0_8 * ie + 100.0_8 * k + 10.0_8 * j + i
+          do q = 1, qsize_mod
+            qwater(i, j, k, q, ie) = 1.0e6_8 * q + inv_cp(i, j, k, ie)
+          end do
+        end do
+      end do
+    end do
+  end do
+  qidx = [2, 1]
+
   call cam_run1()                                             ! timestep 1
-  call prim_step_like(elem, fvm_null, 1, nelem, 0.5_8, tl, hv) ! subcycle 1
-  call prim_step_like(elem, fvm_null, 1, nelem, 0.5_8, tl, hv) ! subcycle 2
+  call prim_step_like(elem, fvm_null, 1, nelem, 0.5_8, tl, hv, &
+       deriv, inv_cp, qwater, qidx)                           ! subcycle 1
+  call prim_step_like(elem, fvm_null, 1, nelem, 0.5_8, tl, hv, &
+       deriv, inv_cp, qwater, qidx)                           ! subcycle 2
   call cam_run1()                                             ! timestep 2
   tl%n0 = 2; tl%np1 = 1; tl%nstep = 1                          ! rotate levels
-  call prim_step_like(elem, fvm_null, 1, nelem, 0.5_8, tl, hv)
+  call prim_step_like(elem, fvm_null, 1, nelem, 0.5_8, tl, hv, &
+       deriv, inv_cp, qwater, qidx)
   print *, elem(1)%state%t(1, 1, 1, 1), elem(nelem)%state%qdp(1, 1, 1, 1, 2)
 end program cal_se
