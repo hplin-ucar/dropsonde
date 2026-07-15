@@ -352,16 +352,24 @@ In order of appearance:
     element stats, or just `sima=… cam=…` for rank-1 (one value per
     species).
   - `[note]` lines are non-verdicts: hits paired by input match, args
-    absent on one side, and `intent(out)` elements never written by
+    absent on one side, `intent(out)` elements never written by
     either model (exit == entry bitwise, still holding each caller's
-    pre-call memory). Partially-filled outputs or oversized actual
-    arguments show up this way.
+    pre-call memory), and hits with no exit capture (the run stopped
+    inside the scheme, so outputs were NOT compared). Partially-filled
+    outputs or oversized actual arguments show up this way.
+  - `[hint]` lines interpret a pattern for you, e.g. inputs that are nan
+    on one side only (a never-written field in that model — benign if
+    the scheme's outputs still match).
 - **per-scheme summary** (on failure) — diff counts per scheme, schemes
-  that were bit-for-bit.
-- **alignment warning + offset scan** — printed when the first compared
-  scheme already has input diffs. Scans all dumped steps on both sides
-  to detect a wrong step offset or a re-read snapshot record. Distrust
-  everything below the first scheme until resolved.
+  that were bit-for-bit, followed by a short "how to read this report"
+  footer so the triage priorities travel with pasted reports.
+- **alignment check** — printed when the first compared scheme already
+  has input diffs. Bitwise-matches that scheme's entry args against
+  every dumped cam step and states the conclusion: if most args match
+  the paired step, alignment is correct and the differing inputs are
+  field-specific upstream issues; it only warns when another step
+  matches better (wrong step offset) or no step matches (wrong
+  snapshot), and separately flags a re-read (repeated) snapshot record.
 
 ## Digging deeper after a run
 

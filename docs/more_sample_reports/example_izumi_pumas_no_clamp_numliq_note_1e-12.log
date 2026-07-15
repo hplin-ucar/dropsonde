@@ -1,0 +1,67 @@
+
+================================================================
+dropsonde report  (/home/hplin/dropsonde/dropsonde_out)
+================================================================
+dropsonde version: b621b43
+SDF:       /scratch/cluster/hplin/pumas_demo/cam_sima_pumas_round3_try8/src/physics/ncar_ccpp/test/test_suites/suite_pumas.xml
+CAM case:  /scratch/cluster/hplin/pumas_demo/cam_pumas_snap
+SIMA case: /scratch/cluster/hplin/pumas_demo/sima_pumas
+steps:     1
+schemes: 2 compared
+  SIMA-only (no CAM symbol, not compared): initialize_constituents, micro_pumas_ccpp_dimensions_pre, micro_pumas_ccpp_dimensions_post, apply_constituent_tendencies, clamp_number_concentrations, apply_heating_rate, pumas_post_main
+  unresolved in both: to_be_ccppized_temporary, clubb_stub, hetfrz_classnuc_stub, pumas_pre_main
+
+constituent mapping (CAM 11 species, SIMA 11):
+  cam q(:,:, 1) Q                <-> sima q(:,:, 4) water_vapor_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 2) CLDLIQ           <-> sima q(:,:, 2) cloud_liquid_water_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 3) CLDICE           <-> sima q(:,:, 1) cloud_ice_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 4) NUMLIQ           <-> sima q(:,:, 8) mass_number_concentration_of_cloud_liquid_water_droplets_in_moist_air_and_condensed_water
+  cam q(:,:, 5) NUMICE           <-> sima q(:,:, 5) mass_number_concentration_of_ice_wrt_moist_air_and_condensed_water
+  cam q(:,:, 6) RAINQM           <-> sima q(:,:, 7) rain_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 7) SNOWQM           <-> sima q(:,:, 9) snow_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:, 8) NUMRAI           <-> sima q(:,:,10) mass_number_concentration_of_rain_drops_in_moist_air_and_condensed_water
+  cam q(:,:, 9) NUMSNO           <-> sima q(:,:,11) mass_number_concentration_of_snow_crystals_in_moist_air_and_condensed_water
+  cam q(:,:,10) GRAUQM           <-> sima q(:,:, 3) graupel_water_mixing_ratio_wrt_moist_air_and_condensed_water
+  cam q(:,:,11) NUMGRA           <-> sima q(:,:, 6) mass_number_concentration_of_graupel_particles_in_moist_air_and_condensed_water
+
+call alignment (hits per compared step; sima step t pairs with cam step t+1;
+indented rows are calls made from inside the parent scheme):
+  micro_pumas_ccpp    sima x1   cam x1
+  geopotential_temp   sima x1   cam x18   <-- hit counts differ (see notes)
+
+comparison (execution order):
+
+FIRST DIVERGENCE -----------------------------------------------
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_snowice_tend_external: 28188/28188 elements differ, max |diff| inf at (1,1): sima=2.8620189290612475e-25 cam=nan
+----------------------------------------------------------------
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_numsnow_tend_external: 28188/28188 elements differ, max |diff| inf at (1,1): sima=9.9999999999999998e-13 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_effi_external: 28188/28188 elements differ, max |diff| inf at (1,1): sima=25 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_frzimm: 28188/28188 elements differ, max |diff| inf at (1,1): sima=0 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_frzcnt: 28188/28188 elements differ, max |diff| inf at (1,1): sima=0 cam=nan
+  [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_frzdep: 28188/28188 elements differ, max |diff| inf at (1,1): sima=0 cam=nan
+  [note] micro_pumas_ccpp [step 1] (hit 0): arg .tmp.MICRO_MG_WARM_RAIN.len_V$17f0 absent on CAM side
+  [note] micro_pumas_ccpp [step 1] (hit 0): arg .tmp.ERRMSG.len_V$196a absent on CAM side
+  [note] geopotential_temp [step 1] (hit 0): paired with cam occurrence 12 of 18 (SDF order: follows micro_pumas_ccpp in CAM execution)
+  [INPUTS DIFFER] geopotential_temp [step 1] (hit 0) arg carr: constituent-indexed array, 6/11 mapped species differ: CLDICE, NUMLIQ, RAINQM, SNOWQM, GRAUQM, NUMGRA
+    CLDICE (cam idx 3, sima idx 1) <-> cloud_ice_mixing_ratio_wrt_moist_air_and_condensed_water: 179/28188 elements differ, max |diff| 5.294e-23 at (163,49): sima=-5.2939559203393771e-23 cam=0
+    NUMLIQ (cam idx 4, sima idx 8) <-> mass_number_concentration_of_cloud_liquid_water_droplets_in_moist_air_and_condensed_water: 22950/28188 elements differ, max |diff| 1.864e-09 at (103,41): sima=-1.862645149230957e-09 cam=9.9999999999999998e-13
+    RAINQM (cam idx 6, sima idx 7) <-> rain_mixing_ratio_wrt_moist_air_and_condensed_water: 969/28188 elements differ, max |diff| 1.034e-15 at (329,37): sima=-1.0342070198681623e-15 cam=0
+    SNOWQM (cam idx 7, sima idx 9) <-> snow_mixing_ratio_wrt_moist_air_and_condensed_water: 668/28188 elements differ, max |diff| 2.908e-20 at (32,39): sima=-2.9084497517977006e-20 cam=0
+    GRAUQM (cam idx 10, sima idx 3) <-> graupel_water_mixing_ratio_wrt_moist_air_and_condensed_water: 446/28188 elements differ, max |diff| 1.546e-20 at (408,57): sima=-1.5458351287390981e-20 cam=0
+    NUMGRA (cam idx 11, sima idx 6) <-> mass_number_concentration_of_graupel_particles_in_moist_air_and_condensed_water: 470/28188 elements differ, max |diff| 8.882e-16 at (139,56): sima=-8.8817841970012523e-16 cam=0
+  [note] geopotential_temp [step 1] (hit 0): arg .tmp.ERRMSG.len_V$8f1 absent on CAM side
+  [OUTPUTS DIFFER] geopotential_temp [step 1] (hit 0) arg zi: 23/28674 elements differ, max |diff| 9.095e-13 at (329,29): sima=7791.9309216547772 cam=7791.9309216547763
+  [OUTPUTS DIFFER] geopotential_temp [step 1] (hit 0) arg zm: 24/28188 elements differ, max |diff| 9.095e-13 at (329,28): sima=8016.4534791797541 cam=8016.4534791797532
+
+*** WARNING: the very first compared scheme already has input differences.
+*** Timestep alignment or initial conditions are suspect; check snapshot setup
+*** before believing any divergence below the first scheme.
+offset scan: entry args of micro_pumas_ccpp (sima step 1) vs every dumped step:
+  vs cam  step 1:  9/37 args bitwise identical
+  vs cam  step 2: 31/37 args bitwise identical
+
+9 differing comparisons across 2 hit pairs.
+per-scheme: 0/2 compared schemes bit-for-bit; differing:
+  micro_pumas_ccpp: 6 input / 0 output diffs
+  geopotential_temp: 1 input / 2 output diffs
+Raw dumps and entry-time addresses are in the manifests for manual gdb follow-up.

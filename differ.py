@@ -51,12 +51,14 @@ SKIP_ARGS = {"errmsg", "errflg", "iulog"}
 
 
 def skip_arg(arg):
-    """Args never compared: CCPP error plumbing, and gfortran's hidden
-    compiler-generated arguments (leading underscore, e.g. the _errmsg
-    character length), which capture asymmetrically when a debug-build
-    manifest (hidden args read as scalars) meets an optimized-build one
-    (hidden args skipped)."""
-    return arg in SKIP_ARGS or arg.startswith("_")
+    """Args never compared: CCPP error plumbing, and hidden
+    compiler-generated arguments -- gfortran's leading underscore (e.g. the
+    _errmsg character length) and ifort's .tmp.<NAME>.len_V$<id>
+    character-length temporaries -- which capture asymmetrically when a
+    debug-build manifest (hidden args read as scalars) meets an
+    optimized-build one (hidden args skipped)."""
+    return (arg in SKIP_ARGS or arg.startswith("_") or
+            (arg.startswith(".tmp.") and ".len_V$" in arg))
 
 # --- constituent-index realignment specs (--realign) ------------------------
 # Some portable subroutines are called from two different constituent-index
@@ -296,12 +298,20 @@ class Reporter(object):
         self.cur_scheme = None
         self.by_scheme = {}  # scheme -> [entry_diffs, exit_diffs]
         self.portable = portable or {}  # scheme -> portable_sub, for labels
+        self.nan_args = []  # (arg, side) of the current hit's one-sided nans
+        self.no_exit_schemes = set()  # schemes with a hit missing exit dumps
 
     def diff(self, scheme, hit, phase, arg, text, extra_lines=None):
         self.n_diffs += 1
         if self.cur_scheme:
             c = self.by_scheme.setdefault(self.cur_scheme, [0, 0])
             c[0 if phase == "entry" else 1] += 1
+        if phase == "entry":
+            t = " ".join([text] + list(extra_lines or []))
+            s_nan = "sima=nan" in t or "sima=-nan" in t
+            c_nan = "cam=nan" in t or "cam=-nan" in t
+            if s_nan != c_nan:
+                self.nan_args.append((arg, "sima" if s_nan else "cam"))
         tag = "INPUTS DIFFER" if phase == "entry" else "OUTPUTS DIFFER"
         head = "  [{}] {} (hit {}) arg {}: {}".format(
             tag, scheme, hit, arg, text)
@@ -320,6 +330,9 @@ class Reporter(object):
 
     def note(self, text):
         print("  [note] " + text)
+
+    def hint(self, text):
+        print("  [hint] " + text)
 
 
 def kdesc(info):
@@ -656,6 +669,17 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
                      "sima={} cam={}".format(fmt_val(sv), fmt_val(cv)))
 
 
+def has_exit_capture(rec):
+    """True if the exit-phase breakpoint fired for this hit (some arg has
+    exit data). When the run stops inside the scheme (crash/abort), the
+    entry dumps exist but no exit ones do -- 0 output diffs would then be
+    indistinguishable from outputs-matched unless reported."""
+    for info in rec["args"].values():
+        if info.get("exit_file") or info.get("exit_value") is not None:
+            return True
+    return False
+
+
 def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
                 realign=None):
     """Compare one aligned hit pair; entry args first, then exit.
@@ -673,6 +697,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
     hit = srec.get("_occ", srec["hit"])
     sch_int = (intents or {}).get(srec["scheme"], {})
     rep.cur_scheme = srec["scheme"]
+    rep.nan_args = []
     # realignment only ever applies to portable-annotated schemes -- the
     # convention mismatch arises from the two models' different wrappers, and
     # scoping keeps an unrelated scheme with a same-named offset arg out
@@ -681,7 +706,16 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
         port = _portable_ctx(srec, crec, sman, cman, const_ctx, realign)
     conv = set()
     entry_diffed = set()
-    for phase in ("entry", "exit"):
+    phases = ("entry", "exit")
+    no_exit = [role for role, r in (("sima", srec), ("cam", crec))
+               if not has_exit_capture(r)]
+    if no_exit:
+        phases = ("entry",)
+        rep.no_exit_schemes.add(srec["scheme"])
+        rep.note("{} (hit {}): no exit capture on {} side -- the run may "
+                 "have stopped inside this scheme; outputs NOT compared"
+                 .format(label, hit, "+".join(no_exit)))
+    for phase in phases:
         suppressed = []
         for arg, sinfo in srec["args"].items():
             if skip_arg(arg):
@@ -717,6 +751,21 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
             rep.first_pair_seen = True
             if rep.n_diffs > 0:
                 rep.alignment_suspect = True
+        if phase == "entry" and rep.nan_args:
+            n = len(rep.nan_args)
+            sides = set(s for _, s in rep.nan_args)
+            side = sides.pop() if len(sides) == 1 else "one"
+            rep.hint("{} (hit {}): {} differing input{} above {} nan on the "
+                     "{} side.\n"
+                     "    nan = never written in that model (uninitialized "
+                     "pbuf is common in\n"
+                     "    reduced configs, e.g. aerosol-free QPC leaves "
+                     "hetfrz fields unset). If\n"
+                     "    this scheme's outputs still match (see per-scheme "
+                     "summary), these nan\n"
+                     "    inputs did not influence the result -- red "
+                     "herring.".format(label, hit, n, "" if n == 1 else "s",
+                                       "is" if n == 1 else "are", side))
     if conv:
         rep.note("{} (hit {}): index-space/convention args not compared "
                  "(expected to differ between models): {}".format(
@@ -813,36 +862,71 @@ def count_matching_entry_args(srec, crec, sman, cman, sch_int=None,
     return same, total
 
 
-def offset_scan(first_srec, cam_g, sima_g, sman, cman, intents=None,
-                const_ctx=None):
-    """When alignment looks wrong, show which cam/sima steps the first
-    compared sima hit actually matches, bitwise."""
+def alignment_verdict(first_srec, cam_g, sima_g, sman, cman, intents=None,
+                      const_ctx=None):
+    """The very first compared hit pair has input diffs. Decide whether the
+    step pairing itself is at fault by bitwise-matching the first sima hit's
+    entry args against every dumped cam step, and print the conclusion, not
+    raw counts: a misaligned or wrong snapshot differs on essentially every
+    prognostic argument, so a mostly-matching paired step proves alignment
+    is correct and the differing inputs are field-specific upstream issues."""
     s = first_srec["scheme"]
     b = first_srec["_bucket"]
     occ = first_srec["_occ"]
     sch_int = (intents or {}).get(s, {})
-    print("offset scan: entry args of {} (sima step {}) vs every dumped "
-          "step:".format(s, first_srec["step"]))
-    cam_steps = sorted(set(t for (ss, t, bb) in cam_g
-                           if ss == s and bb == b))
-    for t in cam_steps:
-        lst = cam_g.get((s, t, b), [])
+    paired_t = first_srec["step"] + 1  # sima step t pairs with cam step t+1
+    scores = {}  # cam step -> (same, total) bitwise-identical entry args
+    for (ss, t, bb) in cam_g:
+        if ss != s or bb != b or t in scores:
+            continue
+        lst = cam_g.get((s, t, bb), [])
         if occ < len(lst):
-            same, total = count_matching_entry_args(
+            scores[t] = count_matching_entry_args(
                 first_srec, lst[occ], sman, cman, sch_int, const_ctx)
-            print("  vs cam  step {}: {:2d}/{} args bitwise identical"
-                  .format(t, same, total))
-    sima_steps = sorted(set(t for (ss, t, bb) in sima_g
-                            if ss == s and bb == b
-                            and t != first_srec["step"]))
-    for t in sima_steps:
+    if scores:
+        best_t = max(scores, key=lambda t: scores[t][0])
+        bs, btot = scores[best_t]
+        ps, pt = scores.get(paired_t, (0, 0))
+        if paired_t in scores and ps >= bs and pt and ps * 2 >= pt:
+            nd = pt - ps
+            mid = ("The {} differing inputs are field-specific upstream "
+                   "issues".format(nd) if nd != 1 else
+                   "The 1 differing input is a field-specific upstream "
+                   "issue")
+            print("alignment check: {}/{} entry args of {} (first compared "
+                  "scheme,\nsima step {}) bitwise match the paired cam step "
+                  "{} -- timestep alignment is\ncorrect. {} (wiring or\n"
+                  "initialization), not misalignment: a wrong or misaligned "
+                  "snapshot would differ\non essentially every argument."
+                  .format(ps, pt, s, first_srec["step"], paired_t, mid))
+        elif best_t != paired_t and bs > ps:
+            print("*** WARNING: only {}/{} entry args of {} (first compared "
+                  "scheme) match\n*** its paired cam step {}, but {}/{} "
+                  "match cam step {}. The runs are likely\n*** misaligned "
+                  "or comparing the wrong snapshot; fix the step pairing "
+                  "before\n*** believing any comparison below."
+                  .format(ps, pt, s, paired_t, bs, btot, best_t))
+        else:
+            print("*** WARNING: the entry state of {} (first compared "
+                  "scheme) matches no\n*** dumped cam step well (best: "
+                  "{}/{} at step {}). The runs already differ\n*** before "
+                  "the first compared scheme: check snapshot generation/"
+                  "reading and\n*** initial conditions before believing any "
+                  "comparison below."
+                  .format(s, bs, btot, best_t))
+    # a second sima step bitwise-identical to this one means the snapshot
+    # record was replayed -- only speak up when that actually fires
+    for t in sorted(set(tt for (ss, tt, bb) in sima_g
+                        if ss == s and bb == b
+                        and tt != first_srec["step"])):
         lst = sima_g.get((s, t, b), [])
         if occ < len(lst):
             same, total = count_matching_entry_args(
                 first_srec, lst[occ], sman, sman, sch_int, const_ctx)
-            print("  vs sima step {}: {:2d}/{} args bitwise identical "
-                  "(identical => snapshot record repeated!)".format(
-                      t, same, total))
+            if total and same == total:
+                print("*** note: sima step {} entry state is bitwise "
+                      "identical to step {} --\n*** the snapshot record may "
+                      "be repeated!".format(t, first_srec["step"]))
 
 
 class _Tee(object):
@@ -881,6 +965,27 @@ def _archive_report(outdir, report_path):
         print("(could not archive report to {}: {})".format(dest, e))
         return None
     return dest
+
+
+# Printed at the end of every differing report so the triage priorities
+# travel with the report text itself (pasted into an issue or handed to an
+# agent), not just in docs/reading_dropsonde_output_guide.md.
+READING_GUIDE = """\
+how to read this report:
+  1. constituent map first: wrong species counts or unmatched near-duplicate
+     names are registry bugs.
+  2. go to FIRST DIVERGENCE, then trace each field to its first appearance;
+     later diffs are usually propagation of an earlier one.
+  3. [INPUTS DIFFER] = the models handed this scheme different data; the bug
+     is upstream (wiring, initialization, an earlier scheme). [OUTPUTS DIFFER]
+     = same inputs, different result; the bug is inside this scheme.
+  4. sima=0 everywhere on an input = SIMA never populated it (wiring). nan on
+     one side = never written in that model (benign if outputs still match).
+  5. value patterns: one side exactly 0 where the other has tiny residuals ->
+     a clamp/floor (e.g. qneg) ran in only one model; one side pinned at a
+     round constant (1, 1e-12) -> a limiter/default applied in one model only;
+     tiny config inputs differing (1e-37 vs 0) -> threshold parity, note it
+     but it rarely moves the answer."""
 
 
 def report(outdir, suite_order, steps, intents=None):
@@ -1251,22 +1356,19 @@ def _report(outdir, suite_order, steps, intents=None):
 
     # --- summary ----------------------------------------------------------
     print("")
-    if rep.alignment_suspect:
-        print("*** WARNING: the very first compared scheme already has "
-              "input differences.")
-        print("*** Timestep alignment or initial conditions are suspect; "
-              "check snapshot setup")
-        print("*** before believing any divergence below the first "
-              "scheme.")
-        if first_srec is not None:
-            offset_scan(first_srec, cam_g, sima_g, sima, cam, intents,
-                        const_ctx)
+    if rep.alignment_suspect and first_srec is not None:
+        alignment_verdict(first_srec, cam_g, sima_g, sima, cam, intents,
+                          const_ctx)
         print("")
     if rep.n_diffs == 0:
         n_args = sum(len(r["args"]) for r in sima["hits"])
         print("No differences found in any subroutines!")
         print("({} hit pairs compared, {} sima arg captures, byte-for-byte"
               " identical)".format(n_pairs, n_args))
+        if rep.no_exit_schemes:
+            print("  (but outputs NOT compared -- no exit capture -- for: "
+                  "{})".format(", ".join(
+                      disp(s) for s in sorted(rep.no_exit_schemes))))
         for man, role in ((cam, "cam"), (sima, "sima")):
             for note in man.get("notes", []):
                 if "FAILED" in note or "failed" in note:
@@ -1274,15 +1376,26 @@ def _report(outdir, suite_order, steps, intents=None):
         return True
     print("{} differing comparisons across {} hit pairs.".format(
         rep.n_diffs, n_pairs))
-    clean = [s for s in compared if s not in rep.by_scheme]
+    clean = [s for s in compared
+             if s not in rep.by_scheme and s not in rep.no_exit_schemes]
     print("per-scheme: {}/{} compared schemes bit-for-bit; differing:"
           .format(len(clean), len(compared)))
     for s in compared:
         if s in rep.by_scheme:
             ne, nx = rep.by_scheme[s]
-            print("  {}: {} input / {} output diffs".format(disp(s), ne, nx))
+            if nx == 0 and s in rep.no_exit_schemes:
+                print("  {}: {} input diffs / outputs not captured"
+                      .format(disp(s), ne))
+            else:
+                print("  {}: {} input / {} output diffs".format(
+                    disp(s), ne, nx))
+        elif s in rep.no_exit_schemes:
+            print("  {}: inputs bit-for-bit; outputs not captured"
+                  .format(disp(s)))
     print("Raw dumps and entry-time addresses are in the manifests for "
           "manual gdb follow-up.")
+    print("")
+    print(READING_GUIDE)
     return False
 
 

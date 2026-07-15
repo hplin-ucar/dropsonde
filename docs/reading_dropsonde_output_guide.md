@@ -206,9 +206,6 @@ FIRST DIVERGENCE -----------------------------------------------
   [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_naai: 812/28188 elements differ, max |diff| 1.031e+02 at (289,29): sima=0 cam=103.07385026541536
   [INPUTS DIFFER] micro_pumas_ccpp [step 1] (hit 0) arg pumas_npccn: 28188/28188 elements differ, max |diff| 3.610e+04 at (208,36): sima=0 cam=-36099.379900846732
 ...
-*** WARNING: the very first compared scheme already has input differences.
-*** Timestep alignment or initial conditions are suspect; check snapshot setup
-*** before believing any divergence below the first scheme.
 ```
 
 In this example, the run phase to `micro_pumas_ccpp` has diverged on its inputs: all of the input fields
@@ -217,6 +214,15 @@ that CAM has real values (e.g., `sima=0 cam=64978883.8`) but SIMA has zero. This
 * SIMA is not passing the values into the scheme correctly
 * SIMA is passing correctly, but not read from snapshot: check `atm.log` at `debug_output = 2`
 * SIMA is reading the snapshot, but something is overwriting it (check interstitials)
+
+When the *first* compared scheme already has input diffs like this, the report
+ends with an `alignment check:` verdict. `dropsonde` bitwise-matches that
+scheme's entry args against every dumped CAM step and states the conclusion:
+if most args match the paired step, alignment is correct and the differing
+inputs are field-specific upstream issues; it only warns when another step
+matches better (wrong step offset) or no step matches well (wrong snapshot).
+(The example logs in this folder predate this and show the older
+`*** WARNING` + raw offset scan output.)
 
 **`nan` on one side** is uninitialized / not-provided-in-snapshot memory:
 
@@ -227,6 +233,11 @@ that CAM has real values (e.g., `sima=0 cam=64978883.8`) but SIMA has zero. This
 
 This means that CAM might have uninitialized pbuf fields when it ran.
 This is entirely possible, e.g., QPC (aquaplanet) compsets lack aerosols, generally.
+The report prints a `[hint]` after such args; the decisive check is whether the
+scheme's *outputs* still match — if they do, the nan inputs were never read and
+the whole block is a red herring. (If a run crashed inside the scheme, a
+`[note]` will say `no exit capture ... outputs NOT compared` instead — then you
+cannot draw that conclusion.)
 
 ## Don't skip the constituent map
 
@@ -263,7 +274,10 @@ single diff.
 
 1. **Check the constituent map** — right species count, no unmatched
    duplicates?
-2. **Is the first compared scheme already diffing?** Make sure that the snapshot CAM-SIMA is running is from the same CAM run provided to the debugger.
+2. **Is the first compared scheme already diffing?** Read the `alignment
+   check` verdict near the bottom: it says whether the step pairing/snapshot
+   is at fault (nearly every arg differs) or the differing inputs are
+   field-specific upstream issues (most args bitwise match the paired step).
 3. **Go to the FIRST DIVERGENCE box.** `[INPUTS DIFFER]` = upstream;
    `[OUTPUTS DIFFER]` = in-scheme.
 4. **Tag every diff by field and trace it to its first appearance.** That first
