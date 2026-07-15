@@ -14,24 +14,31 @@ import sys
 from array import array
 from datetime import datetime
 
-# CAM short name -> CCPP standard name, used to match constituent indices
-# between CAM's cnst_name(:) and CAM-SIMA's registered standard names.
-# Verified against CAM-SIMA src/data/registry.xml; extend as ports grow.
+# CAM short name -> CCPP standard name candidates (first match wins), used to
+# match constituent indices between CAM's cnst_name(:) and CAM-SIMA's
+# registered standard names. The number concentrations were renamed in the
+# 2026-07 standard-name dictionary sweep (droplets_in/rain_drops/...); trees
+# from before the sweep still carry the old _wrt_ spellings, so both are
+# listed, new convention first. Extend as ports grow.
 SPECIAL_CONST_MAP = {
-    "Q": "water_vapor_mixing_ratio_wrt_moist_air_and_condensed_water",
+    "Q": ("water_vapor_mixing_ratio_wrt_moist_air_and_condensed_water",),
     "CLDLIQ":
-        "cloud_liquid_water_mixing_ratio_wrt_moist_air_and_condensed_water",
+        ("cloud_liquid_water_mixing_ratio_wrt_moist_air_and_condensed_water",),
     "CLDICE":
-        "cloud_ice_mixing_ratio_wrt_moist_air_and_condensed_water",
-    "RAINQM": "rain_mixing_ratio_wrt_moist_air_and_condensed_water",
-    "SNOWQM": "snow_mixing_ratio_wrt_moist_air_and_condensed_water",
-    "GRAUQM": "graupel_water_mixing_ratio_wrt_moist_air_and_condensed_water",
-    "NUMLIQ": "mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water",
-    "NUMRAI": "mass_number_concentration_of_rain_wrt_moist_air_and_condensed_water",
+        ("cloud_ice_mixing_ratio_wrt_moist_air_and_condensed_water",),
+    "RAINQM": ("rain_mixing_ratio_wrt_moist_air_and_condensed_water",),
+    "SNOWQM": ("snow_mixing_ratio_wrt_moist_air_and_condensed_water",),
+    "GRAUQM": ("graupel_water_mixing_ratio_wrt_moist_air_and_condensed_water",),
+    "NUMLIQ": ("mass_number_concentration_of_cloud_liquid_water_droplets_in_moist_air_and_condensed_water",
+               "mass_number_concentration_of_cloud_liquid_wrt_moist_air_and_condensed_water"),
+    "NUMRAI": ("mass_number_concentration_of_rain_drops_in_moist_air_and_condensed_water",
+               "mass_number_concentration_of_rain_wrt_moist_air_and_condensed_water"),
     "NUMICE":
-        "mass_number_concentration_of_ice_wrt_moist_air_and_condensed_water",
-    "NUMSNO": "mass_number_concentration_of_snow_wrt_moist_air_and_condensed_water",
-    "NUMGRA": "mass_number_concentration_of_graupel_wrt_moist_air_and_condensed_water"
+        ("mass_number_concentration_of_ice_wrt_moist_air_and_condensed_water",),
+    "NUMSNO": ("mass_number_concentration_of_snow_crystals_in_moist_air_and_condensed_water",
+               "mass_number_concentration_of_snow_wrt_moist_air_and_condensed_water"),
+    "NUMGRA": ("mass_number_concentration_of_graupel_particles_in_moist_air_and_condensed_water",
+               "mass_number_concentration_of_graupel_wrt_moist_air_and_condensed_water")
 }
 
 TYPECODE = {"f8": "d", "f4": "f", "i8": "q", "i4": "i", "i2": "h", "i1": "b"}
@@ -245,21 +252,23 @@ def build_const_map(cam_names, sima_names):
     used = set()
     for i, cn in enumerate(cam_names):
         j = None
-        std = SPECIAL_CONST_MAP.get(cn)
-        if std is not None and std in sima_lookup:
-            j = sima_lookup[std]
-        elif cn in sima_lookup:
-            j = sima_lookup[cn]
-        elif "cnst_" + cn in sima_lookup:
-            # constituents auto-registered from a snapshot file keep
-            # their netcdf variable name (cnst_<CAM short name>) as
-            # their standard name
-            j = sima_lookup["cnst_" + cn]
-        else:
-            cands = [k for k, n in enumerate(sima_names)
-                     if cn.lower() == n or cn.lower() in n.split("_")]
-            if len(cands) == 1:
-                j = cands[0]
+        for std in SPECIAL_CONST_MAP.get(cn, ()):
+            if std in sima_lookup:
+                j = sima_lookup[std]
+                break
+        if j is None:
+            if cn in sima_lookup:
+                j = sima_lookup[cn]
+            elif "cnst_" + cn in sima_lookup:
+                # constituents auto-registered from a snapshot file keep
+                # their netcdf variable name (cnst_<CAM short name>) as
+                # their standard name
+                j = sima_lookup["cnst_" + cn]
+            else:
+                cands = [k for k, n in enumerate(sima_names)
+                         if cn.lower() == n or cn.lower() in n.split("_")]
+                if len(cands) == 1:
+                    j = cands[0]
         if j is None or j in used:
             cam_un.append((i, cn))
         else:
