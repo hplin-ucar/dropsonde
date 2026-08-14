@@ -205,6 +205,9 @@ for role in ('cam', 'sima'):
 
     # --- forced-ABI capture (big-frame dropped-location analog) -----------
     ca = cl[0]['args']
+    check(ca['hv2'].get('kind') == 'skipped' and
+          'null reference' in (ca['hv2'].get('why') or ''),
+          'absent optional derived-type dummy guarded (no expansion)')
     check(ca['deriv%dvv'].get('kind') == 'array' and
           ca['deriv%dvv'].get('extents') == [NP, NP] and
           ca['deriv%dvv'].get('abi'),

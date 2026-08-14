@@ -109,6 +109,17 @@ _BODY_LINE = {}  # scheme -> (filename, line) | None
 def note(msg):
     MANIFEST["notes"].append(msg)
     gdb.write("dropsonde[{}]: {}\n".format(ROLE, msg))
+    # under an MPI launcher stdout is a pipe: without a flush, notes sit in
+    # the stdio buffer and the log looks dead during long init phases
+    try:
+        gdb.flush()
+    except Exception:
+        pass
+
+
+def dump_manifest():
+    with open(os.path.join(OUT, "manifest.json"), "w") as f:
+        json.dump(MANIFEST, f, indent=1)
 
 
 # --------------------------------------------------------------------------
@@ -1314,7 +1325,24 @@ def handle_entry(scheme, frame):
             stname = _capturable_struct(t)
             if stname is not None:
                 paths = CAPTURE.get(stname)
-                if not paths:
+                # Absent OPTIONAL dummy: gfortran passes a null reference,
+                # and a field access on it trips a gdb 8.2 internal abort
+                # (value_primitive_field PROP_CONST assert on the dynamic
+                # data location of allocatable components) that Python
+                # cannot catch -- the whole run dies. Probe the object
+                # address before any expansion (address computation alone
+                # does no field access). Calibrated on CAM's
+                # physics_update, whose optional `tend` is omitted by the
+                # clubb/macrop/microp/convect_shallow interfaces.
+                null_ref = False
+                try:
+                    if val.address is not None and int(val.address) < 4096:
+                        null_ref = True
+                except Exception:
+                    pass
+                if null_ref:
+                    info["why"] = "null reference (absent optional?)"
+                elif not paths:
                     info["why"] = ("derived type {} (no capture spec "
                                    "entry)".format(stname))
                 elif t.code == gdb.TYPE_CODE_ARRAY:
@@ -1842,6 +1870,10 @@ def main():
                 step = b
         if step is not None:
             CURRENT_STEP[0] += 1
+            # checkpoint the manifest at every step boundary: a mid-run
+            # crash (e.g. a gdb internal abort skips the finally block)
+            # then loses at most the current step's records
+            dump_manifest()
             if KILL_AFTER and CURRENT_STEP[0] > KILL_AFTER:
                 note("collected {} timesteps; terminating run".format(
                     KILL_AFTER))
@@ -1943,6 +1975,5 @@ def main():
 try:
     main()
 finally:
-    with open(os.path.join(OUT, "manifest.json"), "w") as f:
-        json.dump(MANIFEST, f, indent=1)
+    dump_manifest()
     note("manifest written: {} hits".format(len(MANIFEST["hits"])))

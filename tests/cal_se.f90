@@ -86,7 +86,7 @@ module se_dycore
   implicit none
 contains
   subroutine compute_like(elem, nets, nete, np1, dt2, hvcoord, deriv, &
-       inv_cp, qwater, qidx)
+       inv_cp, qwater, qidx, hv2)
     ! deriv (arg 7), inv_cp (8), qwater (9), qidx (10) mirror the SE
     ! dycore's compute_and_apply_rhs stack-passed dummies: a scalar
     ! derived-type dummy with fixed-shape components, and explicit-shape
@@ -101,6 +101,10 @@ contains
     real(8), intent(in) :: inv_cp(np, np, nlev, nets:nete)
     real(8), intent(in) :: qwater(np, np, nlev, qsize_mod, nets:nete)
     integer, intent(in) :: qidx(qsize_mod)
+    ! never passed: an ABSENT optional derived-type dummy whose type has a
+    ! capture entry -- expansion must detect the null reference and skip
+    ! (field access on it aborts gdb 8.2; cf. CAM physics_update's tend)
+    type(hvcoord_t), intent(in), optional :: hv2
     integer :: ie
     do ie = nets, nete
       elem(ie)%state%v(:, :, :, :, np1) = elem(ie)%state%v(:, :, :, :, np1) &
