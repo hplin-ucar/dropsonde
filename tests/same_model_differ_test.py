@@ -87,10 +87,11 @@ def targets_loader_test():
                              "intents": {"ptend": "in"}}]}))
     assert targets == [
         {"sub": "foo", "base": "foo", "test": "foo",
-         "label_from": None, "intents": {}, "optional": []},
+         "label_from": None, "intents": {}, "optional": [],
+         "raw_entry": False},
         {"sub": "bar", "base": "bar", "test": "bar_new",
          "label_from": "ptend%name", "intents": {"ptend": "in"},
-         "optional": ["tend"]}], targets
+         "optional": ["tend"], "raw_entry": False}], targets
     assert sentinel == "clm_drv", sentinel
     assert capture == {"element_t": ["state%v", "state%t"]}, capture
 

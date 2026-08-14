@@ -271,7 +271,7 @@ def load_targets(path):
             bad("target {}: need a subroutine name string or an object "
                 'with "sub"'.format(i))
         unknown = set(t) - {"sub", "base", "test", "label_from", "intents",
-                            "optional"}
+                            "optional", "raw_entry"}
         if unknown:
             bad("target {!r}: unknown key(s): {}".format(
                 t["sub"], ", ".join(sorted(unknown))))
@@ -300,13 +300,16 @@ def load_targets(path):
         if not isinstance(opt, list) or not all(
                 isinstance(o, str) and o.strip() for o in opt):
             bad("target {!r}: optional must list argument names".format(sub))
+        if not isinstance(t.get("raw_entry", False), bool):
+            bad("target {!r}: raw_entry must be true/false".format(sub))
         targets.append({"sub": sub,
                         "base": (t.get("base") or sub).strip(),
                         "test": (t.get("test") or sub).strip(),
                         "label_from": (label_from or "").strip().lower()
                         or None,
                         "intents": {k.lower(): v for k, v in over.items()},
-                        "optional": [o.strip().lower() for o in opt]})
+                        "optional": [o.strip().lower() for o in opt],
+                        "raw_entry": bool(t.get("raw_entry", False))})
     sentinel = spec.get("step_sentinel", "cam_run1")
     if not isinstance(sentinel, str) or not sentinel.strip():
         bad("step_sentinel must be a subroutine name")
@@ -370,7 +373,7 @@ def find_meta_root(sdf_abs):
 
 def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
            capture, step_sentinel, const_probe, launch_tpl=None,
-           optional_args=None):
+           optional_args=None, raw_entry=None):
     exe = os.path.join(casedir, "bld", "cesm.exe")
     rundir = os.path.join(casedir, "run")
     if not os.path.isfile(exe):
@@ -388,6 +391,7 @@ def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
                    "step_sentinel": step_sentinel,
                    "const_probe": const_probe,
                    "optional_args": optional_args or {},
+                   "raw_entry": raw_entry or [],
                    "mpi_launch": bool(launch_tpl)}, f, indent=1)
 
     env = dict(os.environ, DROPSONDE_CONFIG=cfgpath)
@@ -594,10 +598,15 @@ def main():
                       for s, a in sorted(optional_args.items()))))
         hit_labels = {t["sub"]: t["label_from"] for t in targets
                       if t["label_from"]}
+        raw_entry = [t["sub"] for t in targets if t["raw_entry"]]
+        if raw_entry:
+            print("dropsonde: raw-entry (ABI) capture for: {}".format(
+                ", ".join(raw_entry)))
         meta_root = None
     else:
         sentinel = "cam_run1"
         hit_labels = {}
+        raw_entry = []
         schemes = parse_sdf(args.sdf)
         uniq = []
         for s in schemes:
@@ -758,12 +767,12 @@ def main():
                       launch(role_c, cam_abs, uniq, outdir,
                              args.steps + offset, portable_c,
                              capture, sentinel, probe_c, args.launch,
-                             optional_args)))
+                             optional_args, raw_entry)))
     if not skip_s:
         runs.append((role_s,
                       launch(role_s, sima_abs, uniq, outdir, args.steps,
                              portable_s, capture, sentinel, probe_s,
-                             args.launch, optional_args)))
+                             args.launch, optional_args, raw_entry)))
     if runs:
         print("dropsonde: waiting for runs to finish ...")
         try:

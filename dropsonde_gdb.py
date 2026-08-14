@@ -49,6 +49,10 @@ CONST_PROBE = CFG.get("const_probe") or (
 # (value_primitive_field PROP_CONST assert; calibrated on CAM's
 # physics_update `tend` at a clubb_intr call site).
 OPT_ARGS = CFG.get("optional_args", {}) or {}
+# schemes captured at their raw entry instruction via the ABI even in
+# debug builds (targets-v1 per-target raw_entry) -- for subroutines whose
+# post-prologue DWARF locations are unreliable
+RAW_ENTRY = set(CFG.get("raw_entry") or ())
 # {derived_type_name_lower: [component paths]}: derived-type dummies whose
 # type matches a key are expanded into per-component pseudo-args
 # (e.g. elem%state%v) instead of being skipped. Authored as a JSON spec
@@ -470,11 +474,23 @@ def _expand_struct_scalar_abi(scheme, hit, name, stype, base, paths, rec):
                 else:
                     info["why"] = "character component not captured"
             elif t.code == gdb.TYPE_CODE_ARRAY:
-                plan, err = _static_shape_plan(addr, t)
+                # static-shape member: raw data at the field offset.
+                # ALLOCATABLE member: gfortran embeds the full array
+                # descriptor at the offset instead -- the static plan
+                # fails its plausibility gates (or throws on the dynamic
+                # ranges), so fall back to a raw descriptor decode, whose
+                # own gates (rank 1-7, non-null base, sane extents) keep
+                # static data from masquerading as a descriptor.
+                try:
+                    plan, err = _static_shape_plan(addr, t)
+                except Exception as exc:
+                    plan, err = None, str(exc)
                 if plan is None:
-                    info["kind"] = "error"
-                    info["why"] = "abi: " + err
-                    continue
+                    plan, err2 = _descriptor_plan(addr, _element_type(t))
+                    if plan is None:
+                        info["kind"] = "error"
+                        info["why"] = "abi: {} / desc: {}".format(err, err2)
+                        continue
                 _record_array(info, scheme, hit, key, plan)
             elif t.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION,
                             gdb.TYPE_CODE_PTR):
@@ -1375,7 +1391,18 @@ def handle_entry_optimized(scheme, frame):
                     continue
                 _record_array(info, scheme, hit, name, plan)
             elif st.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
-                info["why"] = "derived-type arg not captured"
+                stname = _capturable_struct(st)
+                paths = CAPTURE.get(stname) if stname else None
+                if paths:
+                    # capture expansion via ABI pointer + static field
+                    # offsets: no DWARF locations, no value machinery
+                    info["why"] = ("derived type {}: expanded into {} "
+                                   "component pseudo-args (abi)".format(
+                                       stname, len(paths)))
+                    _expand_struct_scalar_abi(scheme, hit, name, st,
+                                              ptr, paths, rec)
+                else:
+                    info["why"] = "derived-type arg not captured"
             else:
                 dt = dtype_of(st)
                 if dt is None:
@@ -1936,15 +1963,21 @@ def setup():
     probe_optimized([specs for _s, _t, specs in plans])
     resolved = 0
     for s, target, specs in plans:
-        if OPTIMIZED[0]:
+        # per-target raw-entry capture (targets-v1 raw_entry): the ABI
+        # path at the first instruction, even in a debug build -- for
+        # subroutines whose post-prologue DWARF locations are unreliable
+        # (CAM's physics_update under frame-pointer-less callers)
+        raw = OPTIMIZED[0] or s in RAW_ENTRY
+        if raw:
             bp = _make_entry_bp_optimized(specs, s, target)
         else:
             bp = _make_bp(EntryBP, specs, s, target)
         if bp is None:
             MANIFEST["breakpoints"][s] = "missing"
         else:
+            bp.raw = raw
             MANIFEST["breakpoints"][s] = "{} ({})".format(
-                bp.location, target) if OPTIMIZED[0] else bp.location
+                bp.location, target) if raw else bp.location
             resolved += 1
     note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
 
@@ -2003,8 +2036,9 @@ def main():
             except gdb.error:
                 pass
             break
-        elif OPTIMIZED[0]:
-            # Optimized binary: the breakpoint is at the raw entry
+        elif getattr(entry, "raw", False):
+            # Raw-entry capture (whole-run optimized mode, or a per-target
+            # raw_entry request): the breakpoint is at the first
             # instruction, the one PC where the ABI argument slots are
             # guaranteed; capture immediately (no advance -- moving even one
             # instruction may clobber the argument registers).
