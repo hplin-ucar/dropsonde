@@ -474,22 +474,28 @@ def _expand_struct_scalar_abi(scheme, hit, name, stype, base, paths, rec):
                 else:
                     info["why"] = "character component not captured"
             elif t.code == gdb.TYPE_CODE_ARRAY:
-                # static-shape member: raw data at the field offset.
-                # ALLOCATABLE member: gfortran embeds the full array
-                # descriptor at the offset instead -- the static plan
-                # fails its plausibility gates (or throws on the dynamic
-                # ranges), so fall back to a raw descriptor decode, whose
-                # own gates (rank 1-7, non-null base, sane extents) keep
-                # static data from masquerading as a descriptor.
-                try:
-                    plan, err = _static_shape_plan(addr, t)
-                except Exception as exc:
-                    plan, err = None, str(exc)
+                # ALLOCATABLE members embed a full descriptor at the field
+                # offset, and gdb 8.2 reads their dynamic DWARF bounds as
+                # GARBAGE CONSTANTS that can pass the static plan's sanity
+                # gates (calibrated: physics_state members decoded as
+                # phantom 49^rank arrays of descriptor/heap bytes). Decode
+                # the descriptor FIRST, accepted only when its rank and
+                # elem_len equal the declared member type's exactly;
+                # genuinely static members fail those gates on their raw
+                # data and fall through to the static-shape plan.
+                dims_decl, elem_decl = array_dims(t)
+                plan, d_err = _descriptor_plan(
+                    addr, elem_decl, expect_rank=len(dims_decl),
+                    expect_elsize=elem_decl.sizeof)
                 if plan is None:
-                    plan, err2 = _descriptor_plan(addr, _element_type(t))
+                    try:
+                        plan, s_err = _static_shape_plan(addr, t)
+                    except Exception as exc:
+                        plan, s_err = None, str(exc)
                     if plan is None:
                         info["kind"] = "error"
-                        info["why"] = "abi: {} / desc: {}".format(err, err2)
+                        info["why"] = "abi: desc: {} / static: {}".format(
+                            d_err, s_err)
                         continue
                 _record_array(info, scheme, hit, key, plan)
             elif t.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION,
@@ -891,8 +897,12 @@ def _element_type(t):
     return t
 
 
-def _descriptor_plan(desc_addr, elem_type):
-    """An array_plan()-shaped dict built from a raw gfortran descriptor."""
+def _descriptor_plan(desc_addr, elem_type, expect_rank=None,
+                     expect_elsize=None):
+    """An array_plan()-shaped dict built from a raw gfortran descriptor.
+    expect_rank/expect_elsize (from the declared member type) harden the
+    plausibility gates when decoding INLINE COMPONENT descriptors, where
+    raw data of a static member could otherwise masquerade as one."""
     dt = dtype_of(elem_type)
     if dt is None:
         return None, "unsupported element type: {}".format(elem_type)
@@ -900,6 +910,14 @@ def _descriptor_plan(desc_addr, elem_type):
         gdb.selected_inferior().read_memory(desc_addr + _D_RANK, 1)))[0]
     if rank < 1 or rank > 7:
         return None, "implausible descriptor rank: {}".format(rank)
+    if expect_rank is not None and rank != expect_rank:
+        return None, "descriptor rank {} != declared {}".format(
+            rank, expect_rank)
+    if expect_elsize is not None:
+        el = _read_i64(desc_addr + _D_ELEM_LEN)
+        if el != expect_elsize:
+            return None, "descriptor elem_len {} != declared {}".format(
+                el, expect_elsize)
     base = _read_u64(desc_addr + _D_BASE)
     if base == 0:
         return None, "null descriptor base_addr"
