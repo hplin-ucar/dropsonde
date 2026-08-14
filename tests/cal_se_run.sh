@@ -46,6 +46,7 @@ for role in cam sima; do
              "hvcoord_t": ["hyai", "ps0", "name"],
              "derivative_t": ["dvv"]},
  "force_abi": ["deriv", "inv_cp", "qwater", "qidx"],
+ "optional_args": {"compute_like": ["hv2", "e2", "hv3"]},
  "kill_after_steps": $kill_steps}
 EOF
   # -u PYTHONHOME/PYTHONPATH: some sites (e.g. Izumi) point these at an
@@ -208,6 +209,11 @@ for role in ('cam', 'sima'):
     check(ca['hv2'].get('kind') == 'skipped' and
           'null reference' in (ca['hv2'].get('why') or ''),
           'absent optional derived-type dummy guarded (no expansion)')
+    check(ca['e2'].get('kind') == 'skipped' and
+          'null reference' in (ca['e2'].get('why') or ''),
+          'absent optional with ALLOCATABLE members guarded value-free')
+    check(ca['hv3%ps0'].get('entry_value') == 1000.0,
+          'PRESENT optional captured normally after the presence probe')
     check(ca['deriv%dvv'].get('kind') == 'array' and
           ca['deriv%dvv'].get('extents') == [NP, NP] and
           ca['deriv%dvv'].get('abi'),

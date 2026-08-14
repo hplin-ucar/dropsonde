@@ -86,7 +86,7 @@ module se_dycore
   implicit none
 contains
   subroutine compute_like(elem, nets, nete, np1, dt2, hvcoord, deriv, &
-       inv_cp, qwater, qidx, hv2)
+       inv_cp, qwater, qidx, hv2, e2, hv3)
     ! deriv (arg 7), inv_cp (8), qwater (9), qidx (10) mirror the SE
     ! dycore's compute_and_apply_rhs stack-passed dummies: a scalar
     ! derived-type dummy with fixed-shape components, and explicit-shape
@@ -101,10 +101,16 @@ contains
     real(8), intent(in) :: inv_cp(np, np, nlev, nets:nete)
     real(8), intent(in) :: qwater(np, np, nlev, qsize_mod, nets:nete)
     integer, intent(in) :: qidx(qsize_mod)
-    ! never passed: an ABSENT optional derived-type dummy whose type has a
-    ! capture entry -- expansion must detect the null reference and skip
-    ! (field access on it aborts gdb 8.2; cf. CAM physics_update's tend)
+    ! hv2/e2 are never passed: ABSENT optional derived-type dummies whose
+    ! types have capture entries. Their presence must be probed value-free
+    ! -- building a gdb value of an absent optional whose type has
+    ! ALLOCATABLE members (e2: element_t%state%qdp) aborts gdb 8.2 during
+    ! value creation (cf. CAM physics_update's tend at clubb call sites);
+    ! hv2 (static members) covers the milder shape. hv3 IS passed: a
+    ! present optional must still capture normally after the probe.
     type(hvcoord_t), intent(in), optional :: hv2
+    type(element_t), intent(in), optional :: e2
+    type(hvcoord_t), intent(in), optional :: hv3
     integer :: ie
     do ie = nets, nete
       elem(ie)%state%v(:, :, :, :, np1) = elem(ie)%state%v(:, :, :, :, np1) &
@@ -137,7 +143,7 @@ contains
       elem(ie)%localid = elem(ie)%localid + 1
     end do
     call compute_like(elem, nets, nete, tl%np1, dt * 0.5_8, hvcoord, &
-         deriv0, inv_cp0, qwater0, qidx0)
+         deriv0, inv_cp0, qwater0, qidx0, hv3=hvcoord)
   end subroutine prim_step_like
 end module se_dycore
 

@@ -124,11 +124,13 @@ def _split_top_commas(s):
 
 
 def _subroutine_intents(path, sym):
-    """{arg_lower: intent} from the Fortran declarations of subroutine `sym`
-    in `path`, or None if `sym` is not defined there. Handles '&'
-    continuations, '!' comments, multiple names per declaration, and
-    array-dim commas. Derived-type (type()/class()) dummies are recorded too
-    but are harmless -- the gdb side skips them."""
+    """({arg_lower: intent}, {optional arg_lower}) from the Fortran
+    declarations of subroutine `sym` in `path`, or None if `sym` is not
+    defined there. Handles '&' continuations, '!' comments, multiple names
+    per declaration, and array-dim commas. Derived-type (type()/class())
+    dummies are recorded too but are harmless -- the gdb side skips them.
+    OPTIONAL dummies are detected only on declarations that also carry
+    intent() (the overwhelming convention)."""
     try:
         with open(path, errors="replace") as f:
             lines = f.readlines()
@@ -148,6 +150,7 @@ def _subroutine_intents(path, sym):
     if start is None:
         return None
     intents = {}
+    optionals = set()
     buf = ""
     for ln in lines[start:]:
         if not buf and _END_SUBR_RE.match(ln):
@@ -159,23 +162,27 @@ def _subroutine_intents(path, sym):
         buf += " " + code
         m = _INTENT_RE.search(buf)
         if m:
-            _head, sep, names = buf.partition("::")
+            head, sep, names = buf.partition("::")
             if sep:
+                is_opt = re.search(r"\boptional\b", head, re.I) is not None
                 for piece in _split_top_commas(names):
                     im = _IDENT_RE.match(piece)
                     if im:
                         intents[im.group(1).lower()] = m.group(1).lower()
+                        if is_opt:
+                            optionals.add(im.group(1).lower())
         buf = ""
-    return intents
+    return intents, optionals
 
 
 def parse_fortran_intents(meta_root, portable):
-    """{scheme: {arg: intent}} for the portable subroutines named in
-    `portable` ({scheme: symbol}), read from their Fortran intent()
-    declarations. Portable subroutines have no .meta, so intents come from the
-    .F90 source; keyed by SCHEME so the differ (scheme-keyed) is unchanged."""
+    """({scheme: {arg: intent}}, {scheme: [optional args]}) for the
+    subroutines named in `portable` ({scheme: symbol}), read from their
+    Fortran declarations; keyed by SCHEME so the differ (scheme-keyed) is
+    unchanged. The optional-dummy list lets the gdb side probe presence
+    before touching a value (absent optionals crash old gdb)."""
     if not portable:
-        return {}
+        return {}, {}
     parsed = {sym.lower(): None for sym in portable.values()}
     for dirpath, _dirs, filenames in os.walk(meta_root):
         if all(v is not None for v in parsed.values()):
@@ -189,11 +196,14 @@ def parse_fortran_intents(meta_root, portable):
                 if got is not None:
                     parsed[symlow] = got
     out = {}
+    out_opt = {}
     for scheme, sym in portable.items():
         got = parsed.get(sym.lower())
-        if got:
-            out[scheme] = got
-    return out
+        if got and got[0]:
+            out[scheme] = got[0]
+        if got and got[1]:
+            out_opt[scheme] = sorted(got[1])
+    return out, out_opt
 
 
 def _capture_types(types, bad):
@@ -260,7 +270,8 @@ def load_targets(path):
                 or not t["sub"].strip():
             bad("target {}: need a subroutine name string or an object "
                 'with "sub"'.format(i))
-        unknown = set(t) - {"sub", "base", "test", "label_from", "intents"}
+        unknown = set(t) - {"sub", "base", "test", "label_from", "intents",
+                            "optional"}
         if unknown:
             bad("target {!r}: unknown key(s): {}".format(
                 t["sub"], ", ".join(sorted(unknown))))
@@ -282,12 +293,20 @@ def load_targets(path):
                 for k, v in over.items()):
             bad("target {!r}: intents must map argument names to "
                 "in/out/inout".format(sub))
+        # OPTIONAL dummies: absent ones are null references the gdb side
+        # must never build values from (old gdb aborts); normally detected
+        # by the --source-root scan, declarable here when no source tree
+        opt = t.get("optional") or []
+        if not isinstance(opt, list) or not all(
+                isinstance(o, str) and o.strip() for o in opt):
+            bad("target {!r}: optional must list argument names".format(sub))
         targets.append({"sub": sub,
                         "base": (t.get("base") or sub).strip(),
                         "test": (t.get("test") or sub).strip(),
                         "label_from": (label_from or "").strip().lower()
                         or None,
-                        "intents": {k.lower(): v for k, v in over.items()}})
+                        "intents": {k.lower(): v for k, v in over.items()},
+                        "optional": [o.strip().lower() for o in opt]})
     sentinel = spec.get("step_sentinel", "cam_run1")
     if not isinstance(sentinel, str) or not sentinel.strip():
         bad("step_sentinel must be a subroutine name")
@@ -350,7 +369,8 @@ def find_meta_root(sdf_abs):
 
 
 def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
-           capture, step_sentinel, const_probe, launch_tpl=None):
+           capture, step_sentinel, const_probe, launch_tpl=None,
+           optional_args=None):
     exe = os.path.join(casedir, "bld", "cesm.exe")
     rundir = os.path.join(casedir, "run")
     if not os.path.isfile(exe):
@@ -367,6 +387,7 @@ def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
                    "portable": portable, "capture": capture,
                    "step_sentinel": step_sentinel,
                    "const_probe": const_probe,
+                   "optional_args": optional_args or {},
                    "mpi_launch": bool(launch_tpl)}, f, indent=1)
 
     env = dict(os.environ, DROPSONDE_CONFIG=cfgpath)
@@ -539,9 +560,11 @@ def main():
                 "{} (base={}, test={})".format(t["sub"], t["base"], t["test"])
                 for t in renamed)))
         intents = {}
+        optional_args = {}
         if args.source_root:
             source_root = os.path.abspath(args.source_root)
-            intents = parse_fortran_intents(source_root, portable_s)
+            intents, optional_args = parse_fortran_intents(
+                source_root, portable_s)
             print("dropsonde: intents for {}/{} targets ({} args) from "
                   "Fortran source under {}".format(
                       len(intents), len(uniq),
@@ -559,6 +582,16 @@ def main():
         for t in targets:
             if t["intents"]:
                 intents.setdefault(t["sub"], {}).update(t["intents"])
+            if t["optional"]:
+                merged = set(optional_args.get(t["sub"], ())) | \
+                    set(t["optional"])
+                optional_args[t["sub"]] = sorted(merged)
+        opt_n = sum(len(v) for v in optional_args.values())
+        if opt_n:
+            print("dropsonde: {} optional dummies (presence probed before "
+                  "capture): {}".format(opt_n, ", ".join(
+                      "{}({})".format(s, ",".join(a))
+                      for s, a in sorted(optional_args.items()))))
         hit_labels = {t["sub"]: t["label_from"] for t in targets
                       if t["label_from"]}
         meta_root = None
@@ -595,8 +628,9 @@ def main():
               "under {}".format(len(intents), len(meta_schemes),
                                 sum(len(v) for v in intents.values()),
                                 meta_root))
+        optional_args = {}
         if portable:
-            fort = parse_fortran_intents(meta_root, portable)
+            fort, optional_args = parse_fortran_intents(meta_root, portable)
             intents.update(fort)
             print("dropsonde: portable overrides ({}): {}".format(
                 len(portable),
@@ -723,12 +757,13 @@ def main():
         runs.append((role_c,
                       launch(role_c, cam_abs, uniq, outdir,
                              args.steps + offset, portable_c,
-                             capture, sentinel, probe_c, args.launch)))
+                             capture, sentinel, probe_c, args.launch,
+                             optional_args)))
     if not skip_s:
         runs.append((role_s,
                       launch(role_s, sima_abs, uniq, outdir, args.steps,
                              portable_s, capture, sentinel, probe_s,
-                             args.launch)))
+                             args.launch, optional_args)))
     if runs:
         print("dropsonde: waiting for runs to finish ...")
         try:

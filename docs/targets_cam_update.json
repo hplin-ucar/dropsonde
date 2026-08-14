@@ -28,6 +28,7 @@
   "targets": [
     {"sub": "physics_update",
      "label_from": "ptend%name",
+     "optional": ["tend"],
      "intents": {"ptend": "in", "dt": "in", "state": "inout",
                  "tend": "inout"}},
     "phys_run1",

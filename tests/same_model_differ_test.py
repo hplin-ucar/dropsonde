@@ -83,14 +83,30 @@ def targets_loader_test():
          "capture": {"element_t": ["state%v", "State%T "]},
          "targets": ["foo", {"sub": "bar", "test": "bar_new",
                              "label_from": "Ptend%Name",
+                             "optional": ["Tend"],
                              "intents": {"ptend": "in"}}]}))
     assert targets == [
         {"sub": "foo", "base": "foo", "test": "foo",
-         "label_from": None, "intents": {}},
+         "label_from": None, "intents": {}, "optional": []},
         {"sub": "bar", "base": "bar", "test": "bar_new",
-         "label_from": "ptend%name", "intents": {"ptend": "in"}}], targets
+         "label_from": "ptend%name", "intents": {"ptend": "in"},
+         "optional": ["tend"]}], targets
     assert sentinel == "clm_drv", sentinel
     assert capture == {"element_t": ["state%v", "state%t"]}, capture
+
+    # Fortran-source scan detects the OPTIONAL attribute alongside intents
+    f90 = os.path.join(d, "opt.F90")
+    with open(f90, "w") as f:
+        f.write("subroutine phys_up(state, ptend, dt, tend)\n"
+                "  type(ps_t), intent(inout) :: state\n"
+                "  real(8), intent(in) :: dt\n"
+                "  type(pt_t), intent(inout) :: ptend\n"
+                "  type(td_t), intent(inout), optional :: tend\n"
+                "end subroutine phys_up\n")
+    intents, optionals = drv._subroutine_intents(f90, "phys_up")
+    assert intents == {"state": "inout", "dt": "in", "ptend": "inout",
+                       "tend": "inout"}, intents
+    assert optionals == {"tend"}, optionals
 
     # defaults: sentinel cam_run1, no capture
     _t, sentinel, capture = drv.load_targets(spec_file(

@@ -43,6 +43,12 @@ SENTINEL = CFG.get("step_sentinel") or "cam_run1"
 # drivers.
 CONST_PROBE = CFG.get("const_probe") or (
     "cnst_name" if ROLE == "cam" else "const_props")
+# {scheme: [dummy names declared OPTIONAL]}: presence is probed value-free
+# before capture -- building a gdb value of an ABSENT optional resolves its
+# dynamic-typed members at a null address, which aborts gdb 8.2 outright
+# (value_primitive_field PROP_CONST assert; calibrated on CAM's
+# physics_update `tend` at a clubb_intr call site).
+OPT_ARGS = CFG.get("optional_args", {}) or {}
 # {derived_type_name_lower: [component paths]}: derived-type dummies whose
 # type matches a key are expanded into per-component pseudo-args
 # (e.g. elem%state%v) instead of being skipped. Authored as a JSON spec
@@ -590,6 +596,89 @@ def arg_symbols(frame):
     if blk is None:
         return []
     return [s for s in blk if s.is_argument]
+
+
+# --------------------------------------------------------------------------
+# value-free presence probe for OPTIONAL dummies
+#
+# gfortran passes an absent optional as a null reference; the dummy's DWARF
+# location at post-prologue PCs is typically `DW_OP_fbreg <off>;
+# DW_OP_deref` -- the by-reference POINTER lives in a frame-base slot, and
+# reading that slot needs no gdb value machinery at all. The frame-base
+# convention (CFA = rbp+16 vs plain rbp) is self-calibrated per hit against
+# a known-present sibling dummy: the correct base is the one whose slot
+# content equals that sibling's actual object address. Any uncertainty
+# (unparsable location, calibration failure) skips the arg's capture rather
+# than risking value creation.
+# --------------------------------------------------------------------------
+
+_RANGE_RE = re.compile(r"Range (0x[0-9a-fA-F]+)-(0x[0-9a-fA-F]+):")
+_FBREG_RE = re.compile(r"DW_OP_fbreg (-?\d+)")
+_BREG_RE = re.compile(r"DW_OP_breg\d+ (-?\d+) \[\$(\w+)\]")
+
+
+def _parse_loc(name, pc):
+    """('slot', off) | ('obj', reg, off) | None: dummy `name`'s location at
+    `pc` from `info address` text. 'slot' (fbreg+deref) means the by-ref
+    pointer lives at frame-base+off; 'obj' (a lone breg) means the OBJECT
+    address -- i.e. the pointer value itself -- is register+off."""
+    try:
+        txt = gdb.execute("info address " + name, to_string=True)
+    except gdb.error:
+        return None
+    if "multi-location" in txt:
+        parts = _RANGE_RE.split(txt)
+        sel = None
+        for i in range(1, len(parts) - 2, 3):
+            if int(parts[i], 16) <= pc < int(parts[i + 1], 16):
+                sel = parts[i + 2]
+                break
+        if sel is None:
+            return None
+        txt = sel
+    m = _FBREG_RE.search(txt)
+    if m and "DW_OP_deref" in txt:
+        return ("slot", int(m.group(1)))
+    m = _BREG_RE.search(txt)
+    if m and "DW_OP_deref" not in txt and "entry_value" not in txt:
+        return ("obj", m.group(2), int(m.group(1)))
+    return None
+
+
+def _optional_present(name, frame, calib_syms):
+    """(present, how) for OPTIONAL dummy `name`, without creating its
+    value. present is True/False/None (None = undetermined: do not touch
+    the value). calib_syms: known-present sibling dummies used to pin the
+    frame-base convention."""
+    pc = int(frame.pc())
+    loc = _parse_loc(name, pc)
+    if loc is None:
+        return None, "location unparsed"
+    if loc[0] == "obj":
+        try:
+            ptr = (int(frame.read_register(loc[1])) + loc[2]) \
+                & 0xFFFFFFFFFFFFFFFF
+        except Exception:
+            return None, "register unread"
+        return ptr >= 4096, "register " + loc[1]
+    off = loc[1]
+    rbp = _frame_base(frame)
+    for calib in calib_syms:
+        cl = _parse_loc(calib.name, pc)
+        if cl is None or cl[0] != "slot":
+            continue
+        try:
+            true_addr = int(calib.value(frame).address)
+        except Exception:
+            continue
+        for adj in (16, 0):
+            try:
+                if _read_u64(rbp + adj + cl[1]) == true_addr:
+                    ptr = _read_u64(rbp + adj + off)
+                    return ptr >= 4096, "slot rbp+{}{:+d}".format(adj, off)
+            except Exception:
+                continue
+    return None, "frame base uncalibrated"
 
 
 def _caller_info(frame):
@@ -1298,10 +1387,24 @@ def handle_entry(scheme, frame):
     rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
            "caller": caller, "caller_line": cline, "args": {}}
     frame.select()
-    for idx, sym in enumerate(arg_symbols(frame), start=1):
+    syms = arg_symbols(frame)
+    opt_names = set(OPT_ARGS.get(scheme) or ())
+    calib = [s for s in syms if s.name not in opt_names] if opt_names else []
+    for idx, sym in enumerate(syms, start=1):
         name = sym.name
         info = {"kind": "skipped"}
         rec["args"][name] = info
+        if name in opt_names:
+            # never build a value before proving presence: an absent
+            # optional aborts old gdb during value creation itself
+            present, how = _optional_present(name, frame, calib)
+            if present is False:
+                info["why"] = "absent optional (null reference)"
+                continue
+            if present is None:
+                info["why"] = ("optional; presence undetermined ({}): "
+                               "not captured".format(how))
+                continue
         try:
             if name in FORCE_ABI and idx > N_INT_REG:
                 # calibration knob: exercise the ABI capture paths without
