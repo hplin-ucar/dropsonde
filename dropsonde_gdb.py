@@ -349,12 +349,19 @@ def _capturable_struct(t):
 
 
 def _expr_plan(expr):
-    """('array', plan) | ('scalar', (addr, dtype)) | (None, None) plus an
-    error string, for a component-path gdb expression like 'tl%n0' or
-    'elem(3)%state%v'."""
+    """('array', plan) | ('scalar', (addr, dtype)) | ('char', (addr, len))
+    | (None, None) plus an error string, for a component-path gdb
+    expression like 'tl%n0' or 'elem(3)%state%v'."""
     v = gdb.parse_and_eval(expr)
     t = v.type.strip_typedefs()
     if is_character(t):
+        # fixed-length character scalar (gdb types it TYPE_CODE_STRING or
+        # a char array depending on version/compiler), e.g. ptend%name --
+        # the self-labeling metadata of CAM's tendency choke point.
+        # Deferred-length components show as PTR: skipped.
+        if (t.code != gdb.TYPE_CODE_PTR and v.address is not None and
+                t.sizeof and 0 < t.sizeof <= 1024):
+            return "char", (int(v.address), int(t.sizeof)), None
         return None, None, "character component not captured"
     if t.code == gdb.TYPE_CODE_ARRAY:
         plan, err = array_plan(expr, v)
@@ -398,6 +405,13 @@ def _expand_struct_scalar(scheme, hit, name, paths, rec):
                 info["dtype"] = dt
                 info["addr"] = addr
                 info["entry_value"] = read_scalar(addr, dt)
+            elif kind == "char":
+                addr, ln = payload
+                raw = bytes(gdb.selected_inferior().read_memory(addr, ln))
+                info["kind"] = "char"
+                info["addr"] = addr
+                info["len"] = ln
+                info["entry_value"] = raw.decode("latin-1").rstrip()
             else:
                 info["why"] = err
         except Exception as exc:
@@ -428,7 +442,16 @@ def _expand_struct_scalar_abi(scheme, hit, name, stype, base, paths, rec):
                 t = t.strip_typedefs()
             addr = base + off
             if is_character(t):
-                info["why"] = "character component not captured"
+                if (t.code != gdb.TYPE_CODE_PTR and t.sizeof and
+                        0 < t.sizeof <= 1024):
+                    raw = bytes(gdb.selected_inferior().read_memory(
+                        addr, int(t.sizeof)))
+                    info["kind"] = "char"
+                    info["addr"] = addr
+                    info["len"] = int(t.sizeof)
+                    info["entry_value"] = raw.decode("latin-1").rstrip()
+                else:
+                    info["why"] = "character component not captured"
             elif t.code == gdb.TYPE_CODE_ARRAY:
                 plan, err = _static_shape_plan(addr, t)
                 if plan is None:
@@ -484,6 +507,10 @@ def _expand_struct_array(scheme, hit, name, val, paths, rec):
                 "{}({})%{}".format(name, lo, path))
             if kind is None:
                 info["why"] = err
+                continue
+            if kind == "char":
+                info["why"] = ("character component not captured across "
+                               "elements")
                 continue
             p0 = payload if kind == "array" else _as_rank0_plan(payload)
             if n > 1:
@@ -552,6 +579,24 @@ def arg_symbols(frame):
     if blk is None:
         return []
     return [s for s in blk if s.is_argument]
+
+
+def _caller_info(frame):
+    """(caller name, 'file.F90:line' of the call site) -- the call-site
+    line distinguishes a choke point's many call sites (e.g. CAM's ~30
+    physics_update calls in tphysbc/tphysac) where the caller name alone
+    cannot."""
+    caller = "?"
+    cline = None
+    try:
+        older = frame.older()
+        caller = older.name() or "?"
+        sal = older.find_sal()
+        cline = "{}:{}".format(
+            os.path.basename(sal.symtab.filename), sal.line)
+    except Exception:
+        pass
+    return caller, cline
 
 
 _END_SUB_RE = re.compile(r"^\s*end\s+subroutine\b", re.I)
@@ -1178,12 +1223,9 @@ def handle_entry_optimized(scheme, frame):
     reference."""
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
-    try:
-        caller = frame.older().name() or "?"
-    except Exception:
-        caller = "?"
+    caller, cline = _caller_info(frame)
     rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
-           "caller": caller, "args": {}}
+           "caller": caller, "caller_line": cline, "args": {}}
     frame.select()
     for idx, sym in enumerate(arg_symbols(frame), start=1):
         name = sym.name
@@ -1241,12 +1283,9 @@ def handle_entry_optimized(scheme, frame):
 def handle_entry(scheme, frame):
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
-    try:
-        caller = frame.older().name() or "?"
-    except Exception:
-        caller = "?"
+    caller, cline = _caller_info(frame)
     rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
-           "caller": caller, "args": {}}
+           "caller": caller, "caller_line": cline, "args": {}}
     frame.select()
     for idx, sym in enumerate(arg_symbols(frame), start=1):
         name = sym.name

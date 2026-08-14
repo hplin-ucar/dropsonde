@@ -77,6 +77,7 @@ module se_element_mod
   type hvcoord_t
     real(8) :: hyai(nlev + 1)
     real(8) :: ps0
+    character(len=12) :: name           ! captured as a char pseudo-arg
   end type hvcoord_t
 end module se_element_mod
 
@@ -185,6 +186,7 @@ program cal_se
   tl%nm1 = 1; tl%n0 = 1; tl%np1 = 2; tl%nstep = 0
   hv%hyai = [(0.1_8 * i, i = 1, nlev + 1)]
   hv%ps0 = 1000.0_8
+  hv%name = 'hv_main'
 
   qsize_mod = 2
   allocate(inv_cp(np, np, nlev, nelem))

@@ -260,7 +260,7 @@ def load_targets(path):
                 or not t["sub"].strip():
             bad("target {}: need a subroutine name string or an object "
                 'with "sub"'.format(i))
-        unknown = set(t) - {"sub", "base", "test"}
+        unknown = set(t) - {"sub", "base", "test", "label_from", "intents"}
         if unknown:
             bad("target {!r}: unknown key(s): {}".format(
                 t["sub"], ", ".join(sorted(unknown))))
@@ -268,9 +268,26 @@ def load_targets(path):
         if sub in seen:
             bad("duplicate target {!r}".format(sub))
         seen.add(sub)
+        label_from = t.get("label_from")
+        if label_from is not None and (not isinstance(label_from, str) or
+                                       not label_from.strip()):
+            bad("target {!r}: label_from must name a captured "
+                "(pseudo-)argument".format(sub))
+        # per-target intent overrides beat the source scan: e.g. CAM's
+        # physics_update deallocates ptend on exit, so its exit-phase bytes
+        # are freed memory -- "ptend": "in" compares it at entry only
+        over = t.get("intents") or {}
+        if not isinstance(over, dict) or not all(
+                isinstance(k, str) and v in ("in", "out", "inout")
+                for k, v in over.items()):
+            bad("target {!r}: intents must map argument names to "
+                "in/out/inout".format(sub))
         targets.append({"sub": sub,
                         "base": (t.get("base") or sub).strip(),
-                        "test": (t.get("test") or sub).strip()})
+                        "test": (t.get("test") or sub).strip(),
+                        "label_from": (label_from or "").strip().lower()
+                        or None,
+                        "intents": {k.lower(): v for k, v in over.items()}})
     sentinel = spec.get("step_sentinel", "cam_run1")
     if not isinstance(sentinel, str) or not sentinel.strip():
         bad("step_sentinel must be a subroutine name")
@@ -538,9 +555,16 @@ def main():
             source_root = None
             print("dropsonde: WARNING: no --source-root; entry values of "
                   "intent(out) args will be compared (noisy)")
+        # per-target intent overrides from the spec beat the source scan
+        for t in targets:
+            if t["intents"]:
+                intents.setdefault(t["sub"], {}).update(t["intents"])
+        hit_labels = {t["sub"]: t["label_from"] for t in targets
+                      if t["label_from"]}
         meta_root = None
     else:
         sentinel = "cam_run1"
+        hit_labels = {}
         schemes = parse_sdf(args.sdf)
         uniq = []
         for s in schemes:
@@ -667,6 +691,7 @@ def main():
              "step_offset": offset,
              "roles": {"c": role_c, "s": role_s},
              "step_sentinel": sentinel,
+             "hit_labels": hit_labels,
              "launch": args.launch,
              spec_key: spec_abs, "intents": intents,
              "portable": suite_portable,

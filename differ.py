@@ -348,7 +348,7 @@ def _disp_scheme(scheme, portable):
 
 
 class Reporter(object):
-    def __init__(self, portable=None):
+    def __init__(self, portable=None, hit_labels=None):
         self.n_diffs = 0
         self.first_printed = False
         self.alignment_suspect = False
@@ -356,6 +356,9 @@ class Reporter(object):
         self.cur_scheme = None
         self.by_scheme = {}  # scheme -> [entry_diffs, exit_diffs]
         self.portable = portable or {}  # scheme -> portable_sub, for labels
+        # scheme -> captured pseudo-arg whose entry value names the hit
+        # (targets-v1 label_from, e.g. physics_update -> ptend%name)
+        self.hit_labels = hit_labels or {}
         self.nan_args = []  # (arg, side) of the current hit's one-sided nans
         self.no_exit_schemes = set()  # schemes with a hit missing exit dumps
 
@@ -803,8 +806,21 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
     """
     bucket = srec.get("_bucket", "<toplevel>")
     label = _disp_scheme(srec["scheme"], rep.portable)
+    # self-labeling metadata (targets-v1 label_from): a captured char
+    # pseudo-arg whose value names the hit -- e.g. ptend%name at CAM's
+    # physics_update choke point identifies the producing parameterization
+    lab_arg = rep.hit_labels.get(srec["scheme"])
+    if lab_arg:
+        lv = (srec["args"].get(lab_arg) or {}).get("entry_value")
+        if lv:
+            label += "<{}>".format(str(lv).strip())
     if bucket != "<toplevel>":
         label += " via " + bucket
+    # call-site line: only shown when identical on both sides (same-model);
+    # cross-model call sites live in different files and would mislead
+    cl = srec.get("caller_line")
+    if cl and cl == crec.get("caller_line"):
+        label += " @" + cl
     label += " [step {}]".format(srec.get("step", "?"))
     hit = srec.get("_occ", srec["hit"])
     sch_int = (intents or {}).get(srec["scheme"], {})
@@ -1446,7 +1462,7 @@ def _report(outdir, suite_order, steps, intents=None):
     # --- stream-order comparison ----------------------------------------
     print("")
     print("comparison (execution order):")
-    rep = Reporter(portable)
+    rep = Reporter(portable, suite_meta.get("hit_labels"))
     n_pairs = 0
     first_srec = None
     matched_cam = {}  # group key -> set of cam occurrences already paired

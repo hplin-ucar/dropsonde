@@ -43,10 +43,14 @@ class Builder(object):
             f.write(data)
         return fn
 
-    def hit(self, scheme, hit, step, caller, args):
+    def hit(self, scheme, hit, step, caller, args, caller_line=None):
         self.man["hits"].append({"scheme": scheme, "hit": hit, "step": step,
-                                 "caller": caller, "args": args,
+                                 "caller": caller,
+                                 "caller_line": caller_line, "args": args,
                                  "complete": True})
+
+    def char(self, entry, exit_):
+        return {"kind": "char", "entry_value": entry, "exit_value": exit_}
 
     def arr(self, extents, entry, exit_):
         return {"kind": "array", "dtype": "f8", "los": [1] * len(extents),
@@ -77,10 +81,14 @@ def targets_loader_test():
     targets, sentinel, capture = drv.load_targets(spec_file(
         {"spec": "dropsonde-targets-v1", "step_sentinel": "clm_drv",
          "capture": {"element_t": ["state%v", "State%T "]},
-         "targets": ["foo", {"sub": "bar", "test": "bar_new"}]}))
-    assert targets == [{"sub": "foo", "base": "foo", "test": "foo"},
-                       {"sub": "bar", "base": "bar", "test": "bar_new"}], \
-        targets
+         "targets": ["foo", {"sub": "bar", "test": "bar_new",
+                             "label_from": "Ptend%Name",
+                             "intents": {"ptend": "in"}}]}))
+    assert targets == [
+        {"sub": "foo", "base": "foo", "test": "foo",
+         "label_from": None, "intents": {}},
+        {"sub": "bar", "base": "bar", "test": "bar_new",
+         "label_from": "ptend%name", "intents": {"ptend": "in"}}], targets
     assert sentinel == "clm_drv", sentinel
     assert capture == {"element_t": ["state%v", "state%t"]}, capture
 
@@ -130,16 +138,21 @@ def main():
                 "errflg": b.scal(0, 0)}
 
     def beta_args(b, exit_val):
+        # ptend%tag: a captured char pseudo-arg used as the hit label
         return {"y": b.arr([2, 3], field, field),
+                "ptend%tag": b.char("zm_convr", "zm_convr"),
                 "n": b.scal(7, exit_val)}
 
-    # both sides run steps 1-2 (offset 0); beta exit diverges at step 2
+    # both sides run steps 1-2 (offset 0); beta exit diverges at step 2;
+    # beta carries a call-site line (identical both sides -> shown)
     for t in (1, 2):
         base.hit("alpha", t - 1, t, "drv", alpha_args(base, t))
-        base.hit("beta", t - 1, t, "drv", beta_args(base, 42))
+        base.hit("beta", t - 1, t, "drv", beta_args(base, 42),
+                 caller_line="drv.F90:57")
         test.hit("alpha", t - 1, t, "drv", alpha_args(test, t))
         test.hit("beta", t - 1, t, "drv",
-                 beta_args(test, 42 if t == 1 else 41))
+                 beta_args(test, 42 if t == 1 else 41),
+                 caller_line="drv.F90:57")
     base.write()
     test.write()
 
@@ -148,6 +161,7 @@ def main():
                    "step_offset": 0,
                    "roles": {"c": "base", "s": "test"},
                    "step_sentinel": "phys_step",
+                   "hit_labels": {"beta": "ptend%tag"},
                    "intents": {}, "portable": {},
                    "version": "testver",
                    "base_case": "/scratch/one", "test_case": "/scratch/two"},
@@ -164,6 +178,8 @@ def main():
     assert re.search(r"\bcam\b", text, re.I) is None, "cam label leaked"
     assert "test=9 base=1" in text, "entry diff not labeled base/test"
     assert "test=41 base=42" in text, "exit diff not labeled base/test"
+    assert "beta<zm_convr> via drv @drv.F90:57 [step 2]" in text, \
+        "hit label / call-site line missing from finding"
     assert "[OUTPUTS DIFFER]" in text and "[INPUTS DIFFER]" in text
     assert "constituent mapping (BASE 2 species, TEST 2):" in text
     assert "base q(:,:, 1) Q" in text, "identity constituent map missing"

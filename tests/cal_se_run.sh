@@ -4,7 +4,10 @@
 # cal_se.f90 sits next to this script, dropsonde_gdb.py in the repo root
 # above it). Compiler selectable via $FC (default gfortran), flags via
 # $FCFLAGS (default "-g -O0"; derived-type capture is a debug-build path,
-# so there is no optimized variant of this calibration).
+# so there is no optimized variant of this calibration). Under FC=ifort
+# everything up to the force-ABI checks passes; the force-ABI checks
+# themselves FAIL by design (the raw-descriptor ABI fallback is
+# gfortran-only -- _capture_abi refuses Intel dope vectors).
 #
 # Expected when everything works (details asserted by the python block):
 #   cam role  (kill_after_steps=1): the 4 step-1 hits only, then
@@ -40,7 +43,7 @@ for role in cam sima; do
  "capture": {"element_t": ["state%v", "state%t", "state%qdp",
                            "derived%ft", "spheremp", "localid", "tag"],
              "timelevel_t": ["n0", "np1"],
-             "hvcoord_t": ["hyai", "ps0"],
+             "hvcoord_t": ["hyai", "ps0", "name"],
              "derivative_t": ["dvv"]},
  "force_abi": ["deriv", "inv_cp", "qwater", "qidx"],
  "kill_after_steps": $kill_steps}
@@ -154,6 +157,9 @@ for role in ('cam', 'sima'):
     check(all(abs(x - 0.1 * (i + 1)) < 1e-12 for i, x in enumerate(hy)),
           'hvcoord%hyai values')
     check(h0['hvcoord%ps0'].get('entry_value') == 1000.0, 'hvcoord%ps0')
+    check(h0['hvcoord%name'].get('kind') == 'char' and
+          h0['hvcoord%name'].get('entry_value') == 'hv_main',
+          'hvcoord%name fixed-length char component captured')
     # --- values: dim order, per-element strides, entry/exit relations ------
     tve = vals(d, h0['elem%state%t']['entry_file'])
     text = exp_ext['elem%state%t']

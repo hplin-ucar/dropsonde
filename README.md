@@ -362,7 +362,20 @@ CTSM, are fine too -- arrays then compare element-wise, which is correct
 when both sides share one layout), and because both cases share the same
 decomposition there is **no dechunking or NTASKS=1 requirement**: compare
 the existing failing case against its baseline as-is. `--skip-base` /
-`--skip-test` replace `--skip-cam`/`--skip-sima`.
+`--skip-test` replace `--skip-cam`/`--skip-sima`. Under MPI, `--launch
+'mpiexec -n 1 {gdb} : -n N-1 {exe}'` instruments rank 0 of a real MPI job
+(divergences confined to other ranks' columns are invisible -- see
+`tests/cal_mpi_run.sh` scenario B).
+
+Two CAM presets ship in docs/:
+[targets_cam_update.json](docs/targets_cam_update.json) (sweep 1: the
+`physics_update` tendency choke point -- one subroutine covers all of
+physics on every suite, each hit labeled by `ptend%name` and call site,
+entry state doubling as a physics/dynamics discriminator) and
+[targets_cam_anchors.json](docs/targets_cam_anchors.json) (sweep 2: the
+tphysbc/tphysac driver-level calls, for input attribution when a
+divergence travels through pbuf or driver-local arrays, which bypass
+`physics_update` and localize one scheme late in sweep 1).
 
 ## Reading the report
 

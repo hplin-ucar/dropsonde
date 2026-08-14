@@ -1,0 +1,46 @@
+{
+  "spec": "dropsonde-targets-v1",
+  "comment": [
+    "CAM same-model preset, sweep 1 (the default first run): CAM is",
+    "tendency-driven, so physics_update -- the one subroutine through which",
+    "every parameterization's tendencies reach the state -- is a single",
+    "comparison point that covers all of physics, on every physics suite",
+    "(cam, cam7, simple) and across refactors. Each hit self-labels via",
+    "ptend%name (the producing parameterization) plus the call-site line.",
+    "Entry-state capture doubles as a physics/dynamics discriminator: if",
+    "state arrives already differing at the FIRST update of a step while",
+    "every ptend of the previous step matched, the divergence entered",
+    "between physics steps (dynamics/coupling) -- drill into the stepon_*/",
+    "dyn_run boundaries next (element_t capture: capture_se_dycore.json).",
+    "ptend is DEALLOCATED inside physics_update, so its exit bytes are",
+    "freed memory: the intents override compares it at entry only.",
+    "Known blind spot: pbuf fields (written via pbuf_get_field pointers)",
+    "and driver-local arrays (dlf, cmfmc, ...) bypass physics_update; a",
+    "divergence carried that way surfaces at the CONSUMING scheme's ptend,",
+    "one or more schemes late. For sharper input attribution run sweep 2:",
+    "targets_cam_anchors.json. Usage: dropsonde --base BASELINE_CASE",
+    "--test MODIFIED_CASE --targets targets_cam_update.json --source-root",
+    "$CAM/src [--launch 'mpiexec -n 1 {gdb} : -n N-1 {exe}']. Both cases",
+    "need the same PE layout, NTHRDS=1, DEBUG (-O0; on Izumi gnu >= 11",
+    "add -gdwarf-4 for gdb 8.2)."
+  ],
+  "step_sentinel": "cam_run1",
+  "targets": [
+    {"sub": "physics_update",
+     "label_from": "ptend%name",
+     "intents": {"ptend": "in", "dt": "in", "state": "inout",
+                 "tend": "inout"}},
+    "phys_run1",
+    "phys_run2",
+    "phys_timestep_init",
+    "stepon_run1",
+    "stepon_run2",
+    "stepon_run3",
+    "dyn_run"
+  ],
+  "capture": {
+    "physics_state": ["ps", "t", "s", "q", "u", "v", "pdel", "omega"],
+    "physics_ptend": ["name", "s", "q", "u", "v", "lq", "ls", "lu", "lv"],
+    "physics_tend": ["dtdt", "dudt", "dvdt", "flx_net"]
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "spec": "dropsonde-targets-v1",
+  "comment": [
+    "CAM same-model preset, sweep 2: the tphysbc/tphysac driver-level",
+    "parameterization calls (cam6-era physpkg.F90 on cam_development;",
+    "the cam7 driver differs -- regenerate the list from cam7/physpkg.F90",
+    "when needed). Use when sweep 1 (targets_cam_update.json) localizes a",
+    "scheme and you want its INPUTS as captured at the driver boundary --",
+    "these calls carry the driver-local coupling arrays (dlf, cmfmc, ...)",
+    "as plain arguments, which physics_update never sees -- or to compare",
+    "a configuration where a listed scheme is replaced (macrop/clubb/rk:",
+    "list them all; symbols absent from a build report 'missing' and",
+    "namelist-deselected ones simply never fire, both harmless).",
+    "Same usage and case requirements as targets_cam_update.json."
+  ],
+  "step_sentinel": "cam_run1",
+  "targets": [
+    "dadadj_tend",
+    "convect_deep_tend",
+    "convect_shallow_tend",
+    "macrop_driver_tend",
+    "clubb_tend_cam",
+    "rk_stratiform_cam_tend",
+    "microp_aero_run",
+    "microp_driver_tend",
+    "modal_aero_calcsize_sub",
+    "modal_aero_wateruptake_dr",
+    "aero_model_wetdep",
+    "convect_deep_tend_2",
+    "radiation_tend",
+    "cam_export",
+    "chem_emissions",
+    "chem_timestep_tend",
+    "trb_mtn_stress_tend",
+    "beljaars_drag_tend",
+    "vertical_diffusion_tend",
+    "rayleigh_friction_run",
+    "aero_model_drydep",
+    "gw_drag_cam_tend",
+    "qbo_relax",
+    "nudging_timestep_tend",
+    "physics_dme_adjust"
+  ],
+  "capture": {
+    "physics_state": ["ps", "t", "s", "q", "u", "v", "pdel", "omega"],
+    "physics_ptend": ["name", "s", "q", "u", "v", "lq", "ls", "lu", "lv"],
+    "physics_tend": ["dtdt", "dudt", "dvdt", "flx_net"],
+    "cam_in_t": ["shf", "lhf", "cflx"]
+  }
+}
