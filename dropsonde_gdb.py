@@ -33,6 +33,18 @@ KILL_AFTER = CFG.get("kill_after_steps", 0)  # 0 = run to natural exit
 # of the SIMA-only <scheme>_run CCPP wrapper. See parse_portable_map in the
 # dropsonde driver.
 PORTABLE = CFG.get("portable", {}) or {}
+# {derived_type_name_lower: [component paths]}: derived-type dummies whose
+# type matches a key are expanded into per-component pseudo-args
+# (e.g. elem%state%v) instead of being skipped. Authored as a JSON spec
+# (--capture); needed for non-CCPP code like the SE dycore, where the model
+# state travels in element_t arrays rather than plain-array arguments.
+CAPTURE = CFG.get("capture", {}) or {}
+# Calibration-only: dummy names forced through the ABI capture paths even
+# when the normal DWARF path works. The ABI paths only trigger naturally on
+# big-frame subroutines where gfortran drops dummy locations -- a condition
+# a micro-calibration cannot reproduce -- so tests/cal_se_run.sh exercises
+# them with this knob instead.
+FORCE_ABI = set(CFG.get("force_abi") or [])
 
 # gdb (Derecho gfortran, calibrated 2026-06-12) reports Fortran array
 # ranges outermost-first, i.e. REVERSED relative to subscript order, while
@@ -210,8 +222,20 @@ def array_plan(name, val):
             "extents": extents, "strides": strides}, None
 
 
+# A synthesized derived-type plan can span the whole element array (GBs)
+# for a component that is a small fraction of it; batch the outermost
+# (largest-stride) dimension so no single gdb read exceeds this.
+CHUNK_SPAN = 64 << 20
+
+
 def read_array(plan):
     """Read the logical array contents as contiguous subscript-major bytes."""
+    if plan.get("addrs") is not None:
+        # per-element plans (allocatable derived-type component): same
+        # inner shape at per-element heap addresses, outermost dim last
+        inner = plan["inner"]
+        return b"".join(read_array(dict(inner, addr=a))
+                        for a in plan["addrs"])
     extents = plan["extents"]
     strides = plan["strides"]
     elsize = plan["elsize"]
@@ -221,6 +245,16 @@ def read_array(plan):
     if total == 0:
         return b""
     span = sum(s * (e - 1) for s, e in zip(strides, extents)) + elsize
+    if (span > CHUNK_SPAN and len(extents) > 1 and strides[-1] > 0 and
+            strides[-1] == max(strides)):
+        nb = max(1, CHUNK_SPAN // strides[-1])
+        out = []
+        for j0 in range(0, extents[-1], nb):
+            cnt = min(nb, extents[-1] - j0)
+            sub = dict(plan, addr=plan["addr"] + j0 * strides[-1],
+                       extents=extents[:-1] + [cnt])
+            out.append(read_array(sub))
+        return b"".join(out)
     raw = bytes(gdb.selected_inferior().read_memory(plan["addr"], span))
 
     contig = True
@@ -253,10 +287,234 @@ def read_scalar(addr, dt):
 
 def write_blob(scheme, hit, arg, phase, data):
     FILE_IDX[0] += 1
-    fn = "{:05d}_{}_h{}_{}_{}.bin".format(FILE_IDX[0], scheme, hit, arg, phase)
+    fn = "{:05d}_{}_h{}_{}_{}.bin".format(
+        FILE_IDX[0], scheme, hit, arg.replace("%", "."), phase)
     with open(os.path.join(OUT, fn), "wb") as f:
         f.write(data)
     return fn
+
+
+# --------------------------------------------------------------------------
+# derived-type dummy expansion (--capture spec)
+#
+# Non-CCPP code like the SE dycore passes its state in derived types
+# (element_t arrays: elem(:)%state%v ...) rather than plain-array arguments.
+# A capture spec maps a derived-type NAME to the component paths worth
+# comparing; matching dummies are expanded into per-component pseudo-args
+# ("elem%state%v") whose records look exactly like plain array/scalar args,
+# so the exit re-read and the differ are unchanged. Components at a fixed
+# offset in the element (compile-time shape) become one strided plan over
+# all elements; allocatable components live at per-element heap addresses
+# and get a per-element address list (read_array's "addrs" path). Addresses
+# are probed empirically per hit, like every other capture.
+# --------------------------------------------------------------------------
+
+def _capturable_struct(t):
+    """Lowercase derived-type name if `t` is a struct, pointer-to-struct, or
+    array-of-struct dummy; None otherwise."""
+    t = t.strip_typedefs()
+    if t.code == gdb.TYPE_CODE_PTR:
+        t = t.target().strip_typedefs()
+    if t.code == gdb.TYPE_CODE_ARRAY:
+        t = _element_type(t)
+    if t.code not in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+        return None
+    name = t.name or t.tag or ""
+    name = name.split("::")[-1].strip().lower()
+    return name or None
+
+
+def _expr_plan(expr):
+    """('array', plan) | ('scalar', (addr, dtype)) | (None, None) plus an
+    error string, for a component-path gdb expression like 'tl%n0' or
+    'elem(3)%state%v'."""
+    v = gdb.parse_and_eval(expr)
+    t = v.type.strip_typedefs()
+    if is_character(t):
+        return None, None, "character component not captured"
+    if t.code == gdb.TYPE_CODE_ARRAY:
+        plan, err = array_plan(expr, v)
+        if plan is None:
+            return None, None, err
+        return "array", plan, None
+    if t.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION,
+                  gdb.TYPE_CODE_PTR):
+        return None, None, ("component is a derived type; extend the "
+                            "capture path into its numeric members")
+    dt = dtype_of(t)
+    if dt is None:
+        return None, None, "unsupported component type: {}".format(t)
+    if v.address is None:
+        return None, None, "component has no address"
+    return "scalar", (int(v.address), dt), None
+
+
+def _as_rank0_plan(payload):
+    """A scalar component as a rank-0 plan, so array-of-struct expansion
+    can treat scalar and array components uniformly (the element dimension
+    is appended either way)."""
+    addr, dt = payload
+    return {"addr": addr, "elsize": int(dt[1:]), "dtype": dt,
+            "los": [], "extents": [], "strides": []}
+
+
+def _expand_struct_scalar(scheme, hit, name, paths, rec):
+    """Pseudo-args for the components of a (scalar) derived-type dummy."""
+    for path in paths:
+        key = "{}%{}".format(name, path)
+        info = {"kind": "skipped"}
+        rec["args"][key] = info
+        try:
+            kind, payload, err = _expr_plan(key)
+            if kind == "array":
+                _record_array(info, scheme, hit, key, payload)
+            elif kind == "scalar":
+                addr, dt = payload
+                info["kind"] = "scalar"
+                info["dtype"] = dt
+                info["addr"] = addr
+                info["entry_value"] = read_scalar(addr, dt)
+            else:
+                info["why"] = err
+        except Exception as exc:
+            info["kind"] = "error"
+            info["why"] = str(exc)
+
+
+def _expand_struct_scalar_abi(scheme, hit, name, stype, base, paths, rec):
+    """Component pseudo-args of a scalar derived-type dummy read at ABI
+    pointer `base` via static DWARF field offsets -- for big-frame
+    subroutines where gfortran dropped the dummy's location and the by-name
+    path (_expand_struct_scalar) cannot address components (deriv%dvv in
+    the SE dycore's compute_and_apply_rhs). Only static-shape array and
+    scalar components are recoverable this way; the derived type's DWARF
+    layout itself is always static."""
+    t0 = stype.strip_typedefs()
+    if t0.code == gdb.TYPE_CODE_PTR:
+        t0 = t0.target().strip_typedefs()
+    for path in paths:
+        key = "{}%{}".format(name, path)
+        info = {"kind": "skipped", "abi": True}
+        rec["args"][key] = info
+        try:
+            t, off = t0, 0
+            for part in path.split("%"):
+                poff, t = _field_offset(t, part)
+                off += poff
+                t = t.strip_typedefs()
+            addr = base + off
+            if is_character(t):
+                info["why"] = "character component not captured"
+            elif t.code == gdb.TYPE_CODE_ARRAY:
+                plan, err = _static_shape_plan(addr, t)
+                if plan is None:
+                    info["kind"] = "error"
+                    info["why"] = "abi: " + err
+                    continue
+                _record_array(info, scheme, hit, key, plan)
+            elif t.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION,
+                            gdb.TYPE_CODE_PTR):
+                info["why"] = ("component is a derived type; extend the "
+                               "capture path into its numeric members")
+            else:
+                dt = dtype_of(t)
+                if dt is None:
+                    info["why"] = "unsupported component type: {}".format(t)
+                    continue
+                info["kind"] = "scalar"
+                info["dtype"] = dt
+                info["addr"] = addr
+                info["entry_value"] = read_scalar(addr, dt)
+        except Exception as exc:
+            info["kind"] = "error"
+            info["why"] = "abi: {}".format(exc)
+
+
+def _expand_struct_array(scheme, hit, name, val, paths, rec):
+    """Pseudo-args for the components of an array-of-struct dummy (e.g.
+    elem(:)). Each component is captured across ALL elements, the element
+    index appended as the outermost (last, slowest-varying) dimension."""
+    dims, _base = array_dims(val.type)
+    if len(dims) != 1:
+        raise gdb.error("rank-{} derived-type array not supported".format(
+            len(dims)))
+    lo, hi = dims[0]
+    n = hi - lo + 1
+    if n <= 0:
+        for path in paths:
+            rec["args"]["{}%{}".format(name, path)] = {
+                "kind": "skipped", "why": "empty derived-type array"}
+        return
+    estride = None
+    if n > 1:
+        a0 = gdb.parse_and_eval("{}({})".format(name, lo)).address
+        a1 = gdb.parse_and_eval("{}({})".format(name, lo + 1)).address
+        if a0 is not None and a1 is not None:
+            estride = int(a1) - int(a0)
+    for path in paths:
+        key = "{}%{}".format(name, path)
+        info = {"kind": "skipped"}
+        rec["args"][key] = info
+        try:
+            kind, payload, err = _expr_plan(
+                "{}({})%{}".format(name, lo, path))
+            if kind is None:
+                info["why"] = err
+                continue
+            p0 = payload if kind == "array" else _as_rank0_plan(payload)
+            if n > 1:
+                # shape must be uniform across elements (same allocation
+                # code ran for each); spot-check the last element
+                kind_l, payload_l, err_l = _expr_plan(
+                    "{}({})%{}".format(name, hi, path))
+                if kind_l != kind:
+                    raise gdb.error("component kind varies across "
+                                    "elements: {}".format(err_l or kind_l))
+                pl = (payload_l if kind == "array"
+                      else _as_rank0_plan(payload_l))
+                if (pl["extents"] != p0["extents"] or
+                        pl["strides"] != p0["strides"]):
+                    raise gdb.error(
+                        "component shape varies across elements: "
+                        "{}/{} vs {}/{}".format(
+                            p0["extents"], p0["strides"],
+                            pl["extents"], pl["strides"]))
+            delta = None
+            if n > 1:
+                kind1, payload1, _err1 = _expr_plan(
+                    "{}({})%{}".format(name, lo + 1, path))
+                if kind1 == kind:
+                    p1 = (payload1 if kind == "array"
+                          else _as_rank0_plan(payload1))
+                    delta = p1["addr"] - p0["addr"]
+            if n == 1 or (delta is not None and delta == estride and
+                          delta > 0):
+                # fixed-offset component: one strided plan covers all
+                # elements
+                plan = {"addr": p0["addr"], "elsize": p0["elsize"],
+                        "dtype": p0["dtype"], "los": p0["los"] + [lo],
+                        "extents": p0["extents"] + [n],
+                        "strides": p0["strides"] + [estride or 0]}
+            else:
+                # allocatable/pointer component: per-element heap
+                # addresses; probe each element's base once
+                addrs = [p0["addr"]]
+                for i in range(lo + 1, hi + 1):
+                    e = "{}({})%{}".format(name, i, path)
+                    if kind == "array":
+                        addrs.append(elem_addr(e, p0["los"]))
+                    else:
+                        addrs.append(
+                            int(gdb.parse_and_eval(e).address))
+                plan = {"elsize": p0["elsize"], "dtype": p0["dtype"],
+                        "los": p0["los"] + [lo],
+                        "extents": p0["extents"] + [n],
+                        "strides": p0["strides"] + [0],
+                        "inner": p0, "addrs": addrs}
+            _record_array(info, scheme, hit, key, plan)
+        except Exception as exc:
+            info["kind"] = "error"
+            info["why"] = str(exc)
 
 
 # --------------------------------------------------------------------------
@@ -334,8 +592,10 @@ def _first_body_line(scheme, frame):
         fname = frame.find_sal().symtab.fullname()
         with open(fname) as fh:
             lines = fh.readlines()
+        end = len(lines) + 1
         for idx in range(start - 1, len(lines)):
             if _END_SUB_RE.match(lines[idx]):
+                end = idx + 1
                 break
             if _ERR_INIT_RE.match(lines[idx]):
                 result = (fname, idx + 1)
@@ -349,6 +609,16 @@ def _first_body_line(scheme, frame):
                      "state".format(scheme, len(suspects),
                                     os.path.basename(fname), result[1],
                                     suspects[0]))
+        else:
+            # Non-CCPP subroutines (e.g. the SE dycore) have no errmsg
+            # idiom; the first executable-looking statement is an equally
+            # safe advance target -- 'advance' stops BEFORE the line runs,
+            # so the dummies are live and still unmodified.
+            suspects = _exec_lines_before(lines, start, end)
+            if suspects:
+                result = (fname, suspects[0])
+                note("{}: no errmsg idiom; using first executable "
+                     "statement".format(scheme))
     except Exception as exc:
         note("{}: body-line scan failed: {}".format(scheme, exc))
     if result is not None:
@@ -361,19 +631,31 @@ def _first_body_line(scheme, frame):
 # --------------------------------------------------------------------------
 # ABI-level argument capture (gfortran / System V AMD64 fallback)
 #
-# A few CCPP schemes are large enough that gfortran -O0 emits an EMPTY
+# A few subroutines are large enough that gfortran -O0 emits an EMPTY
 # DW_AT_location for every stack-passed dummy: `info address numliq` reports
 # "optimized out" and gdb cannot read the dummy by name ANYWHERE in the
 # routine -- not a prologue or stopping-point issue (park_macrophysics_run:
 # 66 dummies, ~1500 lines, a ~30 KB frame from its (ncol,pver) automatic
-# arrays). The data is still on the stack where the ABI put it, so we recover
-# it directly. Every Fortran dummy is passed by reference (one 8-byte
-# pointer); System V AMD64 puts the first 6 in registers and the rest as
-# consecutive 8-byte slots from rbp+16. So dummy i (1-based, declaration
-# order) with i > 6 is the pointer at [rbp + 16 + 8*(i-7)] -- a descriptor
-# pointer for assumed-shape arrays, a value pointer for scalars. Confirmed on
-# gcc 14.3.0. Assumes all-by-reference dummies (the CCPP norm); by-value float
-# arguments would shift the integer-register accounting and are not handled.
+# arrays; the SE dycore's compute_and_apply_rhs hits it too). The data is
+# still on the stack where the ABI put it, so we recover it directly. Every
+# Fortran dummy is passed by reference (one 8-byte pointer); System V AMD64
+# puts the first 6 in registers and the rest as consecutive 8-byte slots
+# from rbp+16. So dummy i (1-based, declaration order) with i > 6 is the
+# pointer at [rbp + 16 + 8*(i-7)] -- a descriptor pointer for assumed-shape
+# arrays, a raw data pointer for explicit-shape arrays, a value pointer for
+# scalars. Confirmed on gcc 14.3.0. Assumes all-by-reference dummies (the
+# CCPP norm); by-value float arguments would shift the integer-register
+# accounting and are not handled.
+#
+# Whether an array dummy's pointer is a descriptor or raw data is decided
+# from its SOURCE declaration (the same file the body-line scan reads):
+# dims all ':' -> assumed shape (descriptor); anything else -> explicit
+# shape, whose extents are resolved per dimension from (in order) integer
+# literals, already-captured sibling scalar dummies (nets:nete), gdb
+# evaluation in the frame (module variables), and the static DWARF ranges
+# (compile-time parameters like np/nlev). Explicit-shape actual arguments
+# are contiguous by construction (copy-in if needed), so pointer + extents
+# is a complete plan.
 # --------------------------------------------------------------------------
 
 import platform as _platform
@@ -440,7 +722,201 @@ def _descriptor_plan(desc_addr, elem_type):
             "los": los, "extents": extents, "strides": strides}, None
 
 
-def _capture_abi(scheme, hit, name, sym, idx, frame, info):
+def _split_top(s, sep=","):
+    """Split at top-level (paren-depth-0) occurrences of `sep`."""
+    out, depth, cur = [], 0, []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == sep and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return out
+
+
+def _balanced(s, open_idx):
+    """Contents of the paren group opening at s[open_idx]."""
+    depth = 0
+    for k in range(open_idx, len(s)):
+        if s[k] == "(":
+            depth += 1
+        elif s[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return s[open_idx + 1:k]
+    return None
+
+
+def _source_decl(frame, name):
+    """(dimension spec strings, lowercase attribute string) of dummy `name`'s
+    declaration in the current subroutine's source -- e.g.
+    (['np','np','nlev','nets:nete'], 'real (kind=r8), intent(in)') -- with
+    [] dims for a scalar, or None if the declaration was not found. Reads
+    the same source file as the body-line scan; handles continuation lines
+    and both entity-suffix (a(n,m)) and dimension(n,m)-attribute forms. The
+    first match from the subroutine's own line is the dummy's declaration
+    (a same-named local would be illegal)."""
+    try:
+        start = frame.function().line
+        fname = frame.find_sal().symtab.fullname()
+        with open(fname) as fh:
+            lines = fh.readlines()
+    except Exception:
+        return None
+    logical = []
+    buf = ""
+    for idx in range(start - 1, len(lines)):
+        code = lines[idx].split("!", 1)[0].rstrip()
+        if _END_SUB_RE.match(code):
+            break
+        if not code.strip():
+            continue
+        if code.endswith("&"):
+            buf += code[:-1].strip() + " "
+            continue
+        logical.append(buf + code.strip())
+        buf = ""
+        if len(logical) > 500:
+            break
+    target = name.lower()
+    for code in logical:
+        low = code.lower()
+        if "::" not in low:
+            continue
+        attrs, _, ents = low.partition("::")
+        dim_attr = None
+        m = re.search(r"\bdimension\s*\(", attrs)
+        if m:
+            dim_attr = _balanced(attrs, m.end() - 1)
+        for ent in _split_top(ents):
+            ent = ent.strip()
+            m2 = re.match(r"([a-z_]\w*)", ent)
+            if not m2 or m2.group(1) != target:
+                continue
+            rest = ent[m2.end():].lstrip()
+            if rest.startswith("("):
+                dims = _balanced(ent, ent.index("(", m2.end()))
+                if dims is None:
+                    return None
+                return [d.strip() for d in _split_top(dims)], attrs.strip()
+            if dim_attr is not None:
+                return ([d.strip() for d in _split_top(dim_attr)],
+                        attrs.strip())
+            return [], attrs.strip()
+    return None
+
+
+def _decl_dtype(attrs):
+    """Fallback dtype from a declaration's attribute string, for when gdb
+    cannot resolve the dummy's (dynamic) DWARF type at all. Only the kinds
+    the models actually use; None when unsure."""
+    if attrs.startswith("real"):
+        return "f4" if re.search(r"kind\s*=\s*(r4\b|4\b)|real\s*\(\s*4\s*\)",
+                                 attrs) else "f8"
+    if attrs.startswith("integer"):
+        return "i8" if re.search(r"kind\s*=\s*(i8\b|8\b)", attrs) else "i4"
+    if attrs.startswith("logical"):
+        return "i4"
+    return None
+
+
+def _static_dims(t, want):
+    """Best-effort per-dimension (lo, hi) from the static DWARF type, in
+    source subscript order; None entries where a range is dynamic or
+    unresolvable, None overall when the rank disagrees with `want`."""
+    out = []
+    try:
+        t = t.strip_typedefs()
+        while t.code == gdb.TYPE_CODE_ARRAY:
+            try:
+                lo, hi = t.range()
+                out.append((int(lo), int(hi)))
+            except Exception:
+                out.append(None)
+            t = t.target().strip_typedefs()
+    except Exception:
+        return None
+    if len(out) != want:
+        return None
+    if DIM_ORDER == "reversed":
+        out.reverse()
+    return out
+
+
+def _eval_bound(expr, rec_args):
+    """Integer value of a declared bound expression: literal, an
+    already-captured sibling scalar dummy (declaration order guarantees
+    nets/nete are captured before the arrays they bound), else gdb
+    evaluation in the frame (module variables)."""
+    expr = expr.strip()
+    try:
+        return int(expr)
+    except ValueError:
+        pass
+    info = rec_args.get(expr.lower())
+    if (info and info.get("kind") == "scalar" and
+            info.get("entry_value") is not None):
+        return int(info["entry_value"])
+    return int(gdb.parse_and_eval(expr))
+
+
+def _declared_plan(ptr, st, dimspecs, attrs, rec_args):
+    """Capture plan for an explicit-shape dummy from its source-declared
+    bounds: `ptr` is the raw contiguous data pointer from the ABI slot.
+    Static DWARF ranges back up any bound gdb cannot evaluate (compile-time
+    parameters like np/nlev have static ranges even when the dummy's
+    location was dropped)."""
+    dt = None
+    elsize = None
+    try:
+        elem = _element_type(st)
+        dt = dtype_of(elem)
+        if dt is not None:
+            elsize = elem.sizeof
+    except Exception:
+        pass
+    if dt is None:
+        dt = _decl_dtype(attrs)
+        if dt is None:
+            return None, "unresolvable element type ({})".format(attrs[:40])
+        elsize = int(dt[1:])
+    static = _static_dims(st, len(dimspecs))
+    los, extents = [], []
+    for k, spec in enumerate(dimspecs):
+        parts = _split_top(spec, ":")
+        try:
+            if len(parts) == 2:
+                lo = _eval_bound(parts[0], rec_args)
+                hi = _eval_bound(parts[1], rec_args)
+            elif len(parts) == 1:
+                lo, hi = 1, _eval_bound(parts[0], rec_args)
+            else:
+                raise gdb.error("unsupported dimension spec: " + spec)
+        except Exception:
+            if static and static[k] is not None:
+                lo, hi = static[k]
+            else:
+                return None, ("could not resolve declared bound {!r} of "
+                              "dims {}".format(spec, dimspecs))
+        los.append(lo)
+        extents.append(hi - lo + 1)
+    if any(e < 0 for e in extents):
+        return None, "implausible declared extents: {}".format(extents)
+    strides = []
+    acc = elsize
+    for e in extents:
+        strides.append(acc)
+        acc *= e
+    return {"addr": ptr, "elsize": elsize, "dtype": dt, "los": los,
+            "extents": extents, "strides": strides}, None
+
+
+def _capture_abi(scheme, hit, name, sym, idx, frame, info, rec_args):
     """Recover a stack-passed dummy whose DWARF location gfortran dropped,
     reading it straight from the ABI argument slot. Fills `info` exactly like
     handle_entry's normal path, so the exit re-read and differ are unchanged."""
@@ -460,26 +936,66 @@ def _capture_abi(scheme, hit, name, sym, idx, frame, info):
     if name.startswith("_"):              # gfortran hidden character-length arg
         info["why"] = "hidden character-length arg (by value)"
         return
-    st = sym.type.strip_typedefs()
-    if is_character(st):
-        info["why"] = "character arg via ABI not captured"
-        return
     slot = _frame_base(frame) + STACK_ARG0 + 8 * (idx - N_INT_REG - 1)
     ptr = _read_u64(slot)                 # by reference: descriptor/value pointer
     info["abi"] = True
-    if st.code == gdb.TYPE_CODE_ARRAY:
-        elem = _element_type(st)
-        if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
-            info["why"] = "derived-type array via ABI not captured"
-            return
-        # Known gap: an EXPLICIT-shape stack-passed dummy (b(ncol,pver)) is a
-        # raw data pointer, not a descriptor, and gdb's type info here does
-        # not distinguish the two. Decoding data bytes as a descriptor is
-        # expected to fail _descriptor_plan's plausibility gates (rank 1-7 at
-        # +28, non-null base, non-negative extents) -- probabilistic, not
-        # principled. If a capture from this path ever looks wrong, check
-        # whether the dummy is explicit-shape.
-        plan, err = _descriptor_plan(ptr, elem)
+    decl = _source_decl(frame, name)
+    dims, attrs = decl if decl is not None else (None, "")
+    # Type introspection can itself fail here: a dynamic DWARF type whose
+    # bounds reference the dropped locations raises (e.g. "Lower bound may
+    # not be '*' in F77") on strip_typedefs/str(). Treat the static type as
+    # advisory and fall back to the source declaration.
+    st = None
+    char = None
+    code = None
+    try:
+        st = sym.type.strip_typedefs()
+        char = is_character(st)
+        code = st.code
+    except Exception:
+        char = attrs.startswith("character")
+        code = gdb.TYPE_CODE_ARRAY if dims else None
+    if char:
+        info["why"] = "character arg via ABI not captured"
+        return
+    if code == gdb.TYPE_CODE_ARRAY:
+        elem = None
+        try:
+            elem = _element_type(st)
+            if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+                info["why"] = "derived-type array via ABI not captured"
+                return
+        except Exception:
+            elem = None
+        if dims:
+            if all(d == ":" for d in dims):
+                # assumed shape: the pointer is a gfortran descriptor
+                if elem is None:
+                    info["kind"] = "error"
+                    info["why"] = ("abi: descriptor decode needs a "
+                                   "resolvable element type")
+                    return
+                plan, err = _descriptor_plan(ptr, elem)
+            elif any("*" in d for d in dims):
+                plan, err = None, ("assumed-size dummy (declared ({}))"
+                                   .format(",".join(dims)))
+            else:
+                # explicit shape: raw contiguous data pointer; extents from
+                # the declared bounds
+                plan, err = _declared_plan(ptr, sym.type, dims, attrs,
+                                           rec_args)
+        else:
+            # No source declaration found: assume a descriptor. Decoding
+            # explicit-shape data bytes as a descriptor is expected to fail
+            # _descriptor_plan's plausibility gates (rank 1-7 at +28,
+            # non-null base, non-negative extents) -- probabilistic, not
+            # principled; the declaration parse above is the reliable path.
+            if elem is None:
+                info["kind"] = "error"
+                info["why"] = ("abi: no source declaration and "
+                               "unresolvable type")
+                return
+            plan, err = _descriptor_plan(ptr, elem)
         if plan is None:
             info["kind"] = "error"
             info["why"] = "abi: " + err
@@ -492,13 +1008,14 @@ def _capture_abi(scheme, hit, name, sym, idx, frame, info):
         info["plan"] = plan
         info["entry_file"] = write_blob(
             scheme, hit, name, "in", read_array(plan))
-    elif st.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+    elif code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
         info["why"] = "derived-type arg via ABI not captured"
     else:
-        dt = dtype_of(st)
+        dt = dtype_of(st) if st is not None else _decl_dtype(attrs)
         if dt is None:
             info["kind"] = "error"
-            info["why"] = "abi: unsupported scalar type: {}".format(st)
+            info["why"] = "abi: unsupported scalar type: {}".format(
+                st if st is not None else attrs[:40])
             return
         info["kind"] = "scalar"
         info["dtype"] = dt
@@ -712,9 +1229,58 @@ def handle_entry(scheme, frame):
         info = {"kind": "skipped"}
         rec["args"][name] = info
         try:
+            if name in FORCE_ABI and idx > N_INT_REG:
+                # calibration knob: exercise the ABI capture paths without
+                # a big-frame reproducer (see FORCE_ABI above)
+                stname = _capturable_struct(sym.type)
+                if stname is not None and CAPTURE.get(stname):
+                    info["abi"] = True
+                    info["why"] = ("forced abi: derived type {}: expanded "
+                                   "into {} component pseudo-args".format(
+                                       stname, len(CAPTURE[stname])))
+                    base = _read_u64(_frame_base(frame) + STACK_ARG0 +
+                                     8 * (idx - N_INT_REG - 1))
+                    _expand_struct_scalar_abi(scheme, hit, name, sym.type,
+                                              base, CAPTURE[stname], rec)
+                else:
+                    _capture_abi(scheme, hit, name, sym, idx, frame, info,
+                                 rec["args"])
+                continue
             val = sym.value(frame)
             t = val.type.strip_typedefs()
-            if t.code == gdb.TYPE_CODE_ARRAY and not is_character(t):
+            stname = _capturable_struct(t)
+            if stname is not None:
+                paths = CAPTURE.get(stname)
+                if not paths:
+                    info["why"] = ("derived type {} (no capture spec "
+                                   "entry)".format(stname))
+                elif t.code == gdb.TYPE_CODE_ARRAY:
+                    info["why"] = ("derived-type array {}: expanded into "
+                                   "{} component pseudo-args".format(
+                                       stname, len(paths)))
+                    _expand_struct_array(scheme, hit, name, val, paths, rec)
+                else:
+                    info["why"] = ("derived type {}: expanded into {} "
+                                   "component pseudo-args".format(
+                                       stname, len(paths)))
+                    _expand_struct_scalar(scheme, hit, name, paths, rec)
+                    # big-frame subroutines: components unaddressable by
+                    # name when the dummy's DWARF location was dropped;
+                    # retry via the ABI argument slot + field offsets
+                    comps = ["{}%{}".format(name, p) for p in paths]
+                    if (idx > N_INT_REG and
+                            _ARCH in ("x86_64", "AMD64") and
+                            compiler() in ("gnu", "unknown") and
+                            all(rec["args"][c].get("kind") == "error" or
+                                "address" in (rec["args"][c].get("why")
+                                              or "")
+                                for c in comps)):
+                        base = _read_u64(_frame_base(frame) + STACK_ARG0 +
+                                         8 * (idx - N_INT_REG - 1))
+                        _expand_struct_scalar_abi(scheme, hit, name,
+                                                  sym.type, base, paths,
+                                                  rec)
+            elif t.code == gdb.TYPE_CODE_ARRAY and not is_character(t):
                 plan, err = array_plan(name, val)
                 if plan is None:
                     info["why"] = err
@@ -755,7 +1321,8 @@ def handle_entry(scheme, frame):
             # straight from the ABI argument slots.
             if idx > N_INT_REG:
                 try:
-                    _capture_abi(scheme, hit, name, sym, idx, frame, info)
+                    _capture_abi(scheme, hit, name, sym, idx, frame, info,
+                                 rec["args"])
                     continue
                 except Exception as exc2:
                     info["kind"] = "error"

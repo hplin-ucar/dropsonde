@@ -1,0 +1,12 @@
+{
+  "spec": "dropsonde-capture-v1",
+  "comment": "SE dycore derived-type capture: prognostic state + physics forcings on every element_t dummy, timelevel indices, vertical coordinate, GLL derivative operator. Component names verified against CAM cam_development and CAM-SIMA (identical elem_state_t layout). Extend derived% paths (vn0, dp, divdp, omega, dpdiss_*) when narrowing a divergence that enters through them; each np,np,nlev field adds ~12 MB per dump at ne16np4/L30.",
+  "types": {
+    "element_t": ["state%v", "state%t", "state%dp3d", "state%psdry",
+                  "state%phis", "state%qdp",
+                  "derived%fm", "derived%ft", "derived%fq"],
+    "timelevel_t": ["nm1", "n0", "np1", "nstep"],
+    "hvcoord_t": ["ps0", "hyai", "hyam", "hybi", "hybm"],
+    "derivative_t": ["dvv"]
+  }
+}

@@ -60,6 +60,15 @@ def skip_arg(arg):
     return (arg in SKIP_ARGS or arg.startswith("_") or
             (arg.startswith(".tmp.") and ".len_V$" in arg))
 
+
+def _arg_intent(sch_int, arg):
+    """Intent of an arg; a derived-type component pseudo-arg (elem%state%v,
+    from a --capture spec) falls back to the intent of its root dummy."""
+    it = sch_int.get(arg)
+    if it is None and "%" in arg:
+        it = sch_int.get(arg.split("%", 1)[0])
+    return it
+
 # --- constituent-index realignment specs (--realign) ------------------------
 # Some portable subroutines are called from two different constituent-index
 # conventions (e.g. MAM's modal_aero_gasaerexch/rename: CAM passes the mozart
@@ -245,6 +254,40 @@ def _exit_diff_written_only(sdata, cdata, s_entry, c_entry, dt, extents,
                                     fmt_val(x), fmt_val(y)), ignored)
 
 
+# Never-initialized memory read as float64 is dominated by values no model
+# field ever takes: NaNs, denormals (stack garbage like 3.9e-315), and
+# absurd magnitudes (1.1e+277). A physical field differing at such values on
+# BOTH sides is caller scratch (e.g. an intent(inout) diagnostic the callee
+# only writes), not a divergence.
+_DBL_MIN = 2.2250738585072014e-308
+_UNINIT_HUGE = 1e300
+
+
+def _looks_uninit(x):
+    return (x != x or abs(x) > _UNINIT_HUGE or
+            (x != 0.0 and abs(x) < _DBL_MIN))
+
+
+def _uninit_entry_stats(sdata, cdata, dt):
+    """(n_diff, n_uninit, example (sima, cam)) over differing elements;
+    n_uninit counts differing elements where EITHER side looks like
+    never-initialized memory."""
+    va = unpack(sdata, dt)
+    vb = unpack(cdata, dt)
+    n_diff = n_un = 0
+    ex = None
+    for k in range(min(len(va), len(vb))):
+        x, y = va[k], vb[k]
+        if x == y or (x != x and y != y):
+            continue
+        n_diff += 1
+        if _looks_uninit(x) or _looks_uninit(y):
+            n_un += 1
+            if ex is None:
+                ex = (x, y)
+    return n_diff, n_un, ex
+
+
 def build_const_map(cam_names, sima_names):
     """(pairs, cam_unmatched, sima_unmatched); pairs are 0-based
     (cam_idx, sima_idx, cam_name, sima_name)."""
@@ -284,9 +327,12 @@ def _disp_scheme(scheme, portable):
     """Display label for a scheme. When the scheme is compared at a shared
     portable subroutine (dropsonde:portable SDF annotation), show
     'scheme -> portable_sub' so the report makes clear what is actually being
-    compared; otherwise just the scheme name."""
+    compared; otherwise just the scheme name. Pseudo-SDF entries that
+    retarget to themselves (portable=<scheme>, the SE dycore convention)
+    add no information, so they show plain."""
     sym = (portable or {}).get(scheme)
-    return "{} -> {}".format(scheme, sym) if sym else scheme
+    return "{} -> {}".format(scheme, sym) if sym and sym != scheme \
+        else scheme
 
 
 class Reporter(object):
@@ -371,6 +417,24 @@ def _const_axis(sext, cext, sima_names):
                 sext[:k] == cext[:k] and sext[k + 1:] == cext[k + 1:]):
             return k
     return None
+
+
+def _mapped_const_axis(sext, cext, sima_names, cam_names):
+    """Axis carrying the constituent index of an arg whose SHAPES DISAGREE
+    because the two models register different constituent counts (e.g. the
+    SE dycore's elem%state%qdp: SIMA [np,np,nlev,3,2,ne] vs CAM
+    [np,np,nlev,12,2,ne]). The axis is identified by its extent equalling
+    each model's own constituent count while every other axis agrees;
+    exactly one candidate axis must exist (ambiguity -> None, and the arg
+    falls back to the shape-mismatch report). Equal-count models never get
+    here (their shapes match), so this is anchored on the count mismatch."""
+    if (len(sext) != len(cext) or not sima_names or not cam_names or
+            len(sima_names) == len(cam_names)):
+        return None
+    cand = [k for k in range(len(sext))
+            if (sext[k] == len(sima_names) and cext[k] == len(cam_names) and
+                sext[:k] == cext[:k] and sext[k + 1:] == cext[k + 1:])]
+    return cand[0] if len(cand) == 1 else None
 
 
 def _int_arg(man, args, name):
@@ -527,7 +591,13 @@ def _compare_metadata_valid(label, hit, phase, arg, sdata, cdata, dt, ext,
 
 
 def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
-                 const_ctx, rep, intent=None, port=None):
+                 const_ctx, rep, intent=None, port=None,
+                 force_written_only=False):
+    """Compare one arg at one phase. Returns 'uninit-entry' when an entry
+    difference was classified as never-initialized caller scratch (the
+    caller then re-invokes the exit phase with force_written_only=True so
+    unwritten elements -- still garbage -- are not compared); None
+    otherwise."""
     fkey = phase + "_file"
     vkey = phase + "_value"
     cam_names, sima_names, pairs = const_ctx
@@ -633,12 +703,23 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
             return
 
         if sext != cext:
+            # different constituent counts: compare the mapped species
+            # slices along the (unambiguous) constituent axis instead of
+            # bailing out on the shape
+            axis = _mapped_const_axis(sext, cext, sima_names, cam_names)
+            if axis is not None and pairs:
+                _compare_species_axis(
+                    label, hit, phase, arg, sdata, cdata, dt, sext, cext,
+                    axis, [(sj, ci, cn, sn) for (ci, sj, cn, sn) in pairs],
+                    sinfo["los"], rep, "constituent map")
+                return
             if phase == "entry":
                 rep.diff(label, hit, phase, arg,
                          "shape mismatch: sima {} vs cam {}".format(
                              sext, cext))
             return
-        if (phase == "exit" and intent == "out" and sdata != cdata and
+        if (phase == "exit" and (intent == "out" or force_written_only) and
+                sdata != cdata and
                 sinfo.get("entry_file") and cinfo.get("entry_file")):
             txt, ignored = _exit_diff_written_only(
                 sdata, cdata, blob(sman, sinfo["entry_file"]),
@@ -657,6 +738,19 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
             return
         txt = array_diff_text(sdata, cdata, dt, sext, sinfo["los"])
         if txt:
+            if phase == "entry" and dt[0] == "f":
+                nd, nu, ex = _uninit_entry_stats(sdata, cdata, dt)
+                if nd and 2 * nu >= nd:
+                    rep.note(
+                        "{} (hit {}): arg {}: entry values differ but look "
+                        "uninitialized ({}/{} differing elements are "
+                        "NaN/denormal/huge, e.g. sima={} cam={}); treated "
+                        "as caller scratch the scheme only writes "
+                        "(intent(inout) diagnostic?): not counted as an "
+                        "input diff, exit compared over written elements "
+                        "only".format(label, hit, arg, nu, nd,
+                                      fmt_val(ex[0]), fmt_val(ex[1])))
+                    return "uninit-entry"
             rep.diff(label, hit, phase, arg, txt)
 
     elif kind in ("scalar", "char"):
@@ -706,6 +800,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
         port = _portable_ctx(srec, crec, sman, cman, const_ctx, realign)
     conv = set()
     entry_diffed = set()
+    uninit_entry = set()
     phases = ("entry", "exit")
     no_exit = [role for role, r in (("sima", srec), ("cam", crec))
                if not has_exit_capture(r)]
@@ -720,7 +815,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
         for arg, sinfo in srec["args"].items():
             if skip_arg(arg):
                 continue
-            it = sch_int.get(arg)
+            it = _arg_intent(sch_int, arg)
             if it == "out" and phase == "entry":
                 continue
             if it == "in" and phase == "exit":
@@ -738,8 +833,11 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
                 suppressed.append(arg)
                 continue
             pre = rep.n_diffs
-            _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
-                         const_ctx, rep, it, port)
+            status = _compare_arg(label, hit, phase, arg, sinfo, cinfo,
+                                  sman, cman, const_ctx, rep, it, port,
+                                  force_written_only=(arg in uninit_entry))
+            if phase == "entry" and status == "uninit-entry":
+                uninit_entry.add(arg)
             if phase == "entry" and rep.n_diffs > pre:
                 entry_diffed.add(arg)
         if phase == "exit" and suppressed:
@@ -820,7 +918,7 @@ def count_matching_entry_args(srec, crec, sman, cman, sch_int=None,
     for arg, sinfo in srec["args"].items():
         if skip_arg(arg):
             continue
-        if sch_int and sch_int.get(arg) == "out":
+        if sch_int and _arg_intent(sch_int, arg) == "out":
             continue
         cinfo = crec["args"].get(arg)
         if cinfo is None or sinfo.get("kind") != cinfo.get("kind"):
@@ -848,10 +946,30 @@ def count_matching_entry_args(srec, crec, sman, cman, sch_int=None,
                        for ci, sj, _, _ in pairs):
                     same += 1
                 continue
+            if sext != cext:
+                # constituent-count mismatch (SE qdp/fq): judge the
+                # mapped species slices only
+                axis = _mapped_const_axis(sext, cext, sima_names, cam_names)
+                if axis is None or not pairs:
+                    continue  # incomparable shapes: cannot judge this arg
+                sdata = blob(sman, sinfo["entry_file"])
+                cdata = blob(cman, cinfo["entry_file"])
+                elsize = ELSIZE[sinfo["dtype"]]
+                total += 1
+                if all(_species_slab(sdata, elsize, sext, axis, sj) ==
+                       _species_slab(cdata, elsize, cext, axis, ci)
+                       for ci, sj, _, _ in pairs):
+                    same += 1
+                continue
+            sdata = blob(sman, sinfo["entry_file"])
+            cdata = blob(cman, cinfo["entry_file"])
+            if sdata != cdata and sinfo.get("dtype", "")[0] == "f":
+                nd, nu, _ex = _uninit_entry_stats(sdata, cdata,
+                                                  sinfo["dtype"])
+                if nd and 2 * nu >= nd:
+                    continue  # caller scratch: not a judgeable input
             total += 1
-            if (sext == cext and
-                    blob(sman, sinfo["entry_file"]) ==
-                    blob(cman, cinfo["entry_file"])):
+            if sdata == cdata:
                 same += 1
         elif sinfo.get("kind") in ("scalar", "char"):
             if sinfo.get("entry_value") is None:
@@ -1020,6 +1138,11 @@ def _report(outdir, suite_order, steps, intents=None):
         suite_meta = {}
     portable = suite_meta.get("portable", {}) or {}
     realign = load_realign(os.path.join(outdir, "realign.json"))
+    # SIMA step t pairs with CAM step t+offset. 1 (the default) matches
+    # FPHYStest snapshot runs, where CAM's first step is skipped; 0 is for
+    # two models running freely from identical initial conditions (e.g.
+    # SE dycore comparisons). Set by --step-offset at capture time.
+    offset = suite_meta.get("step_offset", 1)
 
     def disp(s):
         return _disp_scheme(s, portable)
@@ -1036,7 +1159,8 @@ def _report(outdir, suite_order, steps, intents=None):
     sima_case = suite_meta.get("sima_case")
     if sima_case:
         print("SIMA case: {}".format(sima_case))
-    print("steps:     {}".format(steps))
+    print("steps:     {} (sima step t <-> cam step t+{})".format(
+        steps, offset))
     if realign is not None:
         print("realign:   {} args realigned per species, {} convention, "
               "{} metadata (realign.json)".format(
@@ -1124,7 +1248,7 @@ def _report(outdir, suite_order, steps, intents=None):
 
     # --- alignment ------------------------------------------------------
     # Hits are tagged with the timestep (cam_run1 sentinel) and bucketed
-    # by caller: sima step t pairs with cam step t+1, occurrence-by-
+    # by caller: sima step t pairs with cam step t+offset, occurrence-by-
     # occurrence within each (scheme, step, bucket).
     if not any(r.get("step", 0) >= 1 for r in sima["hits"]):
         print("")
@@ -1151,7 +1275,7 @@ def _report(outdir, suite_order, steps, intents=None):
 
     print("")
     print("call alignment (hits per compared step; sima step t pairs "
-          "with cam step t+1;")
+          "with cam step t+{};".format(offset))
     print("indented rows are calls made from inside the parent scheme):")
     width = max(len(disp(s)) for s in compared) + 2
 
@@ -1178,10 +1302,10 @@ def _report(outdir, suite_order, steps, intents=None):
             buckets = set(b for (ss, tt, b) in sima_g
                           if ss == s and tt == t)
             buckets |= set(b for (ss, tt, b) in cam_g
-                           if ss == s and tt == t + 1)
+                           if ss == s and tt == t + offset)
             for b in sorted(buckets):
                 n_s = len(sima_g.get((s, t, b), []))
-                n_c = len(cam_g.get((s, t + 1, b), []))
+                n_c = len(cam_g.get((s, t + offset, b), []))
                 e = info.setdefault(s, {"top": None, "via": []})
                 if b == "<toplevel>":
                     e["top"] = (n_s, n_c)
@@ -1290,7 +1414,7 @@ def _report(outdir, suite_order, steps, intents=None):
         t = srec.get("step", 0)
         if t < 1 or t > steps:
             continue
-        key = (srec["scheme"], t + 1, srec["_bucket"])
+        key = (srec["scheme"], t + offset, srec["_bucket"])
         cam_list = cam_g.get(key, [])
         n_s = len(sima_g.get((srec["scheme"], t, srec["_bucket"]), []))
         if len(cam_list) == n_s:
@@ -1310,7 +1434,7 @@ def _report(outdir, suite_order, steps, intents=None):
             # Strategy 1: SDF-order pairing -- find the CAM call that
             # follows the last SDF predecessor in CAM's execution order
             result = find_cam_by_sdf_order(
-                srec["scheme"], t + 1, cam_list, used)
+                srec["scheme"], t + offset, cam_list, used)
             if result is not None:
                 k, crec, pred = result
                 used.add(k)

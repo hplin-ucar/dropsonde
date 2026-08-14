@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Pseudo-SDF for the SE dycore on physgrid (pg) grids, where CSLAM advects
+  the tracers: the GLL dynamics chain is unchanged, but tracer advection
+  runs through Prim_Advec_Tracers_fvm / run_consistent_se_cslam instead of
+  Prim_Advec_Tracers_remap / euler_step / advance_hypervis_scalar, and the
+  fvm(:) dummies are ALLOCATED and carry the tracer state (capture them
+  with docs/capture_se_dycore_cslam.json).
+  See docs/se_dycore_guide.md (SE-CSLAM section) for the pg-grid gotchas:
+  fvm_supercycling changes hit counts, GLL Qdp carries only thermodynamic
+  active species, halo-index diffs on fvm fields are suspect.
+-->
+<suite name="se_dycore_cslam" version="1.0">
+  <group name="dynamics">
+    <scheme>prim_run_subcycle</scheme>          <!-- dropsonde:portable=prim_run_subcycle -->
+    <scheme>applycamforcing</scheme>            <!-- dropsonde:portable=applycamforcing -->
+    <scheme>prim_step</scheme>                  <!-- dropsonde:portable=prim_step -->
+    <scheme>prim_advance_exp</scheme>           <!-- dropsonde:portable=prim_advance_exp -->
+    <scheme>compute_and_apply_rhs</scheme>      <!-- dropsonde:portable=compute_and_apply_rhs -->
+    <scheme>advance_hypervis_dp</scheme>        <!-- dropsonde:portable=advance_hypervis_dp -->
+    <scheme>prim_advec_tracers_fvm</scheme>     <!-- dropsonde:portable=prim_advec_tracers_fvm -->
+    <scheme>run_consistent_se_cslam</scheme>    <!-- dropsonde:portable=run_consistent_se_cslam -->
+    <scheme>vertical_remap</scheme>             <!-- dropsonde:portable=vertical_remap -->
+  </group>
+</suite>
