@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -332,7 +333,7 @@ def find_meta_root(sdf_abs):
 
 
 def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
-           capture, step_sentinel, const_probe):
+           capture, step_sentinel, const_probe, launch_tpl=None):
     exe = os.path.join(casedir, "bld", "cesm.exe")
     rundir = os.path.join(casedir, "run")
     if not os.path.isfile(exe):
@@ -348,7 +349,8 @@ def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
                    "kill_after_steps": kill_after_steps,
                    "portable": portable, "capture": capture,
                    "step_sentinel": step_sentinel,
-                   "const_probe": const_probe}, f, indent=1)
+                   "const_probe": const_probe,
+                   "mpi_launch": bool(launch_tpl)}, f, indent=1)
 
     env = dict(os.environ, DROPSONDE_CONFIG=cfgpath)
     # Some sites (e.g. Izumi) point PYTHONHOME/PYTHONPATH at an anaconda whose
@@ -357,11 +359,24 @@ def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
     # stripping them is always safe.
     env.pop("PYTHONHOME", None)
     env.pop("PYTHONPATH", None)
+    script = os.path.join(HERE, "dropsonde_gdb.py")
+    if launch_tpl:
+        # MPI mode: substitute the batch gdb invocation into the launcher
+        # template. The config path and Python-env hygiene are inlined via
+        # env(1) so they reach gdb even when the launcher does not propagate
+        # the caller's environment to spawned ranks.
+        gdb_cmd = ("env -u PYTHONHOME -u PYTHONPATH DROPSONDE_CONFIG={} "
+                   "gdb --batch -x {} {}").format(
+                       shlex.quote(cfgpath), shlex.quote(script),
+                       shlex.quote(exe))
+        cmd = shlex.split(launch_tpl.replace("{gdb}", gdb_cmd)
+                                    .replace("{exe}", exe))
+    else:
+        cmd = ["gdb", "--batch", "-x", script, exe]
     logpath = os.path.join(roledir, "gdb.log")
     log = open(logpath, "w")
     proc = subprocess.Popen(
-        ["gdb", "--batch", "-x", os.path.join(HERE, "dropsonde_gdb.py"), exe],
-        cwd=rundir, env=env, stdout=log, stderr=subprocess.STDOUT)
+        cmd, cwd=rundir, env=env, stdout=log, stderr=subprocess.STDOUT)
     print("dropsonde: {} run launched (pid {}, log {})".format(
         role, proc.pid, logpath))
     return proc, logpath, log
@@ -431,6 +446,16 @@ def main():
                          "pseudo-args instead of being skipped. Needed for "
                          "non-CCPP code like the SE dycore (see docs/"
                          "capture_se_dycore.json). Debug (-O0) builds only")
+    ap.add_argument("--launch", default=None, metavar="TEMPLATE",
+                    help="launcher template for running the gdb side under "
+                         "MPI, e.g. 'mpiexec -n 1 {gdb} : -n 63 {exe}' "
+                         "(MPMD one-rank: gdb instruments rank 0, all other "
+                         "ranks run the plain executable; valid only when "
+                         "both runs use the same decomposition, which "
+                         "same-model mode guarantees). {gdb} expands to the "
+                         "batch gdb invocation, {exe} to the executable "
+                         "path. Without --launch the executable runs "
+                         "directly under gdb (serial / NTASKS=1)")
     ap.add_argument("--step-offset", type=int, default=None, metavar="N",
                     help="reference-side timestep pairing with step t is "
                          "t+N (default 1 with --sdf: FPHYStest snapshot "
@@ -642,6 +667,7 @@ def main():
              "step_offset": offset,
              "roles": {"c": role_c, "s": role_s},
              "step_sentinel": sentinel,
+             "launch": args.launch,
              spec_key: spec_abs, "intents": intents,
              "portable": suite_portable,
              "capture": capture,
@@ -664,16 +690,20 @@ def main():
     # runs try both known layouts and skip gracefully (e.g. CTSM has none).
     probe_c = "auto" if targets_mode else "cnst_name"
     probe_s = "auto" if targets_mode else "const_props"
+    # Absolute case paths: gdb (and, under --launch, the plain MPI ranks)
+    # resolve the executable from the RUN directory, not the caller's cwd,
+    # so a relative --base/--cam would fail only at exec time.
     runs = []
     if not skip_c:
         runs.append((role_c,
-                      launch(role_c, case_c, uniq, outdir,
+                      launch(role_c, cam_abs, uniq, outdir,
                              args.steps + offset, portable_c,
-                             capture, sentinel, probe_c)))
+                             capture, sentinel, probe_c, args.launch)))
     if not skip_s:
         runs.append((role_s,
-                      launch(role_s, case_s, uniq, outdir, args.steps,
-                             portable_s, capture, sentinel, probe_s)))
+                      launch(role_s, sima_abs, uniq, outdir, args.steps,
+                             portable_s, capture, sentinel, probe_s,
+                             args.launch)))
     if runs:
         print("dropsonde: waiting for runs to finish ...")
         try:

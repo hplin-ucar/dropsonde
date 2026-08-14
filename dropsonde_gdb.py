@@ -69,9 +69,23 @@ MANIFEST = {
     "dim_order": DIM_ORDER,
     "breakpoints": {},        # scheme -> resolved spec | "missing"
     "constituents": None,     # ordered names (CAM short / CCPP standard)
+    "mpi_rank": None,         # instrumented rank under an MPI launcher
     "hits": [],               # one record per scheme entry, execution order
     "notes": [],
 }
+
+# Under an MPI launcher (MPMD one-rank mode) the launcher exports the rank
+# to the process it spawns -- which is gdb itself, so the variables are
+# visible here. Recorded for provenance; None when not under MPI.
+for _rv in ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "PALS_RANKID",
+            "SLURM_PROCID", "MV2_COMM_WORLD_RANK"):
+    _rval = os.environ.get(_rv)
+    if _rval is not None:
+        try:
+            MANIFEST["mpi_rank"] = int(_rval)
+        except ValueError:
+            continue
+        break
 FILE_IDX = [0]
 HIT_COUNT = {}
 
@@ -1703,6 +1717,15 @@ def setup():
     gdb.execute("set confirm off")
     gdb.execute("set breakpoint pending off")
     gdb.execute("set width unlimited")
+    if CFG.get("mpi_launch"):
+        # Under an MPI launcher the rank's PMI channel arrives as an open
+        # file descriptor (hydra: PMI_FD); gdb's default shell startup
+        # loses inherited fds, so MPI_Init dies with "Bad file descriptor"
+        # (calibrated on Izumi mvapich2 + gdb 8.2). Direct exec preserves
+        # them. Side constraint: no inferior arguments with whitespace on
+        # gdb 8.2 -- cesm.exe takes none.
+        gdb.execute("set startup-with-shell off")
+        note("MPI launch: startup-with-shell off (preserve PMI fd)")
     # don't let gdb print frame args at every stop: slow and floods the
     # log (and pre-'next', explicit-shape dummies have garbage bounds)
     gdb.execute("set print frame-arguments none")
@@ -1819,7 +1842,20 @@ def main():
             # untouched (errmsg=''/errflg=0 don't modify physical args).
             frame = gdb.newest_frame()
             body = _first_body_line(entry.scheme, frame)
+            # Small subroutines with no descriptor setup (plain explicit-
+            # shape dummies) stop AT the first executable statement already;
+            # advancing to the line we are on would run to the NEXT visit
+            # of that line -- usually straight out of the frame. Capture in
+            # place instead.
+            at_body = False
             if body is not None:
+                try:
+                    sal = frame.find_sal()
+                    at_body = (sal.symtab.fullname() == body[0] and
+                               sal.line >= body[1])
+                except Exception:
+                    pass
+            if body is not None and not at_body:
                 try:
                     gdb.execute("advance {}:{}".format(
                         os.path.basename(body[0]), body[1]))
@@ -1840,7 +1876,7 @@ def main():
                 except gdb.error as exc:
                     note("{}: advance to body line {} failed: {}".format(
                         entry.scheme, body[1], exc))
-            else:
+            elif body is None:
                 # No body marker found: fall back to the historical single
                 # 'next', which suffices for short argument lists.
                 note("{}: no body marker found; single-next fallback".format(
