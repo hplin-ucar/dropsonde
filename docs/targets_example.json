@@ -1,0 +1,15 @@
+{
+  "spec": "dropsonde-targets-v1",
+  "comment": "Same-model (--base/--test) comparison points. Each target is a subroutine present in both binaries; a plain string means the same symbol on both sides, and per-side symbols exist for deliberate renames (refactors). step_sentinel names a once-per-timestep subroutine used to tag hits and auto-terminate the runs (default cam_run1; CTSM would use clm_drv). The optional capture table is the capture-v1 types shape: derived-type dummies of these types expand into per-component pseudo-args, so a per-model preset is one file.",
+  "step_sentinel": "cam_run1",
+  "targets": [
+    "vertical_diffusion_tend",
+    "gw_drag_cam_tend",
+    {"sub": "aero_model_drydep"},
+    {"sub": "convect_deep_tend", "test": "convect_deep_tend_refactored"}
+  ],
+  "capture": {
+    "physics_state": ["t", "q", "u", "v", "s", "ps", "pdel", "omega"],
+    "physics_ptend": ["name", "s", "q", "u", "v"]
+  }
+}

@@ -33,6 +33,16 @@ KILL_AFTER = CFG.get("kill_after_steps", 0)  # 0 = run to natural exit
 # of the SIMA-only <scheme>_run CCPP wrapper. See parse_portable_map in the
 # dropsonde driver.
 PORTABLE = CFG.get("portable", {}) or {}
+# Once-per-timestep sentinel subroutine (hit tags + auto-terminate); the
+# historical default is CAM's cam_run1, per-model presets override it
+# (e.g. CTSM's clm_drv).
+SENTINEL = CFG.get("step_sentinel") or "cam_run1"
+# Which constituent-name layout to read: "cnst_name" (CAM), "const_props"
+# (CAM-SIMA), "auto" (same-model mode: try both, missing is fine). Default
+# derived from the historical role names for configs written by older
+# drivers.
+CONST_PROBE = CFG.get("const_probe") or (
+    "cnst_name" if ROLE == "cam" else "const_props")
 # {derived_type_name_lower: [component paths]}: derived-type dummies whose
 # type matches a key are expanded into per-component pseudo-args
 # (e.g. elem%state%v) instead of being skipped. Authored as a JSON spec
@@ -1529,62 +1539,87 @@ def _gnu_const_names(prefix, n):
     return names
 
 
+def _cnst_name_names():
+    """Constituent names from CAM's constituents module:
+    character(len=16) :: cnst_name(pcnst)."""
+    arr = None
+    for expr in ("constituents::cnst_name",
+                 "__constituents_MOD_cnst_name", "cnst_name"):
+        try:
+            arr = gdb.parse_and_eval(expr)
+            break
+        except gdb.error:
+            continue
+    if arr is None:
+        raise gdb.error("cnst_name not found by any spelling")
+    total = arr.type.sizeof
+    # element sizeof gives the character length regardless of how
+    # gdb orders the array-of-strings dimensions
+    width = gdb.parse_and_eval(expr + "(1)").type.sizeof
+    n = total // width
+    raw = bytes(gdb.selected_inferior().read_memory(
+        int(arr.address), total))
+    return [raw[i * width:(i + 1) * width].decode("latin-1").strip()
+            for i in range(n)]
+
+
+def _const_props_names():
+    """Constituent standard names from CAM-SIMA's cam_constituents module:
+    const_props(:) + num_constituents. Linker-name spellings can hit
+    "unknown type" (gdb 16.2), so try the Fortran module:: syntax first."""
+    n = None
+    base = None
+    for prefix in ("cam_constituents::", "__cam_constituents_MOD_",
+                   ""):
+        try:
+            n = int(gdb.parse_and_eval(prefix + "num_constituents"))
+            base = prefix
+            break
+        except gdb.error:
+            continue
+    if n is None:
+        raise gdb.error(
+            "num_constituents not found by any spelling")
+    if compiler() == "intel":
+        # gdb 8.2 can't index Intel's pointer-array descriptor; decode
+        # const_props from raw memory.
+        return _intel_const_names(base, n)
+    if OPTIMIZED[0]:
+        # -O2 subscript evaluation can abort gdb; decode raw instead.
+        return _gnu_const_names(base, n)
+    names = []
+    for i in range(1, n + 1):
+        try:
+            names.append(_string_at(
+                "{}const_props({})%prop%var_std_name".format(
+                    base, i)))
+        except Exception as exc:
+            names.append("<unreadable: {}>".format(exc))
+    return names
+
+
 def dump_constituents():
     try:
-        if ROLE == "cam":
-            # character(len=16) :: cnst_name(pcnst) in module constituents
-            arr = None
-            for expr in ("constituents::cnst_name",
-                         "__constituents_MOD_cnst_name", "cnst_name"):
-                try:
-                    arr = gdb.parse_and_eval(expr)
-                    break
-                except gdb.error:
-                    continue
-            if arr is None:
-                raise gdb.error("cnst_name not found by any spelling")
-            total = arr.type.sizeof
-            # element sizeof gives the character length regardless of how
-            # gdb orders the array-of-strings dimensions
-            width = gdb.parse_and_eval(expr + "(1)").type.sizeof
-            n = total // width
-            raw = bytes(gdb.selected_inferior().read_memory(
-                int(arr.address), total))
-            names = [raw[i * width:(i + 1) * width].decode("latin-1").strip()
-                     for i in range(n)]
+        if CONST_PROBE == "cnst_name":
+            names = _cnst_name_names()
+        elif CONST_PROBE == "const_props":
+            names = _const_props_names()
         else:
-            # cam_constituents module: const_props(:) + num_constituents.
-            # Linker-name spellings can hit "unknown type" (gdb 16.2), so
-            # try the Fortran module:: syntax first.
-            n = None
-            base = None
-            for prefix in ("cam_constituents::", "__cam_constituents_MOD_",
-                           ""):
+            # auto (same-model mode): try both known layouts; a model with
+            # neither (e.g. CTSM) is fine -- constituent-indexed arrays are
+            # then compared element-wise, which is correct when both sides
+            # share one registry anyway.
+            try:
+                names = _cnst_name_names()
+            except Exception:
                 try:
-                    n = int(gdb.parse_and_eval(prefix + "num_constituents"))
-                    base = prefix
-                    break
-                except gdb.error:
-                    continue
-            if n is None:
-                raise gdb.error(
-                    "num_constituents not found by any spelling")
-            if compiler() == "intel":
-                # gdb 8.2 can't index Intel's pointer-array descriptor; decode
-                # const_props from raw memory.
-                names = _intel_const_names(base, n)
-            elif OPTIMIZED[0]:
-                # -O2 subscript evaluation can abort gdb; decode raw instead.
-                names = _gnu_const_names(base, n)
-            else:
-                names = []
-                for i in range(1, n + 1):
-                    try:
-                        names.append(_string_at(
-                            "{}const_props({})%prop%var_std_name".format(
-                                base, i)))
-                    except Exception as exc:
-                        names.append("<unreadable: {}>".format(exc))
+                    names = _const_props_names()
+                except Exception:
+                    note("no constituent module found (cnst_name/"
+                         "const_props); constituent-indexed arrays "
+                         "compared element-wise")
+                    MANIFEST["constituents"] = []
+                    return
         MANIFEST["constituents"] = names
         note("captured {} constituent names".format(len(names)))
     except Exception as exc:
@@ -1604,7 +1639,8 @@ class EntryBP(gdb.Breakpoint):
 
 
 class StepBP(gdb.Breakpoint):
-    """Sentinel on cam_run1: fires once at the start of every timestep."""
+    """Sentinel on the step subroutine (default cam_run1): fires once at
+    the start of every timestep."""
     pass
 
 
@@ -1707,11 +1743,19 @@ def setup():
             resolved += 1
     note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
 
-    step_bp = _make_bp(StepBP, ("cam_run1", "__cam_comp_MOD_cam_run1",
-                                lambda: _qualified("cam_run1")))
+    if SENTINEL == "cam_run1":
+        # keep the calibrated linker-name fast path for the historical
+        # default; a generic sentinel gets the bare DWARF name plus the
+        # module-qualified sweep (covers Intel's mangling)
+        sent_specs = ("cam_run1", "__cam_comp_MOD_cam_run1",
+                      lambda: _qualified("cam_run1"))
+    else:
+        sent_specs = (SENTINEL, lambda: _qualified(SENTINEL))
+    step_bp = _make_bp(StepBP, sent_specs)
     if step_bp is None:
-        note("WARNING: cam_run1 sentinel not found; hits will not be "
-             "timestep-tagged and the run will not auto-terminate")
+        note("WARNING: {} sentinel not found; hits will not be "
+             "timestep-tagged and the run will not auto-terminate"
+             .format(SENTINEL))
     return resolved
 
 

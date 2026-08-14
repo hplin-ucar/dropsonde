@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
-"""dropsonde -- find where CAM and CAM-SIMA physics answers diverge.
+"""dropsonde -- find where two model runs' answers diverge.
 
-Runs a dechunked single-rank CAM case and a CAM-SIMA case under gdb with
-breakpoints at every CCPP scheme entry/exit listed in the SDF, dumps the
-scheme arguments to disk, and reports the first divergence.
+Runs both cases under gdb with breakpoints at a list of subroutine
+entries/exits, dumps the subroutine arguments to disk, and reports the
+first divergence.
 
-Usage:
+Cross-model mode (CAM vs CAM-SIMA, the original workflow):
   ./dropsonde --cam  /scratch/.../cam_case  \
               --sima /scratch/.../sima_case \
               --sdf  suite_x.xml [--steps 2] [--out dropsonde_out]
-
-Requirements:
-  - Case dirs contain bld/cesm.exe and a populated run/ directory
-    (preview_namelists already run).
+  Comparison points come from the SDF's CCPP schemes (plus
+  dropsonde:portable annotations); intents from .meta files.
   - CAM:      DEBUG, GNU, NTASKS=1, NTHRDS=1, pcols = total columns,
               STOP_N covering at least --steps + 1 physics timesteps.
   - CAM-SIMA: DEBUG, GNU, single rank, STOP_N covering at least --steps
               physics timesteps.
-  - gdb on PATH; both executables built with the same atmospheric_physics.
+  - both executables built with the same atmospheric_physics.
+
+Same-model mode (two builds of the SAME model, e.g. CAM-to-CAM after an
+unexpected regression-test answer change):
+  ./dropsonde --base /scratch/.../baseline_case \
+              --test /scratch/.../modified_case \
+              --targets cam_anchors.json [--source-root ~/CAM/src]
+  Comparison points come from a dropsonde-targets-v1 subroutine list;
+  identical decomposition (PE layout, chunking, threading) in both cases
+  is assumed -- no dechunking or NTASKS=1 requirement. Report labels
+  become base/test.
+
+Requirements: case dirs contain bld/cesm.exe and a populated run/
+directory (preview_namelists already run); gdb on PATH.
 
 Python 3.6 compatible; stdlib only (no numpy anywhere).
 """
@@ -184,6 +195,23 @@ def parse_fortran_intents(meta_root, portable):
     return out
 
 
+def _capture_types(types, bad):
+    """Validated {type_lower: [component paths]} from a capture-v1 types
+    table (the body of a --capture spec, or a targets spec's inline
+    "capture" table)."""
+    if not isinstance(types, dict) or not types:
+        bad("types must map derived-type names to component-path lists")
+    out = {}
+    for tname, paths in types.items():
+        if (not isinstance(paths, list) or not paths or
+                not all(isinstance(p, str) and p.strip() for p in paths)):
+            bad("type {!r}: component paths must be a non-empty list of "
+                "strings".format(tname))
+        out[tname.strip().lower()] = [p.strip().lower().replace(" ", "")
+                                      for p in paths]
+    return out
+
+
 def load_capture(path):
     """{derived_type_name_lower: [component paths]} from a
     dropsonde-capture-v1 JSON spec (--capture). Exits with a clear message
@@ -197,18 +225,58 @@ def load_capture(path):
         bad(exc)
     if spec.get("spec") != "dropsonde-capture-v1":
         bad('missing/unknown spec tag (want "spec": "dropsonde-capture-v1")')
-    types = spec.get("types")
-    if not isinstance(types, dict) or not types:
-        bad("types must map derived-type names to component-path lists")
-    out = {}
-    for tname, paths in types.items():
-        if (not isinstance(paths, list) or not paths or
-                not all(isinstance(p, str) and p.strip() for p in paths)):
-            bad("type {!r}: component paths must be a non-empty list of "
-                "strings".format(tname))
-        out[tname.strip().lower()] = [p.strip().lower().replace(" ", "")
-                                      for p in paths]
-    return out
+    return _capture_types(spec.get("types"), bad)
+
+
+def load_targets(path):
+    """(targets, step_sentinel, capture) from a dropsonde-targets-v1 JSON
+    spec (--targets). targets is an ordered list of
+    {"sub": tag, "base": symbol, "test": symbol}; a plain-string entry is
+    shorthand for the same symbol on both sides, and per-side symbols exist
+    for deliberate renames (refactors). "step_sentinel" names a
+    once-per-timestep subroutine (default cam_run1); an optional "capture"
+    table (capture-v1 types shape) travels inside the spec so a per-model
+    preset is a single file. Exits with a clear message on a malformed
+    spec."""
+    def bad(msg):
+        sys.exit("dropsonde: invalid targets spec {}: {}".format(path, msg))
+    try:
+        with open(path) as f:
+            spec = json.load(f)
+    except (OSError, ValueError) as exc:
+        bad(exc)
+    if spec.get("spec") != "dropsonde-targets-v1":
+        bad('missing/unknown spec tag (want "spec": "dropsonde-targets-v1")')
+    raw = spec.get("targets")
+    if not isinstance(raw, list) or not raw:
+        bad("targets must be a non-empty list")
+    targets = []
+    seen = set()
+    for i, t in enumerate(raw):
+        if isinstance(t, str):
+            t = {"sub": t}
+        if not isinstance(t, dict) or not isinstance(t.get("sub"), str) \
+                or not t["sub"].strip():
+            bad("target {}: need a subroutine name string or an object "
+                'with "sub"'.format(i))
+        unknown = set(t) - {"sub", "base", "test"}
+        if unknown:
+            bad("target {!r}: unknown key(s): {}".format(
+                t["sub"], ", ".join(sorted(unknown))))
+        sub = t["sub"].strip()
+        if sub in seen:
+            bad("duplicate target {!r}".format(sub))
+        seen.add(sub)
+        targets.append({"sub": sub,
+                        "base": (t.get("base") or sub).strip(),
+                        "test": (t.get("test") or sub).strip()})
+    sentinel = spec.get("step_sentinel", "cam_run1")
+    if not isinstance(sentinel, str) or not sentinel.strip():
+        bad("step_sentinel must be a subroutine name")
+    capture = {}
+    if spec.get("capture") is not None:
+        capture = _capture_types(spec["capture"], bad)
+    return targets, sentinel.strip(), capture
 
 
 def parse_meta_intents(meta_root, schemes):
@@ -264,7 +332,7 @@ def find_meta_root(sdf_abs):
 
 
 def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
-           capture):
+           capture, step_sentinel, const_probe):
     exe = os.path.join(casedir, "bld", "cesm.exe")
     rundir = os.path.join(casedir, "run")
     if not os.path.isfile(exe):
@@ -278,7 +346,9 @@ def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
     with open(cfgpath, "w") as f:
         json.dump({"role": role, "out_dir": roledir, "schemes": schemes,
                    "kill_after_steps": kill_after_steps,
-                   "portable": portable, "capture": capture}, f, indent=1)
+                   "portable": portable, "capture": capture,
+                   "step_sentinel": step_sentinel,
+                   "const_probe": const_probe}, f, indent=1)
 
     env = dict(os.environ, DROPSONDE_CONFIG=cfgpath)
     # Some sites (e.g. Izumi) point PYTHONHOME/PYTHONPATH at an anaconda whose
@@ -300,17 +370,36 @@ def launch(role, casedir, schemes, outdir, kill_after_steps, portable,
 def main():
     ap = argparse.ArgumentParser(
         prog="dropsonde",
-        description="Locate the first CCPP scheme where CAM and CAM-SIMA "
-                    "answers diverge.")
-    ap.add_argument("--cam", required=True, help="CAM case scratch dir")
-    ap.add_argument("--sima", required=True, help="CAM-SIMA case scratch dir")
-    ap.add_argument("--sdf", required=True, help="suite definition file (XML)")
+        description="Locate the first subroutine where two model runs' "
+                    "answers diverge. Cross-model mode (--cam/--sima/--sdf) "
+                    "compares CAM against CAM-SIMA at the CCPP schemes of "
+                    "an SDF; same-model mode (--base/--test/--targets) "
+                    "compares two builds of the SAME model at an explicit "
+                    "subroutine list.")
+    ap.add_argument("--cam", help="CAM case scratch dir (cross-model mode)")
+    ap.add_argument("--sima", help="CAM-SIMA case scratch dir "
+                                   "(cross-model mode)")
+    ap.add_argument("--sdf", help="suite definition file (XML; "
+                                  "cross-model mode)")
+    ap.add_argument("--base", help="reference case scratch dir "
+                                   "(same-model mode)")
+    ap.add_argument("--test", help="modified case scratch dir "
+                                   "(same-model mode)")
+    ap.add_argument("--targets", default=None, metavar="SPEC.json",
+                    help="dropsonde-targets-v1 subroutine list (same-model "
+                         "mode): the comparison points, an optional "
+                         "step_sentinel, an optional capture table; see "
+                         "docs/targets_example.json")
+    ap.add_argument("--source-root", default=None,
+                    help="same-model mode: source tree searched for the "
+                         "targets' Fortran intent() declarations, so "
+                         "intent(out) args are not compared at entry; "
+                         "without it those comparisons are noisy")
     ap.add_argument("--steps", type=int, default=1,
-                    help="physics timesteps to compare (default 1: in "
-                         "FPHYStest snapshot runs every timestep is "
-                         "independent, so CAM step 2 vs SIMA step 1 is "
-                         "decisive); CAM contributes steps+1, its first "
-                         "being skipped")
+                    help="timesteps to compare (default 1). Cross-model "
+                         "FPHYStest snapshot runs are decisive at 1 (every "
+                         "timestep is independent; CAM contributes "
+                         "steps+offset, its first being skipped)")
     ap.add_argument("--out", default="dropsonde_out", help="dump directory")
     ap.add_argument("--meta-root", default=None,
                     help="root to search for CCPP .meta files "
@@ -324,6 +413,10 @@ def main():
     ap.add_argument("--skip-sima", action="store_true",
                     help="skip the SIMA gdb run and reuse existing SIMA "
                          "captures in --out")
+    ap.add_argument("--skip-base", action="store_true",
+                    help="same-model mode: reuse existing base captures")
+    ap.add_argument("--skip-test", action="store_true",
+                    help="same-model mode: reuse existing test captures")
     ap.add_argument("--realign", default=None, metavar="SPEC.json",
                     help="constituent-index realignment spec for portable "
                          "subroutines called from different index "
@@ -338,61 +431,143 @@ def main():
                          "pseudo-args instead of being skipped. Needed for "
                          "non-CCPP code like the SE dycore (see docs/"
                          "capture_se_dycore.json). Debug (-O0) builds only")
-    ap.add_argument("--step-offset", type=int, default=1, metavar="N",
-                    help="CAM timestep pairing with SIMA step t is t+N "
-                         "(default 1: FPHYStest snapshot runs, where CAM's "
-                         "first step is skipped; use 0 when both models "
-                         "run freely from identical initial conditions, "
-                         "e.g. SE dycore comparisons)")
+    ap.add_argument("--step-offset", type=int, default=None, metavar="N",
+                    help="reference-side timestep pairing with step t is "
+                         "t+N (default 1 with --sdf: FPHYStest snapshot "
+                         "runs, where CAM's first step is skipped; default "
+                         "0 with --targets: two builds running freely from "
+                         "identical initial conditions)")
     args = ap.parse_args()
-    if args.step_offset < 0:
+
+    # Mode resolution. role_c is the reference side (historically CAM),
+    # role_s the side under test (historically CAM-SIMA); the names become
+    # the <out> subdirectories and every report label.
+    targets_mode = args.targets is not None
+    if targets_mode:
+        if not (args.base and args.test):
+            sys.exit("error: --targets requires --base and --test")
+        if args.cam or args.sima or args.sdf or args.meta_root:
+            sys.exit("error: --cam/--sima/--sdf/--meta-root are cross-model "
+                     "options; with --targets use --base/--test/"
+                     "--source-root")
+        if args.skip_cam or args.skip_sima:
+            sys.exit("error: use --skip-base/--skip-test with --targets")
+        role_c, role_s = "base", "test"
+        case_c, case_s = args.base, args.test
+        skip_c, skip_s = args.skip_base, args.skip_test
+    else:
+        if not (args.cam and args.sima and args.sdf):
+            sys.exit("error: need --cam, --sima and --sdf (cross-model "
+                     "mode) or --base, --test and --targets (same-model "
+                     "mode)")
+        if args.base or args.test or args.source_root:
+            sys.exit("error: --base/--test/--source-root are same-model "
+                     "options; with --sdf use --cam/--sima/--meta-root")
+        if args.skip_base or args.skip_test:
+            sys.exit("error: use --skip-cam/--skip-sima with --sdf")
+        role_c, role_s = "cam", "sima"
+        case_c, case_s = args.cam, args.sima
+        skip_c, skip_s = args.skip_cam, args.skip_sima
+    offset = args.step_offset
+    if offset is None:
+        offset = 0 if targets_mode else 1
+    if offset < 0:
         sys.exit("error: --step-offset must be >= 0")
 
-    schemes = parse_sdf(args.sdf)
-    uniq = []
-    for s in schemes:
-        if s not in uniq:
-            uniq.append(s)
-    print("dropsonde: {} scheme calls per timestep in SDF ({} unique)".format(
-        len(schemes), len(uniq)))
+    capture_inline = {}
+    if targets_mode:
+        targets, sentinel, capture_inline = load_targets(args.targets)
+        spec_abs = os.path.abspath(args.targets)
+        spec_key = "targets"
+        schemes = [t["sub"] for t in targets]
+        uniq = schemes                     # load_targets rejects duplicates
+        print("dropsonde: {} target subroutines (sentinel: {})".format(
+            len(uniq), sentinel))
+        # Per-side breakpoint symbols: identity unless the spec renames a
+        # side (a refactor). The suite-level portable map keeps only genuine
+        # test-side retargets, for report labels.
+        portable_c = {t["sub"]: t["base"] for t in targets}
+        portable_s = {t["sub"]: t["test"] for t in targets}
+        suite_portable = {t["sub"]: t["test"] for t in targets
+                          if t["test"] != t["sub"]}
+        renamed = [t for t in targets
+                   if t["base"] != t["sub"] or t["test"] != t["sub"]]
+        if renamed:
+            print("dropsonde: per-side symbols: {}".format(", ".join(
+                "{} (base={}, test={})".format(t["sub"], t["base"], t["test"])
+                for t in renamed)))
+        intents = {}
+        if args.source_root:
+            source_root = os.path.abspath(args.source_root)
+            intents = parse_fortran_intents(source_root, portable_s)
+            print("dropsonde: intents for {}/{} targets ({} args) from "
+                  "Fortran source under {}".format(
+                      len(intents), len(uniq),
+                      sum(len(v) for v in intents.values()), source_root))
+            no_int = [s for s in uniq if s not in intents]
+            if no_int:
+                print("dropsonde: WARNING: no Fortran intents found for: {} "
+                      "-- entry intent(out) args will be compared (noisy)"
+                      .format(", ".join(no_int)))
+        else:
+            source_root = None
+            print("dropsonde: WARNING: no --source-root; entry values of "
+                  "intent(out) args will be compared (noisy)")
+        meta_root = None
+    else:
+        sentinel = "cam_run1"
+        schemes = parse_sdf(args.sdf)
+        uniq = []
+        for s in schemes:
+            if s not in uniq:
+                uniq.append(s)
+        print("dropsonde: {} scheme calls per timestep in SDF ({} unique)"
+              .format(len(schemes), len(uniq)))
 
-    sdf_abs = os.path.abspath(args.sdf)
-    meta_root = args.meta_root or find_meta_root(sdf_abs)
-    if meta_root is None:
-        meta_root = os.path.dirname(sdf_abs)
-        print("dropsonde: WARNING: no schemes/ directory found above the SDF; "
-              "falling back to {} -- set --meta-root if .meta files live "
-              "elsewhere".format(meta_root))
-    # Schemes carrying a same-line `dropsonde:portable=` SDF comment are
-    # compared at their shared portable subroutine, not the CCPP wrapper.
-    # Those get intents from the portable .F90 (no .meta exists for it);
-    # all other schemes use .meta exactly as before.
-    portable = {s: sym for s, sym in parse_portable_map(sdf_abs).items()
-                if s in uniq}
-    meta_schemes = [s for s in uniq if s not in portable]
-    intents = parse_meta_intents(meta_root, meta_schemes)
-    print("dropsonde: intents for {}/{} schemes ({} args) from .meta "
-          "under {}".format(len(intents), len(meta_schemes),
-                            sum(len(v) for v in intents.values()),
-                            meta_root))
-    if portable:
-        fort = parse_fortran_intents(meta_root, portable)
-        intents.update(fort)
-        print("dropsonde: portable overrides ({}): {}".format(
-            len(portable),
-            ", ".join("{}->{}".format(s, portable[s]) for s in portable)))
-        no_int = [s for s in portable if s not in fort]
-        if no_int:
-            print("dropsonde: WARNING: no Fortran intents found for portable "
-                  "target(s): {} -- entry intent(out) args will be compared "
-                  "(noisy)".format(", ".join(
-                      "{}({})".format(s, portable[s]) for s in no_int)))
-    if not intents:
-        print("dropsonde: WARNING: no intents found; entry values of "
-              "intent(out) args will be compared (noisy) -- set "
-              "--meta-root")
+        spec_abs = os.path.abspath(args.sdf)
+        spec_key = "sdf"
+        source_root = None
+        meta_root = args.meta_root or find_meta_root(spec_abs)
+        if meta_root is None:
+            meta_root = os.path.dirname(spec_abs)
+            print("dropsonde: WARNING: no schemes/ directory found above the "
+                  "SDF; falling back to {} -- set --meta-root if .meta files "
+                  "live elsewhere".format(meta_root))
+        # Schemes carrying a same-line `dropsonde:portable=` SDF comment are
+        # compared at their shared portable subroutine, not the CCPP wrapper.
+        # Those get intents from the portable .F90 (no .meta exists for it);
+        # all other schemes use .meta exactly as before.
+        portable = {s: sym for s, sym in parse_portable_map(spec_abs).items()
+                    if s in uniq}
+        portable_c = portable_s = suite_portable = portable
+        meta_schemes = [s for s in uniq if s not in portable]
+        intents = parse_meta_intents(meta_root, meta_schemes)
+        print("dropsonde: intents for {}/{} schemes ({} args) from .meta "
+              "under {}".format(len(intents), len(meta_schemes),
+                                sum(len(v) for v in intents.values()),
+                                meta_root))
+        if portable:
+            fort = parse_fortran_intents(meta_root, portable)
+            intents.update(fort)
+            print("dropsonde: portable overrides ({}): {}".format(
+                len(portable),
+                ", ".join("{}->{}".format(s, portable[s]) for s in portable)))
+            no_int = [s for s in portable if s not in fort]
+            if no_int:
+                print("dropsonde: WARNING: no Fortran intents found for "
+                      "portable target(s): {} -- entry intent(out) args will "
+                      "be compared (noisy)".format(", ".join(
+                          "{}({})".format(s, portable[s]) for s in no_int)))
+        if not intents:
+            print("dropsonde: WARNING: no intents found; entry values of "
+                  "intent(out) args will be compared (noisy) -- set "
+                  "--meta-root")
 
-    capture = load_capture(args.capture) if args.capture else {}
+    # A --capture file merges over (and overrides) any capture table carried
+    # inside a targets spec.
+    capture = dict(capture_inline)
+    if args.capture:
+        capture.update(load_capture(args.capture))
     if capture:
         print("dropsonde: capture spec: {} derived type(s): {}".format(
             len(capture),
@@ -401,8 +576,8 @@ def main():
 
     outdir = os.path.abspath(args.out)
     os.makedirs(outdir, exist_ok=True)
-    cam_abs = os.path.abspath(args.cam)
-    sima_abs = os.path.abspath(args.sima)
+    cam_abs = os.path.abspath(case_c)
+    sima_abs = os.path.abspath(case_s)
 
     # --realign: validate up front (differ.load_realign exits with a clear
     # message on a bad spec -- fail before the model runs, not after) and
@@ -423,12 +598,12 @@ def main():
         print("dropsonde: removed stale {} (no --realign given)".format(
             realign_dest))
 
-    # --skip-cam / --skip-sima: validate that the existing captures in --out
-    # came from the same case directory, SDF, and --steps the user is
-    # pointing at now -- suite.json is rewritten below with the NEW values,
-    # so a mismatch would silently relabel stale captures.
-    for skip, role, case_abs in ((args.skip_cam, "cam", cam_abs),
-                                 (args.skip_sima, "sima", sima_abs)):
+    # --skip-*: validate that the existing captures in --out came from the
+    # same case directory, spec file, and --steps the user is pointing at
+    # now -- suite.json is rewritten below with the NEW values, so a
+    # mismatch would silently relabel stale captures.
+    for skip, role, case_abs in ((skip_c, role_c, cam_abs),
+                                 (skip_s, role_s, sima_abs)):
         if not skip:
             continue
         manifest = os.path.join(outdir, role, "manifest.json")
@@ -441,9 +616,9 @@ def main():
             with open(suite_path) as f:
                 prev = json.load(f)
             checks = ((role + "_case", case_abs, "--" + role),
-                      ("sdf", sdf_abs, "--sdf"),
+                      (spec_key, spec_abs, "--" + spec_key),
                       ("steps", args.steps, "--steps"),
-                      ("step_offset", args.step_offset, "--step-offset"))
+                      ("step_offset", offset, "--step-offset"))
             for key, now, flag in checks:
                 prev_val = prev.get(key)
                 if prev_val is None:
@@ -463,32 +638,42 @@ def main():
             role, outdir))
 
     version = git_version()
+    suite = {"schemes": schemes, "steps": args.steps,
+             "step_offset": offset,
+             "roles": {"c": role_c, "s": role_s},
+             "step_sentinel": sentinel,
+             spec_key: spec_abs, "intents": intents,
+             "portable": suite_portable,
+             "capture": capture,
+             "realign": realign_abs,
+             "version": version,
+             role_c + "_case": cam_abs,
+             role_s + "_case": sima_abs}
+    if targets_mode:
+        suite["source_root"] = source_root
+    else:
+        suite["meta_root"] = meta_root
     with open(os.path.join(outdir, "suite.json"), "w") as f:
-        json.dump({"schemes": schemes, "steps": args.steps,
-                   "step_offset": args.step_offset,
-                   "sdf": sdf_abs, "intents": intents,
-                   "portable": portable,
-                   "capture": capture,
-                   "realign": realign_abs,
-                   "version": version,
-                   "cam_case": cam_abs,
-                   "sima_case": sima_abs,
-                   "meta_root": meta_root}, f, indent=1)
+        json.dump(suite, f, indent=1)
 
-    # CAM dumps steps+offset timesteps (SIMA step t pairs with CAM step
-    # t+offset); SIMA dumps steps. The gdb side kills each run at the start
-    # of the timestep after that, so STOP_N only needs to be long enough
-    # (e.g. CAM's 6-step minimum).
+    # The reference side dumps steps+offset timesteps (step t pairs with
+    # step t+offset); the test side dumps steps. The gdb side kills each
+    # run at the start of the timestep after that, so STOP_N only needs to
+    # be long enough (e.g. CAM's 6-step minimum).
+    # Constituent-name probe: model-specific in cross-model mode; same-model
+    # runs try both known layouts and skip gracefully (e.g. CTSM has none).
+    probe_c = "auto" if targets_mode else "cnst_name"
+    probe_s = "auto" if targets_mode else "const_props"
     runs = []
-    if not args.skip_cam:
-        runs.append(("cam",
-                      launch("cam", args.cam, uniq, outdir,
-                             args.steps + args.step_offset, portable,
-                             capture)))
-    if not args.skip_sima:
-        runs.append(("sima",
-                      launch("sima", args.sima, uniq, outdir, args.steps,
-                             portable, capture)))
+    if not skip_c:
+        runs.append((role_c,
+                      launch(role_c, case_c, uniq, outdir,
+                             args.steps + offset, portable_c,
+                             capture, sentinel, probe_c)))
+    if not skip_s:
+        runs.append((role_s,
+                      launch(role_s, case_s, uniq, outdir, args.steps,
+                             portable_s, capture, sentinel, probe_s)))
     if runs:
         print("dropsonde: waiting for runs to finish ...")
         try:

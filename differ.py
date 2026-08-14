@@ -61,6 +61,17 @@ def skip_arg(arg):
             (arg.startswith(".tmp.") and ".len_V$" in arg))
 
 
+# Role names: the directory names under <out> and the labels used in every
+# user-visible report line. ROLE_S is the second/"new" side (historically
+# CAM-SIMA), ROLE_C the reference side (historically CAM). Same-model runs
+# rename them (e.g. test/base) via suite.json {"roles": {"s":..., "c":...}};
+# _report() sets these before any comparison so a CAM-to-CAM report never
+# says "sima". Internal identifiers (sima_names, cam_g, srec/crec, ...) keep
+# the historical spellings -- only labels and lookups are parameterized.
+ROLE_S = "sima"
+ROLE_C = "cam"
+
+
 def _arg_intent(sch_int, arg):
     """Intent of an arg; a derived-type component pseudo-arg (elem%state%v,
     from a --capture spec) falls back to the intent of its root dummy."""
@@ -203,9 +214,9 @@ def array_diff_text(sdata, cdata, dt, extents, los):
         return "byte-level difference only (padding?)"
     d, li, x, y = worst
     return ("{}/{} elements differ, max |diff| {:.3e} at {}: "
-            "sima={} cam={}".format(count, len(va), d,
-                                    lin_to_sub(li, extents, los),
-                                    fmt_val(x), fmt_val(y)))
+            "{}={} {}={}".format(count, len(va), d,
+                                 lin_to_sub(li, extents, los),
+                                 ROLE_S, fmt_val(x), ROLE_C, fmt_val(y)))
 
 
 def _exit_diff_written_only(sdata, cdata, s_entry, c_entry, dt, extents,
@@ -249,9 +260,10 @@ def _exit_diff_written_only(sdata, cdata, s_entry, c_entry, dt, extents,
     extra = (" (+{} elements never written in either model, "
              "not compared)".format(ignored)) if ignored else ""
     return ("{}/{} elements differ{}, max |diff| {:.3e} at {}: "
-            "sima={} cam={}".format(count, n, extra, d,
-                                    lin_to_sub(li, extents, los),
-                                    fmt_val(x), fmt_val(y)), ignored)
+            "{}={} {}={}".format(count, n, extra, d,
+                                 lin_to_sub(li, extents, los),
+                                 ROLE_S, fmt_val(x), ROLE_C, fmt_val(y)),
+            ignored)
 
 
 # Never-initialized memory read as float64 is dominated by values no model
@@ -354,10 +366,10 @@ class Reporter(object):
             c[0 if phase == "entry" else 1] += 1
         if phase == "entry":
             t = " ".join([text] + list(extra_lines or []))
-            s_nan = "sima=nan" in t or "sima=-nan" in t
-            c_nan = "cam=nan" in t or "cam=-nan" in t
+            s_nan = (ROLE_S + "=nan") in t or (ROLE_S + "=-nan") in t
+            c_nan = (ROLE_C + "=nan") in t or (ROLE_C + "=-nan") in t
             if s_nan != c_nan:
-                self.nan_args.append((arg, "sima" if s_nan else "cam"))
+                self.nan_args.append((arg, ROLE_S if s_nan else ROLE_C))
         tag = "INPUTS DIFFER" if phase == "entry" else "OUTPUTS DIFFER"
         head = "  [{}] {} (hit {}) arg {}: {}".format(
             tag, scheme, hit, arg, text)
@@ -547,14 +559,16 @@ def _compare_species_axis(label, hit, phase, arg, sdata, cdata, dt, sext, cext,
         if not res_ext:                        # one element per species
             txt = None
             if ss != cs:
-                txt = "sima={} cam={}".format(fmt_val(unpack(ss, dt)[0]),
-                                              fmt_val(unpack(cs, dt)[0]))
+                txt = "{}={} {}={}".format(ROLE_S,
+                                           fmt_val(unpack(ss, dt)[0]),
+                                           ROLE_C,
+                                           fmt_val(unpack(cs, dt)[0]))
         else:
             txt = array_diff_text(ss, cs, dt, res_ext, res_los)
         if txt:
             diff_names.append(cn)
-            lines.append("{} (cam idx {}, sima idx {}) <-> {}: {}".format(
-                cn, ci + 1, sj + 1, sn, txt))
+            lines.append("{} ({} idx {}, {} idx {}) <-> {}: {}".format(
+                cn, ROLE_C, ci + 1, ROLE_S, sj + 1, sn, txt))
     if lines:
         rep.diff(label, hit, phase, arg,
                  "constituent-indexed array ({}, per-model local "
@@ -585,9 +599,9 @@ def _compare_metadata_valid(label, hit, phase, arg, sdata, cdata, dt, ext,
         d, li, x, y = worst
         rep.diff(label, hit, phase, arg,
                  "{}/{} valid slots differ (unused padding ignored), max "
-                 "|diff| {:.3e} at {}: sima={} cam={}".format(
+                 "|diff| {:.3e} at {}: {}={} {}={}".format(
                      count, len(valid), d, lin_to_sub(li, ext, los),
-                     fmt_val(x), fmt_val(y)))
+                     ROLE_S, fmt_val(x), ROLE_C, fmt_val(y)))
 
 
 def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
@@ -610,19 +624,21 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
         if kind not in captured and cinfo.get("kind") not in captured:
             if phase == "entry":
                 rep.note("{} (hit {}): arg {} not captured on either side: "
-                         "sima {} / cam {}".format(
-                             label, hit, arg, kdesc(sinfo), kdesc(cinfo)))
+                         "{} {} / {} {}".format(
+                             label, hit, arg, ROLE_S, kdesc(sinfo),
+                             ROLE_C, kdesc(cinfo)))
             return
         if phase == "entry":
             rep.diff(label, hit, phase, arg,
-                     "argument kind mismatch: sima {} vs cam {}".format(
-                         kdesc(sinfo), kdesc(cinfo)))
+                     "argument kind mismatch: {} {} vs {} {}".format(
+                         ROLE_S, kdesc(sinfo), ROLE_C, kdesc(cinfo)))
         return
     if kind == "error":
         if phase == "entry":
             rep.note("{} (hit {}): arg {} capture errored on both sides: "
-                     "sima {} / cam {}".format(label, hit, arg,
-                                               kdesc(sinfo), kdesc(cinfo)))
+                     "{} {} / {} {}".format(label, hit, arg,
+                                            ROLE_S, kdesc(sinfo),
+                                            ROLE_C, kdesc(cinfo)))
         return
 
     if kind == "array":
@@ -634,8 +650,8 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
         if dt != cinfo.get("dtype"):
             if phase == "entry":
                 rep.diff(label, hit, phase, arg,
-                         "dtype mismatch: sima {} vs cam {}".format(
-                             dt, cinfo.get("dtype")))
+                         "dtype mismatch: {} {} vs {} {}".format(
+                             ROLE_S, dt, ROLE_C, cinfo.get("dtype")))
             return
         sext = sinfo["extents"]
         cext = cinfo["extents"]
@@ -683,17 +699,17 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
                     # one element per species: just show the two values
                     txt = None
                     if ss != cs:
-                        txt = "sima={} cam={}".format(
-                            fmt_val(unpack(ss, dt)[0]),
-                            fmt_val(unpack(cs, dt)[0]))
+                        txt = "{}={} {}={}".format(
+                            ROLE_S, fmt_val(unpack(ss, dt)[0]),
+                            ROLE_C, fmt_val(unpack(cs, dt)[0]))
                 else:
                     txt = array_diff_text(ss, cs, dt, sext[:-1],
                                           sinfo["los"][:-1])
                 if txt:
                     diff_names.append(cn)
                     lines.append(
-                        "{} (cam idx {}, sima idx {}) <-> {}: {}".format(
-                            cn, ci + 1, sj + 1, sn, txt))
+                        "{} ({} idx {}, {} idx {}) <-> {}: {}".format(
+                            cn, ROLE_C, ci + 1, ROLE_S, sj + 1, sn, txt))
             if lines:
                 rep.diff(label, hit, phase, arg,
                          "constituent-indexed array, {}/{} mapped species"
@@ -715,8 +731,8 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
                 return
             if phase == "entry":
                 rep.diff(label, hit, phase, arg,
-                         "shape mismatch: sima {} vs cam {}".format(
-                             sext, cext))
+                         "shape mismatch: {} {} vs {} {}".format(
+                             ROLE_S, sext, ROLE_C, cext))
             return
         if (phase == "exit" and (intent == "out" or force_written_only) and
                 sdata != cdata and
@@ -744,12 +760,13 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
                     rep.note(
                         "{} (hit {}): arg {}: entry values differ but look "
                         "uninitialized ({}/{} differing elements are "
-                        "NaN/denormal/huge, e.g. sima={} cam={}); treated "
+                        "NaN/denormal/huge, e.g. {}={} {}={}); treated "
                         "as caller scratch the scheme only writes "
                         "(intent(inout) diagnostic?): not counted as an "
                         "input diff, exit compared over written elements "
                         "only".format(label, hit, arg, nu, nd,
-                                      fmt_val(ex[0]), fmt_val(ex[1])))
+                                      ROLE_S, fmt_val(ex[0]),
+                                      ROLE_C, fmt_val(ex[1])))
                     return "uninit-entry"
             rep.diff(label, hit, phase, arg, txt)
 
@@ -760,7 +777,8 @@ def _compare_arg(label, hit, phase, arg, sinfo, cinfo, sman, cman,
             return
         if sv != cv:
             rep.diff(label, hit, phase, arg,
-                     "sima={} cam={}".format(fmt_val(sv), fmt_val(cv)))
+                     "{}={} {}={}".format(ROLE_S, fmt_val(sv),
+                                          ROLE_C, fmt_val(cv)))
 
 
 def has_exit_capture(rec):
@@ -802,7 +820,7 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
     entry_diffed = set()
     uninit_entry = set()
     phases = ("entry", "exit")
-    no_exit = [role for role, r in (("sima", srec), ("cam", crec))
+    no_exit = [role for role, r in ((ROLE_S, srec), (ROLE_C, crec))
                if not has_exit_capture(r)]
     if no_exit:
         phases = ("entry",)
@@ -823,8 +841,8 @@ def compare_hit(srec, crec, sman, cman, const_ctx, rep, intents=None,
             cinfo = crec["args"].get(arg)
             if cinfo is None:
                 if phase == "entry":
-                    rep.note("{} (hit {}): arg {} absent on CAM side".format(
-                        label, hit, arg))
+                    rep.note("{} (hit {}): arg {} absent on {} side".format(
+                        label, hit, arg, ROLE_C))
                 continue
             if port is not None and arg in port["spec"]["_convention"]:
                 conv.add(arg)
@@ -981,7 +999,7 @@ def count_matching_entry_args(srec, crec, sman, cman, sch_int=None,
 
 
 def alignment_verdict(first_srec, cam_g, sima_g, sman, cman, intents=None,
-                      const_ctx=None):
+                      const_ctx=None, offset=1):
     """The very first compared hit pair has input diffs. Decide whether the
     step pairing itself is at fault by bitwise-matching the first sima hit's
     entry args against every dumped cam step, and print the conclusion, not
@@ -992,7 +1010,7 @@ def alignment_verdict(first_srec, cam_g, sima_g, sman, cman, intents=None,
     b = first_srec["_bucket"]
     occ = first_srec["_occ"]
     sch_int = (intents or {}).get(s, {})
-    paired_t = first_srec["step"] + 1  # sima step t pairs with cam step t+1
+    paired_t = first_srec["step"] + offset  # step t pairs with step t+offset
     scores = {}  # cam step -> (same, total) bitwise-identical entry args
     for (ss, t, bb) in cam_g:
         if ss != s or bb != b or t in scores:
@@ -1012,26 +1030,28 @@ def alignment_verdict(first_srec, cam_g, sima_g, sman, cman, intents=None,
                    "The 1 differing input is a field-specific upstream "
                    "issue")
             print("alignment check: {}/{} entry args of {} (first compared "
-                  "scheme,\nsima step {}) bitwise match the paired cam step "
+                  "scheme,\n{} step {}) bitwise match the paired {} step "
                   "{} -- timestep alignment is\ncorrect. {} (wiring or\n"
                   "initialization), not misalignment: a wrong or misaligned "
                   "snapshot would differ\non essentially every argument."
-                  .format(ps, pt, s, first_srec["step"], paired_t, mid))
+                  .format(ps, pt, s, ROLE_S, first_srec["step"], ROLE_C,
+                          paired_t, mid))
         elif best_t != paired_t and bs > ps:
             print("*** WARNING: only {}/{} entry args of {} (first compared "
-                  "scheme) match\n*** its paired cam step {}, but {}/{} "
-                  "match cam step {}. The runs are likely\n*** misaligned "
+                  "scheme) match\n*** its paired {} step {}, but {}/{} "
+                  "match {} step {}. The runs are likely\n*** misaligned "
                   "or comparing the wrong snapshot; fix the step pairing "
                   "before\n*** believing any comparison below."
-                  .format(ps, pt, s, paired_t, bs, btot, best_t))
+                  .format(ps, pt, s, ROLE_C, paired_t, bs, btot, ROLE_C,
+                          best_t))
         else:
             print("*** WARNING: the entry state of {} (first compared "
-                  "scheme) matches no\n*** dumped cam step well (best: "
+                  "scheme) matches no\n*** dumped {} step well (best: "
                   "{}/{} at step {}). The runs already differ\n*** before "
                   "the first compared scheme: check snapshot generation/"
                   "reading and\n*** initial conditions before believing any "
                   "comparison below."
-                  .format(s, bs, btot, best_t))
+                  .format(s, ROLE_C, bs, btot, best_t))
     # a second sima step bitwise-identical to this one means the snapshot
     # record was replayed -- only speak up when that actually fires
     for t in sorted(set(tt for (ss, tt, bb) in sima_g
@@ -1042,9 +1062,9 @@ def alignment_verdict(first_srec, cam_g, sima_g, sman, cman, intents=None,
             same, total = count_matching_entry_args(
                 first_srec, lst[occ], sman, sman, sch_int, const_ctx)
             if total and same == total:
-                print("*** note: sima step {} entry state is bitwise "
+                print("*** note: {} step {} entry state is bitwise "
                       "identical to step {} --\n*** the snapshot record may "
-                      "be repeated!".format(t, first_srec["step"]))
+                      "be repeated!".format(ROLE_S, t, first_srec["step"]))
 
 
 class _Tee(object):
@@ -1068,7 +1088,8 @@ def _archive_report(outdir, report_path):
     written."""
     try:
         with open(os.path.join(outdir, "suite.json")) as f:
-            sdf = json.load(f).get("sdf", "")
+            meta = json.load(f)
+            sdf = meta.get("sdf") or meta.get("targets") or ""
     except (IOError, ValueError):
         sdf = ""
     sdf_name = os.path.splitext(os.path.basename(sdf))[0] or "unknown"
@@ -1097,13 +1118,17 @@ how to read this report:
   3. [INPUTS DIFFER] = the models handed this scheme different data; the bug
      is upstream (wiring, initialization, an earlier scheme). [OUTPUTS DIFFER]
      = same inputs, different result; the bug is inside this scheme.
-  4. sima=0 everywhere on an input = SIMA never populated it (wiring). nan on
+  4. {s}=0 everywhere on an input = {S} never populated it (wiring). nan on
      one side = never written in that model (benign if outputs still match).
   5. value patterns: one side exactly 0 where the other has tiny residuals ->
      a clamp/floor (e.g. qneg) ran in only one model; one side pinned at a
      round constant (1, 1e-12) -> a limiter/default applied in one model only;
      tiny config inputs differing (1e-37 vs 0) -> threshold parity, note it
      but it rarely moves the answer."""
+
+
+def reading_guide():
+    return READING_GUIDE.format(s=ROLE_S, S=ROLE_S.upper())
 
 
 def report(outdir, suite_order, steps, intents=None):
@@ -1137,6 +1162,13 @@ def _report(outdir, suite_order, steps, intents=None):
     except (IOError, ValueError):
         suite_meta = {}
     portable = suite_meta.get("portable", {}) or {}
+    # Role names (directory names + report labels): historically cam/sima;
+    # same-model runs set e.g. base/test at capture time.
+    roles = suite_meta.get("roles") or {}
+    global ROLE_S, ROLE_C
+    ROLE_S = roles.get("s", "sima")
+    ROLE_C = roles.get("c", "cam")
+    sentinel = suite_meta.get("step_sentinel", "cam_run1")
     realign = load_realign(os.path.join(outdir, "realign.json"))
     # SIMA step t pairs with CAM step t+offset. 1 (the default) matches
     # FPHYStest snapshot runs, where CAM's first step is skipped; 0 is for
@@ -1153,29 +1185,32 @@ def _report(outdir, suite_order, steps, intents=None):
     sdf_path = suite_meta.get("sdf")
     if sdf_path:
         print("SDF:       {}".format(sdf_path))
-    cam_case = suite_meta.get("cam_case")
+    targets_path = suite_meta.get("targets")
+    if targets_path:
+        print("targets:   {}".format(targets_path))
+    cam_case = suite_meta.get(ROLE_C + "_case")
     if cam_case:
-        print("CAM case:  {}".format(cam_case))
-    sima_case = suite_meta.get("sima_case")
+        print("{} case: {}".format(ROLE_C.upper(), cam_case))
+    sima_case = suite_meta.get(ROLE_S + "_case")
     if sima_case:
-        print("SIMA case: {}".format(sima_case))
-    print("steps:     {} (sima step t <-> cam step t+{})".format(
-        steps, offset))
+        print("{} case: {}".format(ROLE_S.upper(), sima_case))
+    print("steps:     {} ({} step t <-> {} step t+{})".format(
+        steps, ROLE_S, ROLE_C, offset))
     if realign is not None:
         print("realign:   {} args realigned per species, {} convention, "
               "{} metadata (realign.json)".format(
                   len(realign["_arg_space"]), len(realign["_convention"]),
                   len(realign["_metadata"])))
 
-    cam = load_role(outdir, "cam")
-    sima = load_role(outdir, "sima")
-    missing = [r for r, m in (("cam", cam), ("sima", sima)) if m is None]
+    cam = load_role(outdir, ROLE_C)
+    sima = load_role(outdir, ROLE_S)
+    missing = [r for r, m in ((ROLE_C, cam), (ROLE_S, sima)) if m is None]
     if missing:
         print("ERROR: no manifest for: {} (gdb run failed? see gdb.log)"
               .format(", ".join(missing)))
         return False
 
-    for man, role in ((cam, "cam"), (sima, "sima")):
+    for man, role in ((cam, ROLE_C), (sima, ROLE_S)):
         for note_ in man.get("notes", []):
             if "FAILED" in note_ or "WARNING" in note_:
                 print("  {} gdb note: {}".format(
@@ -1201,10 +1236,11 @@ def _report(outdir, suite_order, steps, intents=None):
             neither.append(s)
     print("schemes: {} compared".format(len(compared)))
     if sima_only:
-        print("  SIMA-only (no CAM symbol, not compared): " +
-              ", ".join(sima_only))
+        print("  {}-only (no {} symbol, not compared): ".format(
+            ROLE_S.upper(), ROLE_C.upper()) + ", ".join(sima_only))
     if cam_only:
-        print("  CAM-only (no SIMA symbol!): " + ", ".join(cam_only))
+        print("  {}-only (no {} symbol!): ".format(
+            ROLE_C.upper(), ROLE_S.upper()) + ", ".join(cam_only))
     if neither:
         print("  unresolved in both: " + ", ".join(neither))
 
@@ -1213,25 +1249,27 @@ def _report(outdir, suite_order, steps, intents=None):
     sima_names = sima.get("constituents") or []
     pairs, cam_un, sima_un = build_const_map(cam_names, sima_names)
     print("")
-    print("constituent mapping (CAM {} species, SIMA {}):".format(
-        len(cam_names), len(sima_names)))
+    print("constituent mapping ({} {} species, {} {}):".format(
+        ROLE_C.upper(), len(cam_names), ROLE_S.upper(), len(sima_names)))
     for ci, sj, cn, sn in pairs:
-        print("  cam q(:,:,{:2d}) {:16s} <-> sima q(:,:,{:2d}) {}".format(
-            ci + 1, cn, sj + 1, sn))
+        print("  {} q(:,:,{:2d}) {:16s} <-> {} q(:,:,{:2d}) {}".format(
+            ROLE_C, ci + 1, cn, ROLE_S, sj + 1, sn))
     for i, cn in cam_un:
-        print("  cam q(:,:,{:2d}) {:16s} <-> (unmatched, not compared)"
-              .format(i + 1, cn))
+        print("  {} q(:,:,{:2d}) {:16s} <-> (unmatched, not compared)"
+              .format(ROLE_C, i + 1, cn))
     for j, sn in sima_un:
-        print("  sima q(:,:,{:2d}) {} (unmatched, not compared)".format(
-            j + 1, sn))
+        print("  {} q(:,:,{:2d}) {} (unmatched, not compared)".format(
+            ROLE_S, j + 1, sn))
     if not cam_names or not sima_names:
         print("  (capture incomplete on {} side; constituent-indexed "
               "arrays compared element-wise only)".format(
-                  "CAM" if not cam_names else "SIMA"))
+                  ROLE_C.upper() if not cam_names else ROLE_S.upper()))
     if cam_un and sima_un:
         print("")
-        print("  *** WARNING: {} CAM and {} SIMA constituents are "
-              "UNMATCHED on both sides.".format(len(cam_un), len(sima_un)))
+        print("  *** WARNING: {} {} and {} {} constituents are "
+              "UNMATCHED on both sides.".format(
+                  len(cam_un), ROLE_C.upper(), len(sima_un),
+                  ROLE_S.upper()))
         print("  *** They are not name-matched, so they are not compared "
               "via the constituent map (species")
         print("  *** realigned from pointer arrays by a realign spec -- "
@@ -1240,10 +1278,10 @@ def _report(outdir, suite_order, steps, intents=None):
               "name). Otherwise this often means a")
         print("  *** missing SPECIAL_CONST_MAP entry (differ.py) or a "
               "duplicate standard name (see example 3 in docs/).")
-        print("  *** Unmatched CAM:  {}".format(
-            ", ".join(cn for _, cn in cam_un)))
-        print("  *** Unmatched SIMA: {}".format(
-            ", ".join(sn for _, sn in sima_un)))
+        print("  *** Unmatched {}:  {}".format(
+            ROLE_C.upper(), ", ".join(cn for _, cn in cam_un)))
+        print("  *** Unmatched {}: {}".format(
+            ROLE_S.upper(), ", ".join(sn for _, sn in sima_un)))
     const_ctx = (cam_names, sima_names, pairs)
 
     # --- alignment ------------------------------------------------------
@@ -1252,13 +1290,15 @@ def _report(outdir, suite_order, steps, intents=None):
     # occurrence within each (scheme, step, bucket).
     if not any(r.get("step", 0) >= 1 for r in sima["hits"]):
         print("")
-        print("ERROR: no timestep tags on SIMA hits -- the cam_run1 "
-              "sentinel did not resolve or never fired (see gdb.log).")
+        print("ERROR: no timestep tags on {} hits -- the {} "
+              "sentinel did not resolve or never fired (see gdb.log)."
+              .format(ROLE_S.upper(), sentinel))
         return False
     if not any(r.get("step", 0) >= 1 for r in cam["hits"]):
         print("")
-        print("ERROR: no timestep tags on CAM hits -- the cam_run1 "
-              "sentinel did not resolve or never fired (see gdb.log).")
+        print("ERROR: no timestep tags on {} hits -- the {} "
+              "sentinel did not resolve or never fired (see gdb.log)."
+              .format(ROLE_C.upper(), sentinel))
         return False
 
     shared = shared_caller_map(cam, sima)
@@ -1274,8 +1314,8 @@ def _report(outdir, suite_order, steps, intents=None):
         return name if name in compared else None
 
     print("")
-    print("call alignment (hits per compared step; sima step t pairs "
-          "with cam step t+{};".format(offset))
+    print("call alignment (hits per compared step; {} step t pairs "
+          "with {} step t+{};".format(ROLE_S, ROLE_C, offset))
     print("indented rows are calls made from inside the parent scheme):")
     width = max(len(disp(s)) for s in compared) + 2
 
@@ -1283,15 +1323,15 @@ def _report(outdir, suite_order, steps, intents=None):
         if n_s == n_c:
             return ""
         if n_c == 0:
-            return "  <-- no CAM hits: not compared"
+            return "  <-- no {} hits: not compared".format(ROLE_C.upper())
         if n_s == 0:
-            return "  <-- no SIMA hits: not compared"
+            return "  <-- no {} hits: not compared".format(ROLE_S.upper())
         return "  <-- hit counts differ (see notes)"
 
     def row(label, n_s, n_c, depth):
-        print("  {}{:<{w}} sima x{:<3d} cam x{:<3d}{}".format(
-            "    " * depth, label, n_s, n_c, vmark(n_s, n_c),
-            w=max(1, width - 4 * depth)).rstrip())
+        print("  {}{:<{w}} {} x{:<3d} {} x{:<3d}{}".format(
+            "    " * depth, label, ROLE_S, n_s, ROLE_C, n_c,
+            vmark(n_s, n_c), w=max(1, width - 4 * depth)).rstrip())
 
     for t in range(1, steps + 1):
         if steps > 1:
@@ -1438,11 +1478,11 @@ def _report(outdir, suite_order, steps, intents=None):
             if result is not None:
                 k, crec, pred = result
                 used.add(k)
-                rep.note("{} [step {}] (hit {}): paired with cam "
+                rep.note("{} [step {}] (hit {}): paired with {} "
                          "occurrence {} of {} (SDF order: follows {} "
-                         "in CAM execution)".format(
-                             disp(srec["scheme"]), t, srec["_occ"],
-                             k, len(cam_list), pred))
+                         "in {} execution)".format(
+                             disp(srec["scheme"]), t, srec["_occ"], ROLE_C,
+                             k, len(cam_list), pred, ROLE_C.upper()))
             else:
                 # Strategy 2: bitwise input match (fallback)
                 closest = None
@@ -1455,10 +1495,10 @@ def _report(outdir, suite_order, steps, intents=None):
                         crec = cand
                         used.add(k)
                         rep.note(
-                            "{} [step {}] (hit {}): paired with cam "
+                            "{} [step {}] (hit {}): paired with {} "
                             "occurrence {} of {} (bitwise input match)"
                             .format(disp(srec["scheme"]), t, srec["_occ"],
-                                    k, len(cam_list)))
+                                    ROLE_C, k, len(cam_list)))
                         break
                     if closest is None or same > closest[1]:
                         closest = (k, same, total)
@@ -1468,10 +1508,10 @@ def _report(outdir, suite_order, steps, intents=None):
                            "closest: occurrence {}, {}/{} args match"
                            .format(closest[0], closest[1], closest[2]))
                     rep.note(
-                        "{} [step {}] (hit {}): NO cam hit with matching "
+                        "{} [step {}] (hit {}): NO {} hit with matching "
                         "inputs among {} candidates ({}); not compared"
                         .format(disp(srec["scheme"]), t, srec["_occ"],
-                                len(cam_list), why))
+                                ROLE_C, len(cam_list), why))
                     continue
         if first_srec is None:
             first_srec = srec
@@ -1482,18 +1522,18 @@ def _report(outdir, suite_order, steps, intents=None):
     print("")
     if rep.alignment_suspect and first_srec is not None:
         alignment_verdict(first_srec, cam_g, sima_g, sima, cam, intents,
-                          const_ctx)
+                          const_ctx, offset)
         print("")
     if rep.n_diffs == 0:
         n_args = sum(len(r["args"]) for r in sima["hits"])
         print("No differences found in any subroutines!")
-        print("({} hit pairs compared, {} sima arg captures, byte-for-byte"
-              " identical)".format(n_pairs, n_args))
+        print("({} hit pairs compared, {} {} arg captures, byte-for-byte"
+              " identical)".format(n_pairs, n_args, ROLE_S))
         if rep.no_exit_schemes:
             print("  (but outputs NOT compared -- no exit capture -- for: "
                   "{})".format(", ".join(
                       disp(s) for s in sorted(rep.no_exit_schemes))))
-        for man, role in ((cam, "cam"), (sima, "sima")):
+        for man, role in ((cam, ROLE_C), (sima, ROLE_S)):
             for note in man.get("notes", []):
                 if "FAILED" in note or "failed" in note:
                     print("  {} note: {}".format(role, note))
@@ -1519,7 +1559,7 @@ def _report(outdir, suite_order, steps, intents=None):
     print("Raw dumps and entry-time addresses are in the manifests for "
           "manual gdb follow-up.")
     print("")
-    print(READING_GUIDE)
+    print(reading_guide())
     return False
 
 

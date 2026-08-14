@@ -333,6 +333,37 @@ notes, blind spots, and costs are in
 [docs/se_dycore_guide.md](docs/se_dycore_guide.md). Debug (`-O0`) builds
 only.
 
+## Same-model mode: base vs test
+
+Comparing two builds of the *same* model (e.g. CAM against a baseline tag
+after an unexpected regression-test answer change) drops the SDF entirely:
+
+```bash
+./dropsonde --base /scratch/.../baseline_case \
+            --test /scratch/.../modified_case \
+            --targets cam_anchors.json [--source-root ~/CAM/src]
+```
+
+`--targets` is a `dropsonde-targets-v1` JSON (see
+[docs/targets_example.json](docs/targets_example.json)): an ordered list of
+subroutines to compare at, an optional `step_sentinel` (the once-per-
+timestep subroutine used to tag hits and auto-terminate; default
+`cam_run1`), and an optional inline `capture` table (capture-v1 `types`
+shape) so a per-model preset is a single file. A target may carry per-side
+symbols (`{"sub": "foo", "test": "foo_renamed"}`) when a refactor renamed
+one side. Intents come from scanning `--source-root` for the targets'
+Fortran `intent()` declarations.
+
+Same-model mode is *simpler* than cross-model: report labels become
+`base`/`test`, `--step-offset` defaults to 0 (both runs advance freely
+from identical initial conditions), constituent registries are identical
+so species identity-map (models without a constituent registry, e.g.
+CTSM, are fine too -- arrays then compare element-wise, which is correct
+when both sides share one layout), and because both cases share the same
+decomposition there is **no dechunking or NTASKS=1 requirement**: compare
+the existing failing case against its baseline as-is. `--skip-base` /
+`--skip-test` replace `--skip-cam`/`--skip-sima`.
+
 ## Reading the report
 
 In order of appearance:
