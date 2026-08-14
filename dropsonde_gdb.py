@@ -617,68 +617,80 @@ _FBREG_RE = re.compile(r"DW_OP_fbreg (-?\d+)")
 _BREG_RE = re.compile(r"DW_OP_breg\d+ (-?\d+) \[\$(\w+)\]")
 
 
+_ARG_REG_SET = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
+
+
 def _parse_loc(name, pc):
-    """('slot', off) | ('obj', reg, off) | None: dummy `name`'s location at
-    `pc` from `info address` text. 'slot' (fbreg+deref) means the by-ref
-    pointer lives at frame-base+off; 'obj' (a lone breg) means the OBJECT
-    address -- i.e. the pointer value itself -- is register+off."""
+    """{'slot': off|None, 'at_pc': ('obj', reg, off)|None} for dummy
+    `name`, from `info address` text. 'slot' is the fbreg+deref frame-base
+    slot holding the by-ref POINTER, harvested from ANY range: at -O0 the
+    pointer is spilled there in the prologue and never moves, so the slot
+    is authoritative at all body PCs -- even where gcc 12's range for the
+    current PC degrades to a bare frame-pointer claim (an artifact seen on
+    absent optionals). 'at_pc' is a lone-breg location covering `pc`,
+    trustworthy only for genuine argument registers near entry."""
     try:
         txt = gdb.execute("info address " + name, to_string=True)
     except gdb.error:
         return None
+    out = {"slot": None, "at_pc": None}
+    m = _FBREG_RE.search(txt)
+    if m and "DW_OP_deref" in txt:
+        out["slot"] = int(m.group(1))
     if "multi-location" in txt:
         parts = _RANGE_RE.split(txt)
-        sel = None
         for i in range(1, len(parts) - 2, 3):
             if int(parts[i], 16) <= pc < int(parts[i + 1], 16):
                 sel = parts[i + 2]
+                mb = _BREG_RE.search(sel)
+                if (mb and "DW_OP_deref" not in sel and
+                        "entry_value" not in sel):
+                    out["at_pc"] = ("obj", mb.group(2), int(mb.group(1)))
                 break
-        if sel is None:
-            return None
-        txt = sel
-    m = _FBREG_RE.search(txt)
-    if m and "DW_OP_deref" in txt:
-        return ("slot", int(m.group(1)))
-    m = _BREG_RE.search(txt)
-    if m and "DW_OP_deref" not in txt and "entry_value" not in txt:
-        return ("obj", m.group(2), int(m.group(1)))
-    return None
+    return out
 
 
 def _optional_present(name, frame, calib_syms):
     """(present, how) for OPTIONAL dummy `name`, without creating its
     value. present is True/False/None (None = undetermined: do not touch
     the value). calib_syms: known-present sibling dummies used to pin the
-    frame-base convention."""
+    frame-base convention (the correct base is the one whose slot content
+    equals a sibling's actual object address)."""
     pc = int(frame.pc())
     loc = _parse_loc(name, pc)
     if loc is None:
         return None, "location unparsed"
-    if loc[0] == "obj":
-        try:
-            ptr = (int(frame.read_register(loc[1])) + loc[2]) \
-                & 0xFFFFFFFFFFFFFFFF
-        except Exception:
-            return None, "register unread"
-        return ptr >= 4096, "register " + loc[1]
-    off = loc[1]
-    rbp = _frame_base(frame)
-    for calib in calib_syms:
-        cl = _parse_loc(calib.name, pc)
-        if cl is None or cl[0] != "slot":
-            continue
-        try:
-            true_addr = int(calib.value(frame).address)
-        except Exception:
-            continue
-        for adj in (16, 0):
+    if loc["slot"] is not None:
+        off = loc["slot"]
+        rbp = _frame_base(frame)
+        for calib in calib_syms:
+            cl = _parse_loc(calib.name, pc)
+            if cl is None or cl["slot"] is None:
+                continue
             try:
-                if _read_u64(rbp + adj + cl[1]) == true_addr:
-                    ptr = _read_u64(rbp + adj + off)
-                    return ptr >= 4096, "slot rbp+{}{:+d}".format(adj, off)
+                true_addr = int(calib.value(frame).address)
             except Exception:
                 continue
-    return None, "frame base uncalibrated"
+            for adj in (16, 0):
+                try:
+                    if _read_u64(rbp + adj + cl["slot"]) == true_addr:
+                        ptr = _read_u64(rbp + adj + off)
+                        return (ptr >= 4096,
+                                "slot rbp+{}{:+d}".format(adj, off))
+                except Exception:
+                    continue
+        return None, "frame base uncalibrated"
+    at = loc["at_pc"]
+    if at is not None and at[1] in _ARG_REG_SET and at[2] == 0:
+        # near function entry the by-ref pointer really is in its System V
+        # argument register; bare frame-pointer claims (breg6/$rbp) are NOT
+        # evidence of presence and fall through to undetermined
+        try:
+            ptr = int(frame.read_register(at[1])) & 0xFFFFFFFFFFFFFFFF
+        except Exception:
+            return None, "register unread"
+        return ptr >= 4096, "register " + at[1]
+    return None, "no trustworthy location"
 
 
 def _caller_info(frame):
