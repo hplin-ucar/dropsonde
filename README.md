@@ -485,4 +485,6 @@ Later improvements were added by Claude Opus 4.6 and Claude Opus 4.8.
 
 The supervising human was Haipeng Lin <hplin@ucar.edu>, NSF NCAR/CGD/AMP.
 
+The development of this software was supported by [NSF award 2311376](https://www.nsf.gov/awardsearch/show-award/?AWD_ID=2311376).
+
 (c) 2026 University Corporation for Atmospheric Research.
