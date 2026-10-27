@@ -83,15 +83,9 @@ _BODY_LINE = {}  # scheme -> (filename, line) | None
 
 
 def _write_manifest():
-    """Persist MANIFEST to disk now, not just once at the very end. nvhpc
-    DEBUG binaries have been observed (root cause not yet understood --
-    reproduces identically with only one role running, no GPU involved) to
-    take an external SIGKILL shortly after a physics timestep completes.
-    SIGKILL bypasses Python's try/finally entirely, so the one-time
-    end-of-run write is not reached and an otherwise-fully-captured
-    timestep's data is lost with no manifest to show for it. Called after
-    every scheme's exit capture completes, so whatever's been captured
-    survives even if the process is killed moments later."""
+    """Write the manifest now. Called after every scheme exit, because nvhpc
+    DEBUG runs under gdb can be SIGKILLed after a timestep (cause unknown),
+    which skips the final write in the try/finally."""
     with open(os.path.join(OUT, "manifest.json"), "w") as f:
         json.dump(MANIFEST, f, indent=1)
 
@@ -133,21 +127,9 @@ _COMPILER = [None]
 OPTIMIZED = [None]
 _OPT_FLAG_RE = re.compile(r"(?:^|\s)-O([123sz])(?:\s|$)")
 
-# nvhpc/nvfortran: GDB's own typed Fortran array evaluation cannot be
-# trusted for assumed-shape dummies bound to non-contiguous actual
-# arguments (a common CCPP pattern -- e.g. a constituent slice out of a
-# larger tracer array), even at -O0 with every DWARF location present and
-# valid. The real per-call array descriptor is passed correctly by the
-# compiled code, but as a HIDDEN argument appended after all declared
-# dummies (one per assumed-shape array dummy, in declaration order),
-# separate from the dummy's own ABI slot (which holds a plain raw data
-# pointer, gfortran-style explicit-shape convention). GDB's synthesized
-# DWARF array type for the dummy does not consult this hidden descriptor,
-# so subscript evaluation silently assumes contiguous packing and can
-# return wrong (not just missing) values with no warning. So nvhpc
-# binaries always use the raw-entry ABI capture strategy (like OPTIMIZED),
-# reading the hidden descriptor directly, regardless of optimization
-# level. See _nvhpc_descriptor_plan / handle_entry_nvhpc.
+# nvhpc: gdb's typed array evaluation ignores nvfortran's hidden
+# assumed-shape descriptors and silently mis-strides non-contiguous
+# actuals, so nvhpc always uses raw-entry capture (handle_entry_nvhpc).
 NVHPC = [False]
 
 
@@ -1258,34 +1240,19 @@ def handle_entry_optimized(scheme, frame):
 # --------------------------------------------------------------------------
 # nvhpc/nvfortran raw-entry capture
 #
-# Reverse-engineered from nvhpc 25.9, x86_64 LP64, -O0 (see calibration
-# notes). An assumed-shape array dummy's own ABI slot holds a plain raw
-# data pointer (gfortran explicit-shape convention, NOT a descriptor
-# pointer). The real per-call descriptor is a separate HIDDEN argument,
-# one per assumed-shape array dummy, appended after ALL declared dummies
-# (both register- and stack-passed) in the same left-to-right order those
-# dummies appear in the declaration, then following normal System V
-# register/stack allocation over that extended list. Confirmed with 1, 2,
-# and 3 assumed-shape dummies, interspersed with scalars, and with a
-# trailing character(len=*) dummy (whose own hidden length arg follows
-# every array descriptor, i.e. sits at the very end of the extended list --
-# not needed for capture here since character dummies are not captured).
+# Reverse-engineered from nvhpc 25.9, x86_64, -O0. An assumed-shape dummy's
+# ABI slot holds a raw data pointer; its descriptor is a hidden argument,
+# one per assumed-shape dummy in declaration order, appended after all
+# declared dummies (then normal System V register/stack allocation).
 #
-# Descriptor layout (byte offsets from the descriptor pointer):
+# Descriptor layout (byte offsets):
 #   rank                    @ 0x08
-#   dimension blocks, 0x30 (48) bytes each, starting @ 0x50; within a
-#   block (0-based dim d at 0x50 + 0x30*d):
+#   dimension d, 0x30 bytes each from 0x50:
 #     lower_bound           @ +0x00
 #     upper_bound           @ +0x08
 #     stride (elements)     @ +0x20
-# The descriptor also carries a data-pointer-shaped field @ 0x48, but the
-# compiled code does NOT use it to address elements -- it indexes from the
-# dummy's own ABI slot (a plain raw pointer, already address-of-element-
-# at-lower-bounds) using index arithmetic built from the fields above. So
-# _nvhpc_descriptor_plan takes that pointer as an explicit argument rather
-# than reading 0x48. Field semantics at offsets other than the above (a
-# handful of constant-valued words per block, and a word @ 0x38 used in
-# the compiled index arithmetic) were not needed and were left undecoded.
+# Element addresses come from the ABI data pointer, not the descriptor's
+# pointer field @ 0x48. Other fields are not decoded.
 # --------------------------------------------------------------------------
 
 _NV_D_RANK = 0x08
@@ -1297,14 +1264,9 @@ _NV_D_DIM_STRIDE = 0x20
 
 
 def _nvhpc_descriptor_plan(desc_addr, elem_type, base_ptr):
-    """An array_plan()-shaped dict for an nvhpc assumed-shape array dummy.
-    `desc_addr` is the hidden descriptor argument, used only for
-    rank/bounds/strides. `base_ptr` is the dummy's own ABI slot value (the
-    raw data pointer, already address-of-element-at-lower-bounds) -- the
-    compiled code computes element addresses from THIS pointer plus index
-    arithmetic derived from the descriptor, not from any pointer field
-    inside the descriptor itself, so that's what must be used as the
-    array's base address here too."""
+    """array_plan()-shaped dict for an nvhpc assumed-shape dummy: bounds and
+    strides from the hidden descriptor `desc_addr`, base address from the
+    dummy's own data pointer `base_ptr`."""
     dt = dtype_of(elem_type)
     if dt is None:
         return None, "unsupported element type: {}".format(elem_type)
@@ -1330,25 +1292,17 @@ def _nvhpc_descriptor_plan(desc_addr, elem_type, base_ptr):
 
 
 def _nvhpc_hidden_descriptor_ptr(frame, assumed_shape_flags, idx):
-    """ABI pointer to the hidden nvhpc descriptor for the assumed-shape
-    array dummy declared at position `idx` (1-based). `assumed_shape_flags`
-    is a list, one entry per declared dummy (1-based via index 0 unused),
-    true where the dummy is assumed-shape per its SOURCE declaration (NOT
-    sym.type -- nvhpc's DWARF array type prints placeholder static bounds
-    for assumed-shape dummies, so it cannot be used to classify them)."""
+    """Hidden descriptor pointer for assumed-shape dummy `idx` (1-based).
+    `assumed_shape_flags[i]` is true when dummy i is assumed-shape (index 0
+    unused)."""
     n_declared = len(assumed_shape_flags) - 1
     ordinal = sum(1 for i in range(1, idx + 1) if assumed_shape_flags[i])
     return _abi_arg_ptr(frame, n_declared + ordinal)
 
 
 def handle_entry_nvhpc(scheme, frame):
-    """Entry capture for an nvhpc-compiled binary at any optimization
-    level. Mirrors handle_entry_optimized's record shape and reuses its
-    scalar/explicit-shape machinery (_abi_arg_ptr, _declared_plan), but
-    reads assumed-shape array dummies from their real hidden descriptor
-    (_nvhpc_descriptor_plan) instead of trusting GDB's typed evaluation or
-    assuming (as handle_entry_optimized does) that the dummy's own ABI
-    slot is itself a descriptor pointer."""
+    """handle_entry_optimized for nvhpc: assumed-shape dummies are read
+    through their hidden descriptor."""
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
     try:
@@ -1359,11 +1313,8 @@ def handle_entry_nvhpc(scheme, frame):
            "caller": caller, "args": {}}
     frame.select()
     all_syms = list(arg_symbols(frame))
-    # Precompute each dummy's source-declared dims once: both the shape
-    # classification below and _nvhpc_hidden_descriptor_ptr's ordinal count
-    # need it, and nvhpc's DWARF array type (sym.type) can't be used for
-    # this -- it prints placeholder static bounds ("(1,1)") for
-    # assumed-shape dummies instead of ":" the way gfortran's does.
+    # Classify shapes from the source declaration: nvhpc's DWARF gives
+    # placeholder bounds such as (1,1) for assumed-shape dummies.
     decls = [None] + [_source_decl(frame, sym.name) for sym in all_syms]
     assumed_shape_flags = [False] + [
         decl is not None and bool(decl[0]) and all(d == ":" for d in decl[0])
@@ -1553,11 +1504,8 @@ _GPU_SYNC_RE = re.compile(r"^\s*!\$acc\s+update\s+self\s*\(", re.I)
 
 
 def _find_gpu_sync_target(frame):
-    """(file_basename, line) just past the last of one or more generated
-    "!$acc update self(...)" lines immediately following `frame`'s current
-    position, or None if there's no such line nearby. Pure source-text
-    lookup -- no gdb execution/resuming commands, safe to call from
-    anywhere, including from within a FinishBreakpoint's own stop()."""
+    """(file, line) just past the "!$acc update self(...)" lines that follow
+    `frame`'s position (within 20 lines), or None. Source text only."""
     try:
         sal = frame.find_sal()
         fname = sal.symtab.fullname()
@@ -1603,35 +1551,11 @@ def _read_exit_values(rec):
 
 
 class GpuSyncBP(gdb.Breakpoint):
-    """Temporary breakpoint placed just past a generated "!$acc update
-    self(...)" directive in the caller, to re-read exit values there once
-    the sync has actually run.
-
-    Why this exists, and why it's a separate breakpoint rather than
-    ExitBP resuming execution itself: for a GPU-resident output,
-    xdsl_ccpp generates a caller-side "!$acc update self(...)" directive
-    right after the scheme call, refreshing the host mirror from the
-    live device value. But ExitBP's capture is a gdb.FinishBreakpoint,
-    which fires the instant control returns to the caller -- strictly
-    before ANY of the caller's own subsequent code runs, including that
-    sync line, no matter where in the caller it's placed. Confirmed
-    live: temp_prev/qv_dry/qc_dry (synced BEFORE their call, so already
-    live by the time the call -- and thus entry capture -- happens) read
-    correctly; theta/relhum/ttend_t (synced AFTER their call, like this
-    one) did not, until this.
-
-    The natural fix -- resume execution (e.g. 'advance') past the sync
-    line before reading -- does NOT work from inside FinishBreakpoint's
-    own stop() callback: confirmed live, every attempt failed with
-    "Cannot execute this command while the selected thread is running"
-    (gdb's stop() callbacks run before the thread is fully in a state
-    that accepts a new resuming command). Setting a plain (temporary)
-    breakpoint object instead, from within ExitBP.stop(), is not a
-    resuming command and works fine there; the breakpoint then fires
-    normally through gdb's regular event loop once execution naturally
-    reaches it, at which point re-reading is safe. No OpenACC/CUDA API
-    calls anywhere in this -- just gdb-native breakpoints and reading
-    host memory, the same tools dropsonde already uses everywhere."""
+    """Re-reads exit values just past the caller's "!$acc update self(...)",
+    so device-resident outputs are read after the host copy is refreshed.
+    ExitBP fires before any caller code runs, and gdb refuses to resume
+    execution from inside its stop(), so a temporary breakpoint is set
+    instead."""
 
     def __init__(self, spec, rec):
         super(GpuSyncBP, self).__init__(
@@ -1829,23 +1753,14 @@ def _gnu_const_names(prefix, n):
     return names
 
 
-_NV_CHAR_DATA = 0x00     # data pointer, within a deferred-length character's
-_NV_CHAR_LEN = 0x20      # descriptor -- reverse-engineered the same way as
-                          # the array descriptor (calibration notes above);
-                          # verified against 1-, 23- and 68-character values.
+_NV_CHAR_DATA = 0x00     # deferred-length character: data pointer
+_NV_CHAR_LEN = 0x20      # and length (checked with 1/23/68-char values)
 
 
 def _nvhpc_const_names(prefix, n):
-    """SIMA constituent standard names under nvhpc. const_props(i)%prop
-    (a plain pointer, one dereference) evaluates fine through GDB's normal
-    Fortran expression evaluator; going one level further
-    (%prop%var_std_name) fails ("Attempt to extract a component of a value
-    that is not a structure") because nvhpc's DWARF for the POINTER
-    component's target type (props_t) is not something GDB can resolve
-    through a second dot/percent access. So each prop pointer is read
-    through GDB (reliable), then var_std_name -- a deferred-length
-    allocatable character -- is decoded from raw memory past that point:
-    a data pointer at +0x00 and the true (unpadded) length at +0x20."""
+    """CAM-SIMA constituent names under nvhpc. gdb resolves
+    const_props(i)%prop but not %prop%var_std_name, so the deferred-length
+    character is decoded from raw memory."""
     names = []
     for i in range(1, n + 1):
         try:
