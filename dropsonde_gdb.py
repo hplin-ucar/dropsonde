@@ -82,6 +82,20 @@ _ERR_INIT_RE = re.compile(r"^\s*(errmsg|errflg|errcode|errstat)\s*=", re.I)
 _BODY_LINE = {}  # scheme -> (filename, line) | None
 
 
+def _write_manifest():
+    """Persist MANIFEST to disk now, not just once at the very end. nvhpc
+    DEBUG binaries have been observed (root cause not yet understood --
+    reproduces identically with only one role running, no GPU involved) to
+    take an external SIGKILL shortly after a physics timestep completes.
+    SIGKILL bypasses Python's try/finally entirely, so the one-time
+    end-of-run write is not reached and an otherwise-fully-captured
+    timestep's data is lost with no manifest to show for it. Called after
+    every scheme's exit capture completes, so whatever's been captured
+    survives even if the process is killed moments later."""
+    with open(os.path.join(OUT, "manifest.json"), "w") as f:
+        json.dump(MANIFEST, f, indent=1)
+
+
 def note(msg):
     MANIFEST["notes"].append(msg)
     gdb.write("dropsonde[{}]: {}\n".format(ROLE, msg))
@@ -119,6 +133,23 @@ _COMPILER = [None]
 OPTIMIZED = [None]
 _OPT_FLAG_RE = re.compile(r"(?:^|\s)-O([123sz])(?:\s|$)")
 
+# nvhpc/nvfortran: GDB's own typed Fortran array evaluation cannot be
+# trusted for assumed-shape dummies bound to non-contiguous actual
+# arguments (a common CCPP pattern -- e.g. a constituent slice out of a
+# larger tracer array), even at -O0 with every DWARF location present and
+# valid. The real per-call array descriptor is passed correctly by the
+# compiled code, but as a HIDDEN argument appended after all declared
+# dummies (one per assumed-shape array dummy, in declaration order),
+# separate from the dummy's own ABI slot (which holds a plain raw data
+# pointer, gfortran-style explicit-shape convention). GDB's synthesized
+# DWARF array type for the dummy does not consult this hidden descriptor,
+# so subscript evaluation silently assumes contiguous packing and can
+# return wrong (not just missing) values with no warning. So nvhpc
+# binaries always use the raw-entry ABI capture strategy (like OPTIMIZED),
+# reading the hidden descriptor directly, regardless of optimization
+# level. See _nvhpc_descriptor_plan / handle_entry_nvhpc.
+NVHPC = [False]
+
 
 def compiler():
     """'gnu' | 'intel' | 'nag' | 'unknown' for the binary under debug."""
@@ -136,6 +167,8 @@ def compiler():
         c = "nag"
     elif "gnu" in low or "gcc" in low:
         c = "gnu"
+    elif "nvfortran" in low or "nvhpc" in low or "pgi" in low:
+        c = "nvhpc"
     else:
         c = "unknown"
     _COMPILER[0] = c
@@ -1051,6 +1084,14 @@ def probe_optimized(specs_per_scheme):
             prod = _cu_producer(spec)
             if prod is None:
                 continue
+            low = prod.lower()
+            if "nvfortran" in low or "nvhpc" in low:
+                NVHPC[0] = True
+                note("optimization probe: nvhpc detected (producer: {}); "
+                     "using raw-entry ABI capture unconditionally "
+                     "(GDB's typed array evaluation is unreliable for "
+                     "nvhpc even at -O0)".format(prod[:90]))
+                return
             m = _OPT_FLAG_RE.search(prod)
             OPTIMIZED[0] = bool(m)
             note("optimization probe: {} (producer: {})".format(
@@ -1214,6 +1255,180 @@ def handle_entry_optimized(scheme, frame):
     return rec
 
 
+# --------------------------------------------------------------------------
+# nvhpc/nvfortran raw-entry capture
+#
+# Reverse-engineered from nvhpc 25.9, x86_64 LP64, -O0 (see calibration
+# notes). An assumed-shape array dummy's own ABI slot holds a plain raw
+# data pointer (gfortran explicit-shape convention, NOT a descriptor
+# pointer). The real per-call descriptor is a separate HIDDEN argument,
+# one per assumed-shape array dummy, appended after ALL declared dummies
+# (both register- and stack-passed) in the same left-to-right order those
+# dummies appear in the declaration, then following normal System V
+# register/stack allocation over that extended list. Confirmed with 1, 2,
+# and 3 assumed-shape dummies, interspersed with scalars, and with a
+# trailing character(len=*) dummy (whose own hidden length arg follows
+# every array descriptor, i.e. sits at the very end of the extended list --
+# not needed for capture here since character dummies are not captured).
+#
+# Descriptor layout (byte offsets from the descriptor pointer):
+#   rank                    @ 0x08
+#   dimension blocks, 0x30 (48) bytes each, starting @ 0x50; within a
+#   block (0-based dim d at 0x50 + 0x30*d):
+#     lower_bound           @ +0x00
+#     upper_bound           @ +0x08
+#     stride (elements)     @ +0x20
+# The descriptor also carries a data-pointer-shaped field @ 0x48, but the
+# compiled code does NOT use it to address elements -- it indexes from the
+# dummy's own ABI slot (a plain raw pointer, already address-of-element-
+# at-lower-bounds) using index arithmetic built from the fields above. So
+# _nvhpc_descriptor_plan takes that pointer as an explicit argument rather
+# than reading 0x48. Field semantics at offsets other than the above (a
+# handful of constant-valued words per block, and a word @ 0x38 used in
+# the compiled index arithmetic) were not needed and were left undecoded.
+# --------------------------------------------------------------------------
+
+_NV_D_RANK = 0x08
+_NV_D_DIM0 = 0x50
+_NV_D_DIM = 0x30
+_NV_D_DIM_LB = 0x00
+_NV_D_DIM_UB = 0x08
+_NV_D_DIM_STRIDE = 0x20
+
+
+def _nvhpc_descriptor_plan(desc_addr, elem_type, base_ptr):
+    """An array_plan()-shaped dict for an nvhpc assumed-shape array dummy.
+    `desc_addr` is the hidden descriptor argument, used only for
+    rank/bounds/strides. `base_ptr` is the dummy's own ABI slot value (the
+    raw data pointer, already address-of-element-at-lower-bounds) -- the
+    compiled code computes element addresses from THIS pointer plus index
+    arithmetic derived from the descriptor, not from any pointer field
+    inside the descriptor itself, so that's what must be used as the
+    array's base address here too."""
+    dt = dtype_of(elem_type)
+    if dt is None:
+        return None, "unsupported element type: {}".format(elem_type)
+    if base_ptr == 0:
+        return None, "null data pointer"
+    rank = _read_i64(desc_addr + _NV_D_RANK)
+    if rank < 1 or rank > 7:
+        return None, "implausible nvhpc descriptor rank: {}".format(rank)
+    elsize = elem_type.sizeof
+    los, extents, strides = [], [], []
+    for d in range(rank):
+        blk = desc_addr + _NV_D_DIM0 + _NV_D_DIM * d
+        lb = _read_i64(blk + _NV_D_DIM_LB)
+        ub = _read_i64(blk + _NV_D_DIM_UB)
+        st_elems = _read_i64(blk + _NV_D_DIM_STRIDE)
+        los.append(lb)
+        extents.append(ub - lb + 1)
+        strides.append(st_elems * elsize)
+    if any(e < 0 for e in extents):
+        return None, "negative extent in nvhpc descriptor: {}".format(extents)
+    return {"addr": base_ptr, "elsize": elsize, "dtype": dt, "los": los,
+            "extents": extents, "strides": strides}, None
+
+
+def _nvhpc_hidden_descriptor_ptr(frame, assumed_shape_flags, idx):
+    """ABI pointer to the hidden nvhpc descriptor for the assumed-shape
+    array dummy declared at position `idx` (1-based). `assumed_shape_flags`
+    is a list, one entry per declared dummy (1-based via index 0 unused),
+    true where the dummy is assumed-shape per its SOURCE declaration (NOT
+    sym.type -- nvhpc's DWARF array type prints placeholder static bounds
+    for assumed-shape dummies, so it cannot be used to classify them)."""
+    n_declared = len(assumed_shape_flags) - 1
+    ordinal = sum(1 for i in range(1, idx + 1) if assumed_shape_flags[i])
+    return _abi_arg_ptr(frame, n_declared + ordinal)
+
+
+def handle_entry_nvhpc(scheme, frame):
+    """Entry capture for an nvhpc-compiled binary at any optimization
+    level. Mirrors handle_entry_optimized's record shape and reuses its
+    scalar/explicit-shape machinery (_abi_arg_ptr, _declared_plan), but
+    reads assumed-shape array dummies from their real hidden descriptor
+    (_nvhpc_descriptor_plan) instead of trusting GDB's typed evaluation or
+    assuming (as handle_entry_optimized does) that the dummy's own ABI
+    slot is itself a descriptor pointer."""
+    hit = HIT_COUNT.get(scheme, 0)
+    HIT_COUNT[scheme] = hit + 1
+    try:
+        caller = frame.older().name() or "?"
+    except Exception:
+        caller = "?"
+    rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
+           "caller": caller, "args": {}}
+    frame.select()
+    all_syms = list(arg_symbols(frame))
+    # Precompute each dummy's source-declared dims once: both the shape
+    # classification below and _nvhpc_hidden_descriptor_ptr's ordinal count
+    # need it, and nvhpc's DWARF array type (sym.type) can't be used for
+    # this -- it prints placeholder static bounds ("(1,1)") for
+    # assumed-shape dummies instead of ":" the way gfortran's does.
+    decls = [None] + [_source_decl(frame, sym.name) for sym in all_syms]
+    assumed_shape_flags = [False] + [
+        decl is not None and bool(decl[0]) and all(d == ":" for d in decl[0])
+        for decl in decls[1:]]
+    for idx, sym in enumerate(all_syms, start=1):
+        name = sym.name
+        info = {"kind": "skipped", "abi": True}
+        rec["args"][name] = info
+        try:
+            if name.startswith("_"):
+                info["why"] = "hidden length/descriptor arg (by value)"
+                continue
+            st = sym.type.strip_typedefs()
+            ptr = _abi_arg_ptr(frame, idx)
+            if ptr == 0:
+                info["why"] = "null argument pointer (absent optional?)"
+                continue
+            if is_character(st):
+                info["why"] = "character arg not captured under nvhpc"
+                continue
+            if st.code == gdb.TYPE_CODE_ARRAY:
+                elem = _element_type(st)
+                if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+                    info["why"] = "derived-type array not captured"
+                    continue
+                decl = decls[idx]
+                dims, attrs = decl if decl is not None else (None, "")
+                if not dims:
+                    info["kind"] = "error"
+                    info["why"] = "array dummy: no source declaration found"
+                    continue
+                if assumed_shape_flags[idx]:
+                    desc_ptr = _nvhpc_hidden_descriptor_ptr(
+                        frame, assumed_shape_flags, idx)
+                    plan, err = _nvhpc_descriptor_plan(desc_ptr, elem, ptr)
+                elif any("*" in d for d in dims):
+                    info["why"] = ("assumed-size dummy (declared ({}))"
+                                   .format(",".join(dims)))
+                    continue
+                else:
+                    plan, err = _declared_plan(ptr, sym.type, dims, attrs,
+                                               rec["args"])
+                if plan is None:
+                    info["kind"] = "error"
+                    info["why"] = err
+                    continue
+                _record_array(info, scheme, hit, name, plan)
+            elif st.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+                info["why"] = "derived-type arg not captured"
+            else:
+                dt = dtype_of(st)
+                if dt is None:
+                    info["why"] = "unsupported type: {}".format(st)
+                    continue
+                info["kind"] = "scalar"
+                info["dtype"] = dt
+                info["addr"] = ptr
+                info["entry_value"] = read_scalar(ptr, dt)
+        except Exception as exc:
+            info["kind"] = "error"
+            info["why"] = str(exc)
+    MANIFEST["hits"].append(rec)
+    return rec
+
+
 def handle_entry(scheme, frame):
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
@@ -1334,6 +1549,100 @@ def handle_entry(scheme, frame):
     return rec
 
 
+_GPU_SYNC_RE = re.compile(r"^\s*!\$acc\s+update\s+self\s*\(", re.I)
+
+
+def _find_gpu_sync_target(frame):
+    """(file_basename, line) just past the last of one or more generated
+    "!$acc update self(...)" lines immediately following `frame`'s current
+    position, or None if there's no such line nearby. Pure source-text
+    lookup -- no gdb execution/resuming commands, safe to call from
+    anywhere, including from within a FinishBreakpoint's own stop()."""
+    try:
+        sal = frame.find_sal()
+        fname = sal.symtab.fullname()
+        start_line = sal.line
+        with open(fname) as fh:
+            lines = fh.readlines()
+    except Exception:
+        return None
+    idx = start_line - 1
+    last_match = None
+    while idx < len(lines) and idx < start_line - 1 + 20:
+        if _GPU_SYNC_RE.match(lines[idx]):
+            last_match = idx
+            idx += 1
+            continue
+        if last_match is not None:
+            break
+        idx += 1
+    if last_match is None:
+        return None
+    return os.path.basename(fname), last_match + 2  # line after last match
+
+
+def _read_exit_values(rec):
+    for name, info in rec["args"].items():
+        try:
+            kind = info.get("kind")
+            if kind == "array":
+                data = read_array(info["plan"])
+                info["exit_file"] = write_blob(
+                    rec["scheme"], rec["hit"], name, "out", data)
+            elif kind == "scalar" and "addr" in info:
+                info["exit_value"] = read_scalar(
+                    info["addr"], info["dtype"])
+            elif kind == "char" and "addr" in info:
+                raw = bytes(gdb.selected_inferior().read_memory(
+                    info["addr"], info["len"]))
+                info["exit_value"] = raw.decode("latin-1").rstrip()
+        except Exception as exc:
+            info["exit_error"] = str(exc)
+    rec["complete"] = True
+    _write_manifest()
+
+
+class GpuSyncBP(gdb.Breakpoint):
+    """Temporary breakpoint placed just past a generated "!$acc update
+    self(...)" directive in the caller, to re-read exit values there once
+    the sync has actually run.
+
+    Why this exists, and why it's a separate breakpoint rather than
+    ExitBP resuming execution itself: for a GPU-resident output,
+    xdsl_ccpp generates a caller-side "!$acc update self(...)" directive
+    right after the scheme call, refreshing the host mirror from the
+    live device value. But ExitBP's capture is a gdb.FinishBreakpoint,
+    which fires the instant control returns to the caller -- strictly
+    before ANY of the caller's own subsequent code runs, including that
+    sync line, no matter where in the caller it's placed. Confirmed
+    live: temp_prev/qv_dry/qc_dry (synced BEFORE their call, so already
+    live by the time the call -- and thus entry capture -- happens) read
+    correctly; theta/relhum/ttend_t (synced AFTER their call, like this
+    one) did not, until this.
+
+    The natural fix -- resume execution (e.g. 'advance') past the sync
+    line before reading -- does NOT work from inside FinishBreakpoint's
+    own stop() callback: confirmed live, every attempt failed with
+    "Cannot execute this command while the selected thread is running"
+    (gdb's stop() callbacks run before the thread is fully in a state
+    that accepts a new resuming command). Setting a plain (temporary)
+    breakpoint object instead, from within ExitBP.stop(), is not a
+    resuming command and works fine there; the breakpoint then fires
+    normally through gdb's regular event loop once execution naturally
+    reaches it, at which point re-reading is safe. No OpenACC/CUDA API
+    calls anywhere in this -- just gdb-native breakpoints and reading
+    host memory, the same tools dropsonde already uses everywhere."""
+
+    def __init__(self, spec, rec):
+        super(GpuSyncBP, self).__init__(
+            spec, internal=True, temporary=True)
+        self.rec = rec
+
+    def stop(self):
+        _read_exit_values(self.rec)
+        return False
+
+
 class ExitBP(gdb.FinishBreakpoint):
     """Re-reads entry-time addresses when the scheme returns."""
 
@@ -1343,23 +1652,14 @@ class ExitBP(gdb.FinishBreakpoint):
 
     def stop(self):
         rec = self.rec
-        for name, info in rec["args"].items():
+        _read_exit_values(rec)
+        target = _find_gpu_sync_target(gdb.newest_frame())
+        if target is not None:
             try:
-                kind = info.get("kind")
-                if kind == "array":
-                    data = read_array(info["plan"])
-                    info["exit_file"] = write_blob(
-                        rec["scheme"], rec["hit"], name, "out", data)
-                elif kind == "scalar" and "addr" in info:
-                    info["exit_value"] = read_scalar(
-                        info["addr"], info["dtype"])
-                elif kind == "char" and "addr" in info:
-                    raw = bytes(gdb.selected_inferior().read_memory(
-                        info["addr"], info["len"]))
-                    info["exit_value"] = raw.decode("latin-1").rstrip()
-            except Exception as exc:
-                info["exit_error"] = str(exc)
-        rec["complete"] = True
+                GpuSyncBP("{}:{}".format(*target), rec)
+            except gdb.error as exc:
+                note("GPU-sync re-read breakpoint at {}:{} failed: "
+                     "{}".format(target[0], target[1], exc))
         return False
 
     def out_of_scope(self):
@@ -1529,6 +1829,44 @@ def _gnu_const_names(prefix, n):
     return names
 
 
+_NV_CHAR_DATA = 0x00     # data pointer, within a deferred-length character's
+_NV_CHAR_LEN = 0x20      # descriptor -- reverse-engineered the same way as
+                          # the array descriptor (calibration notes above);
+                          # verified against 1-, 23- and 68-character values.
+
+
+def _nvhpc_const_names(prefix, n):
+    """SIMA constituent standard names under nvhpc. const_props(i)%prop
+    (a plain pointer, one dereference) evaluates fine through GDB's normal
+    Fortran expression evaluator; going one level further
+    (%prop%var_std_name) fails ("Attempt to extract a component of a value
+    that is not a structure") because nvhpc's DWARF for the POINTER
+    component's target type (props_t) is not something GDB can resolve
+    through a second dot/percent access. So each prop pointer is read
+    through GDB (reliable), then var_std_name -- a deferred-length
+    allocatable character -- is decoded from raw memory past that point:
+    a data pointer at +0x00 and the true (unpadded) length at +0x20."""
+    names = []
+    for i in range(1, n + 1):
+        try:
+            prop = int(gdb.parse_and_eval(
+                "{}const_props({})%prop".format(prefix, i)))
+        except gdb.error as exc:
+            names.append("<unreadable: {}>".format(exc))
+            continue
+        if prop == 0:
+            names.append("<null prop>")
+            continue
+        data_ptr = _read_u64(prop + _NV_CHAR_DATA)
+        length = _read_i64(prop + _NV_CHAR_LEN)
+        if data_ptr == 0 or not (0 < length <= 1024):
+            names.append("<unreadable: len={}>".format(length))
+            continue
+        raw = bytes(gdb.selected_inferior().read_memory(data_ptr, length))
+        names.append(raw.decode("latin-1").strip())
+    return names
+
+
 def dump_constituents():
     try:
         if ROLE == "cam":
@@ -1573,6 +1911,11 @@ def dump_constituents():
                 # gdb 8.2 can't index Intel's pointer-array descriptor; decode
                 # const_props from raw memory.
                 names = _intel_const_names(base, n)
+            elif NVHPC[0]:
+                # GDB can't resolve the second-level %prop%var_std_name
+                # dereference under nvhpc; decode the deferred-length
+                # character raw instead.
+                names = _nvhpc_const_names(base, n)
             elif OPTIMIZED[0]:
                 # -O2 subscript evaluation can abort gdb; decode raw instead.
                 names = _gnu_const_names(base, n)
@@ -1693,9 +2036,10 @@ def setup():
                            lambda s=s: _qualified(s + "_run"))))
 
     probe_optimized([specs for _s, _t, specs in plans])
+    raw_entry = OPTIMIZED[0] or NVHPC[0]
     resolved = 0
     for s, target, specs in plans:
-        if OPTIMIZED[0]:
+        if raw_entry:
             bp = _make_entry_bp_optimized(specs, s, target)
         else:
             bp = _make_bp(EntryBP, specs, s, target)
@@ -1703,7 +2047,7 @@ def setup():
             MANIFEST["breakpoints"][s] = "missing"
         else:
             MANIFEST["breakpoints"][s] = "{} ({})".format(
-                bp.location, target) if OPTIMIZED[0] else bp.location
+                bp.location, target) if raw_entry else bp.location
             resolved += 1
     note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
 
@@ -1750,14 +2094,16 @@ def main():
             except gdb.error:
                 pass
             break
-        elif OPTIMIZED[0]:
-            # Optimized binary: the breakpoint is at the raw entry
-            # instruction, the one PC where the ABI argument slots are
-            # guaranteed; capture immediately (no advance -- moving even one
-            # instruction may clobber the argument registers).
+        elif OPTIMIZED[0] or NVHPC[0]:
+            # Optimized binary, or nvhpc at any optimization level: the
+            # breakpoint is at the raw entry instruction, the one PC where
+            # the ABI argument slots (including nvhpc's hidden descriptor
+            # args) are guaranteed; capture immediately (no advance --
+            # moving even one instruction may clobber argument registers).
             frame = gdb.newest_frame()
             try:
-                rec = handle_entry_optimized(entry.scheme, frame)
+                rec = (handle_entry_nvhpc(entry.scheme, frame) if NVHPC[0]
+                       else handle_entry_optimized(entry.scheme, frame))
                 ExitBP(frame, rec)
             except Exception as exc:
                 note("entry capture failed for {}: {}".format(
@@ -1824,6 +2170,5 @@ def main():
 try:
     main()
 finally:
-    with open(os.path.join(OUT, "manifest.json"), "w") as f:
-        json.dump(MANIFEST, f, indent=1)
     note("manifest written: {} hits".format(len(MANIFEST["hits"])))
+    _write_manifest()

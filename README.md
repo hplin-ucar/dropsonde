@@ -74,13 +74,15 @@ Copy aside any logs you want to keep before running.
 - CAM: GNU or Intel, `DEBUG=TRUE`, `NTASKS=1`, `NTHRDS=1`, dechunked
   (`pcols` = total columns). Must call the same CCPPized
   `atmospheric_physics` routines as the SIMA build.
-- CAM-SIMA: GNU or Intel, `DEBUG=TRUE`, single rank. Both runs must use
+- CAM-SIMA: GNU, Intel or nvhpc, `DEBUG=TRUE`, single rank. Both runs must use
   the same compiler (caller symbols and constituent capture are matched
   across the pair). The compiler is auto-detected from the DWARF producer
   string; no flag needed. NAG is not yet supported (see Known limitations).
   A production (`-O2 -g`) CAM-SIMA build against a DEBUG CAM is also
   supported (GNU only) — see
   [Optimized (production) binaries](#optimized-production-binaries).
+  nvhpc builds, including OpenACC (GPU) builds, have their own notes — see
+  [nvhpc and OpenACC builds](#nvhpc-and-openacc-builds).
 - `STOP_N` only needs to be *long enough* (CAM's 6-step coupling minimum
   is fine): each gdb session counts timesteps via a sentinel breakpoint on
   `cam_run1` and kills its run once it has what it needs (CAM:
@@ -133,8 +135,10 @@ Copy aside any logs you want to keep before running.
 
 The compiler is auto-detected at the first scheme hit from the DWARF
 producer string (`symtab.producer`: "GNU Fortran ..." / "Intel(R)
-Fortran ...") and selects the memory-layout-specific paths below; the
-by-name element-address probing is identical for both.
+Fortran ..." / "nvfortran ...") and selects the memory-layout-specific
+paths below; the by-name element-address probing is identical for GNU and
+Intel. nvhpc always uses raw-entry capture (see
+[nvhpc and OpenACC builds](#nvhpc-and-openacc-builds)).
 
 gdb/gfortran assumptions (gdb 16.2, gfortran 12, Derecho):
 
@@ -248,6 +252,41 @@ Caveats specific to optimized binaries:
 - Scalars promoted to registers after their first use don't affect entry
   capture (the by-reference pointer is read before any body code runs), and
   the pointed-to caller storage stays valid for the exit re-read.
+
+## nvhpc and OpenACC builds
+
+nvhpc (`nvfortran`) is detected from the DWARF producer string and always
+uses the raw-entry ABI capture of
+[Optimized (production) binaries](#optimized-production-binaries), at any
+optimization level:
+
+- nvfortran passes an assumed-shape dummy as a raw data pointer in its own
+  argument slot, plus a hidden descriptor argument appended after all
+  declared dummies (one per assumed-shape dummy, in declaration order).
+  gdb's typed evaluation ignores that descriptor and silently assumes
+  contiguous packing, so for a non-contiguous actual argument (e.g. a
+  constituent slice) it returns wrong values. dropsonde reads the hidden
+  descriptor instead (rank at +0x08; per-dimension 0x30-byte blocks from
+  +0x50 with lower bound +0x00, upper bound +0x08, stride in elements
+  +0x20; nvhpc 25.9, x86_64). Shapes are classified from the source
+  declaration, since nvhpc's DWARF gives placeholder bounds such as `(1,1)`
+  for assumed-shape dummies.
+- CAM-SIMA constituent names: gdb resolves `const_props(i)%prop` but not
+  `%prop%var_std_name`, so the deferred-length character is decoded from
+  raw memory (data pointer at +0x00, length at +0x20).
+- The manifest is written after every scheme exit, not only at the end:
+  nvhpc DEBUG runs under gdb have been seen to receive a SIGKILL shortly
+  after a physics timestep (cause unknown), which would otherwise lose all
+  captured data.
+
+OpenACC (GPU) builds: when a scheme's outputs live on the device, the cap
+copies them back with an `!$acc update self(...)` directive after the call.
+Exit capture (a finish breakpoint) runs before any caller code, so it would
+read the stale host copy. When one or more `!$acc update self(...)` lines
+follow the call site (within 20 lines), dropsonde sets a temporary
+breakpoint just past them and re-reads the exit values there. No OpenACC
+or CUDA runtime calls are made from gdb. Outputs with no such update after
+the call are read from host memory as-is.
 
 ## Comparing shared portable subroutines
 
