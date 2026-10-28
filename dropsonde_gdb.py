@@ -1168,13 +1168,13 @@ def _static_shape_plan(ptr, st):
             "extents": extents, "strides": strides}, None
 
 
-def handle_entry_optimized(scheme, frame):
-    """Entry capture for an optimized binary, stopped at the function's
-    first instruction. Mirrors handle_entry's record shape exactly (the
-    exit re-read and the differ are unchanged), but never evaluates a
-    dummy's value or subscripts through gdb -- every dynamic fact comes
-    from the ABI argument pointers and the gfortran descriptors they
-    reference."""
+def _handle_entry_raw(scheme, frame, make_array_planner, mode, hidden_why):
+    """Entry capture at a function's first instruction. Mirrors handle_entry's
+    record shape exactly (the exit re-read and the differ are unchanged), but
+    never evaluates a dummy's value or subscripts through gdb -- every dynamic
+    fact comes from the ABI argument pointers. make_array_planner(frame, syms)
+    returns plan_array(idx, sym, st, elem, ptr, rec_args) -> (plan, why,
+    skipped); `mode` and `hidden_why` word the skip reasons."""
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
     try:
@@ -1184,13 +1184,15 @@ def handle_entry_optimized(scheme, frame):
     rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
            "caller": caller, "args": {}}
     frame.select()
-    for idx, sym in enumerate(arg_symbols(frame), start=1):
+    syms = list(arg_symbols(frame))
+    plan_array = make_array_planner(frame, syms)
+    for idx, sym in enumerate(syms, start=1):
         name = sym.name
         info = {"kind": "skipped", "abi": True}
         rec["args"][name] = info
         try:
             if name.startswith("_"):
-                info["why"] = "hidden character-length arg (by value)"
+                info["why"] = hidden_why
                 continue
             st = sym.type.strip_typedefs()
             ptr = _abi_arg_ptr(frame, idx)
@@ -1198,25 +1200,19 @@ def handle_entry_optimized(scheme, frame):
                 info["why"] = "null argument pointer (absent optional?)"
                 continue
             if is_character(st):
-                info["why"] = "character arg not captured in optimized mode"
+                info["why"] = "character arg not captured " + mode
                 continue
             if st.code == gdb.TYPE_CODE_ARRAY:
                 elem = _element_type(st)
                 if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
                     info["why"] = "derived-type array not captured"
                     continue
-                if ":" in str(sym.type):
-                    # assumed shape: the argument is a descriptor pointer
-                    plan, err = _descriptor_plan(ptr, elem)
-                elif not getattr(st, "dynamic", False):
-                    plan, err = _static_shape_plan(ptr, st)
-                else:
-                    info["why"] = ("explicit-shape dummy with runtime "
-                                   "bounds not captured in optimized mode")
-                    continue
+                plan, why, skipped = plan_array(idx, sym, st, elem, ptr,
+                                                rec["args"])
                 if plan is None:
-                    info["kind"] = "error"
-                    info["why"] = err
+                    if not skipped:
+                        info["kind"] = "error"
+                    info["why"] = why
                     continue
                 _record_array(info, scheme, hit, name, plan)
             elif st.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
@@ -1235,6 +1231,28 @@ def handle_entry_optimized(scheme, frame):
             info["why"] = str(exc)
     MANIFEST["hits"].append(rec)
     return rec
+
+
+def _optimized_array_planner(frame, syms):
+    def plan_array(idx, sym, st, elem, ptr, rec_args):
+        if ":" in str(sym.type):
+            # assumed shape: the argument is a descriptor pointer
+            plan, err = _descriptor_plan(ptr, elem)
+        elif not getattr(st, "dynamic", False):
+            plan, err = _static_shape_plan(ptr, st)
+        else:
+            return None, ("explicit-shape dummy with runtime bounds not "
+                          "captured in optimized mode"), True
+        return plan, err, False
+    return plan_array
+
+
+def handle_entry_optimized(scheme, frame):
+    """Entry capture for an optimized binary: assumed-shape dummies are read
+    through the gfortran descriptors their ABI slots point to."""
+    return _handle_entry_raw(scheme, frame, _optimized_array_planner,
+                             "in optimized mode",
+                             "hidden character-length arg (by value)")
 
 
 # --------------------------------------------------------------------------
@@ -1300,84 +1318,36 @@ def _nvhpc_hidden_descriptor_ptr(frame, assumed_shape_flags, idx):
     return _abi_arg_ptr(frame, n_declared + ordinal)
 
 
+def _nvhpc_array_planner(frame, syms):
+    # Classify shapes from the source declaration: nvhpc's DWARF gives
+    # placeholder bounds such as (1,1) for assumed-shape dummies.
+    decls = [None] + [_source_decl(frame, sym.name) for sym in syms]
+    assumed = [False] + [
+        decl is not None and bool(decl[0]) and all(d == ":" for d in decl[0])
+        for decl in decls[1:]]
+
+    def plan_array(idx, sym, st, elem, ptr, rec_args):
+        dims, attrs = decls[idx] if decls[idx] is not None else (None, "")
+        if not dims:
+            return None, "array dummy: no source declaration found", False
+        if assumed[idx]:
+            desc_ptr = _nvhpc_hidden_descriptor_ptr(frame, assumed, idx)
+            plan, err = _nvhpc_descriptor_plan(desc_ptr, elem, ptr)
+        elif any("*" in d for d in dims):
+            return None, ("assumed-size dummy (declared ({}))"
+                          .format(",".join(dims))), True
+        else:
+            plan, err = _declared_plan(ptr, sym.type, dims, attrs, rec_args)
+        return plan, err, False
+    return plan_array
+
+
 def handle_entry_nvhpc(scheme, frame):
     """handle_entry_optimized for nvhpc: assumed-shape dummies are read
     through their hidden descriptor."""
-    hit = HIT_COUNT.get(scheme, 0)
-    HIT_COUNT[scheme] = hit + 1
-    try:
-        caller = frame.older().name() or "?"
-    except Exception:
-        caller = "?"
-    rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
-           "caller": caller, "args": {}}
-    frame.select()
-    all_syms = list(arg_symbols(frame))
-    # Classify shapes from the source declaration: nvhpc's DWARF gives
-    # placeholder bounds such as (1,1) for assumed-shape dummies.
-    decls = [None] + [_source_decl(frame, sym.name) for sym in all_syms]
-    assumed_shape_flags = [False] + [
-        decl is not None and bool(decl[0]) and all(d == ":" for d in decl[0])
-        for decl in decls[1:]]
-    for idx, sym in enumerate(all_syms, start=1):
-        name = sym.name
-        info = {"kind": "skipped", "abi": True}
-        rec["args"][name] = info
-        try:
-            if name.startswith("_"):
-                info["why"] = "hidden length/descriptor arg (by value)"
-                continue
-            st = sym.type.strip_typedefs()
-            ptr = _abi_arg_ptr(frame, idx)
-            if ptr == 0:
-                info["why"] = "null argument pointer (absent optional?)"
-                continue
-            if is_character(st):
-                info["why"] = "character arg not captured under nvhpc"
-                continue
-            if st.code == gdb.TYPE_CODE_ARRAY:
-                elem = _element_type(st)
-                if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
-                    info["why"] = "derived-type array not captured"
-                    continue
-                decl = decls[idx]
-                dims, attrs = decl if decl is not None else (None, "")
-                if not dims:
-                    info["kind"] = "error"
-                    info["why"] = "array dummy: no source declaration found"
-                    continue
-                if assumed_shape_flags[idx]:
-                    desc_ptr = _nvhpc_hidden_descriptor_ptr(
-                        frame, assumed_shape_flags, idx)
-                    plan, err = _nvhpc_descriptor_plan(desc_ptr, elem, ptr)
-                elif any("*" in d for d in dims):
-                    info["why"] = ("assumed-size dummy (declared ({}))"
-                                   .format(",".join(dims)))
-                    continue
-                else:
-                    plan, err = _declared_plan(ptr, sym.type, dims, attrs,
-                                               rec["args"])
-                if plan is None:
-                    info["kind"] = "error"
-                    info["why"] = err
-                    continue
-                _record_array(info, scheme, hit, name, plan)
-            elif st.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
-                info["why"] = "derived-type arg not captured"
-            else:
-                dt = dtype_of(st)
-                if dt is None:
-                    info["why"] = "unsupported type: {}".format(st)
-                    continue
-                info["kind"] = "scalar"
-                info["dtype"] = dt
-                info["addr"] = ptr
-                info["entry_value"] = read_scalar(ptr, dt)
-        except Exception as exc:
-            info["kind"] = "error"
-            info["why"] = str(exc)
-    MANIFEST["hits"].append(rec)
-    return rec
+    return _handle_entry_raw(scheme, frame, _nvhpc_array_planner,
+                             "under nvhpc",
+                             "hidden length/descriptor arg (by value)")
 
 
 def handle_entry(scheme, frame):
@@ -1551,7 +1521,7 @@ def _read_exit_values(rec):
 
 
 class GpuSyncBP(gdb.Breakpoint):
-    """Re-reads exit values just past the caller's "!$acc update self(...)",
+    """Reads exit values just past the caller's "!$acc update self(...)",
     so device-resident outputs are read after the host copy is refreshed.
     ExitBP fires before any caller code runs, and gdb refuses to resume
     execution from inside its stop(), so a temporary breakpoint is set
@@ -1576,14 +1546,20 @@ class ExitBP(gdb.FinishBreakpoint):
 
     def stop(self):
         rec = self.rec
-        _read_exit_values(rec)
         target = _find_gpu_sync_target(gdb.newest_frame())
         if target is not None:
+            spec = "{}:{}".format(*target)
             try:
-                GpuSyncBP("{}:{}".format(*target), rec)
+                GpuSyncBP(spec, rec)
+                # Exit values are read there; until then the hit stays
+                # incomplete, so a run that dies first reports no exit
+                # values rather than stale host copies.
+                rec["gpu_sync"] = spec
+                return False
             except gdb.error as exc:
-                note("GPU-sync re-read breakpoint at {}:{} failed: "
-                     "{}".format(target[0], target[1], exc))
+                note("GPU-sync breakpoint at {} failed: {}; reading exit "
+                     "values at return".format(spec, exc))
+        _read_exit_values(rec)
         return False
 
     def out_of_scope(self):

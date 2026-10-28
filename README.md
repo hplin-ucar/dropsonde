@@ -284,7 +284,9 @@ copies them back with an `!$acc update self(...)` directive after the call.
 Exit capture (a finish breakpoint) runs before any caller code, so it would
 read the stale host copy. When one or more `!$acc update self(...)` lines
 follow the call site (within 20 lines), dropsonde sets a temporary
-breakpoint just past them and re-reads the exit values there. No OpenACC
+breakpoint just past them and reads the exit values there; until then the
+hit has no exit values, so a run that dies first is reported as missing its
+exit capture rather than compared with stale data. No OpenACC
 or CUDA runtime calls are made from gdb. Outputs with no such update after
 the call are read from host memory as-is.
 
