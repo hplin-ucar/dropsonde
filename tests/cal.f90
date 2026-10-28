@@ -13,7 +13,12 @@ end module constituents
 
 module cam_constituents
   implicit none
-  type props_t
+  ! Like ccpp_constituent_properties_t: a parent component (the hash key
+  ! `name`) precedes var_std_name.
+  type key_t
+    character(len=:), allocatable :: name
+  end type key_t
+  type, extends(key_t) :: props_t
     character(len=:), allocatable :: var_std_name
   end type props_t
   type prop_ptr_t
@@ -70,6 +75,7 @@ program cal
   num_constituents = 3
   do i = 1, 3
     allocate(const_props(i)%prop)
+    const_props(i)%prop%name = 'hash_key_'//achar(48 + i)
     const_props(i)%prop%var_std_name = 'std_name_'//achar(48 + i)
   end do
   q3 = reshape([(real(i, 8), i = 1, 24)], [4, 3, 2])

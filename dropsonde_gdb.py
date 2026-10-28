@@ -1728,27 +1728,37 @@ def _gnu_const_names(prefix, n):
     return names
 
 
-_NV_CHAR_DATA = 0x00     # deferred-length character: data pointer
+_NV_CHAR_DATA = 0x00     # within a deferred-length character: data pointer
 _NV_CHAR_LEN = 0x20      # and length (checked with 1/23/68-char values)
 
 
 def _nvhpc_const_names(prefix, n):
     """CAM-SIMA constituent names under nvhpc. gdb resolves
     const_props(i)%prop but not %prop%var_std_name, so the deferred-length
-    character is decoded from raw memory."""
+    character is decoded from raw memory, at var_std_name's offset in the
+    properties type (after any parent components) from gdb's type info."""
     names = []
+    vsn_off = None
     for i in range(1, n + 1):
         try:
-            prop = int(gdb.parse_and_eval(
-                "{}const_props({})%prop".format(prefix, i)))
+            v = gdb.parse_and_eval("{}const_props({})%prop".format(prefix, i))
+            prop = int(v)
         except gdb.error as exc:
             names.append("<unreadable: {}>".format(exc))
             continue
         if prop == 0:
             names.append("<null prop>")
             continue
-        data_ptr = _read_u64(prop + _NV_CHAR_DATA)
-        length = _read_i64(prop + _NV_CHAR_LEN)
+        if vsn_off is None:
+            try:
+                vsn_off, _ = _field_offset(v.type.strip_typedefs().target(),
+                                           "var_std_name")
+            except gdb.error as exc:
+                vsn_off = 0
+                note("nvhpc constituent names: no var_std_name offset in "
+                     "type info ({}); assuming 0".format(exc))
+        data_ptr = _read_u64(prop + vsn_off + _NV_CHAR_DATA)
+        length = _read_i64(prop + vsn_off + _NV_CHAR_LEN)
         if data_ptr == 0 or not (0 < length <= 1024):
             names.append("<unreadable: len={}>".format(length))
             continue
