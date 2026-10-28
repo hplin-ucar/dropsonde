@@ -82,6 +82,14 @@ _ERR_INIT_RE = re.compile(r"^\s*(errmsg|errflg|errcode|errstat)\s*=", re.I)
 _BODY_LINE = {}  # scheme -> (filename, line) | None
 
 
+def _write_manifest():
+    """Write the manifest now. Called after every scheme exit, because nvhpc
+    DEBUG runs under gdb can be SIGKILLed after a timestep (cause unknown),
+    which skips the final write in the try/finally."""
+    with open(os.path.join(OUT, "manifest.json"), "w") as f:
+        json.dump(MANIFEST, f, indent=1)
+
+
 def note(msg):
     MANIFEST["notes"].append(msg)
     gdb.write("dropsonde[{}]: {}\n".format(ROLE, msg))
@@ -119,6 +127,11 @@ _COMPILER = [None]
 OPTIMIZED = [None]
 _OPT_FLAG_RE = re.compile(r"(?:^|\s)-O([123sz])(?:\s|$)")
 
+# nvhpc: gdb's typed array evaluation ignores nvfortran's hidden
+# assumed-shape descriptors and silently mis-strides non-contiguous
+# actuals, so nvhpc always uses raw-entry capture (handle_entry_nvhpc).
+NVHPC = [False]
+
 
 def compiler():
     """'gnu' | 'intel' | 'nag' | 'unknown' for the binary under debug."""
@@ -136,6 +149,8 @@ def compiler():
         c = "nag"
     elif "gnu" in low or "gcc" in low:
         c = "gnu"
+    elif "nvfortran" in low or "nvhpc" in low or "pgi" in low:
+        c = "nvhpc"
     else:
         c = "unknown"
     _COMPILER[0] = c
@@ -1051,6 +1066,14 @@ def probe_optimized(specs_per_scheme):
             prod = _cu_producer(spec)
             if prod is None:
                 continue
+            low = prod.lower()
+            if "nvfortran" in low or "nvhpc" in low:
+                NVHPC[0] = True
+                note("optimization probe: nvhpc detected (producer: {}); "
+                     "using raw-entry ABI capture unconditionally "
+                     "(GDB's typed array evaluation is unreliable for "
+                     "nvhpc even at -O0)".format(prod[:90]))
+                return
             m = _OPT_FLAG_RE.search(prod)
             OPTIMIZED[0] = bool(m)
             note("optimization probe: {} (producer: {})".format(
@@ -1145,13 +1168,13 @@ def _static_shape_plan(ptr, st):
             "extents": extents, "strides": strides}, None
 
 
-def handle_entry_optimized(scheme, frame):
-    """Entry capture for an optimized binary, stopped at the function's
-    first instruction. Mirrors handle_entry's record shape exactly (the
-    exit re-read and the differ are unchanged), but never evaluates a
-    dummy's value or subscripts through gdb -- every dynamic fact comes
-    from the ABI argument pointers and the gfortran descriptors they
-    reference."""
+def _handle_entry_raw(scheme, frame, make_array_planner, mode, hidden_why):
+    """Entry capture at a function's first instruction. Mirrors handle_entry's
+    record shape exactly (the exit re-read and the differ are unchanged), but
+    never evaluates a dummy's value or subscripts through gdb -- every dynamic
+    fact comes from the ABI argument pointers. make_array_planner(frame, syms)
+    returns plan_array(idx, sym, st, elem, ptr, rec_args) -> (plan, why,
+    skipped); `mode` and `hidden_why` word the skip reasons."""
     hit = HIT_COUNT.get(scheme, 0)
     HIT_COUNT[scheme] = hit + 1
     try:
@@ -1161,13 +1184,15 @@ def handle_entry_optimized(scheme, frame):
     rec = {"scheme": scheme, "hit": hit, "step": CURRENT_STEP[0],
            "caller": caller, "args": {}}
     frame.select()
-    for idx, sym in enumerate(arg_symbols(frame), start=1):
+    syms = list(arg_symbols(frame))
+    plan_array = make_array_planner(frame, syms)
+    for idx, sym in enumerate(syms, start=1):
         name = sym.name
         info = {"kind": "skipped", "abi": True}
         rec["args"][name] = info
         try:
             if name.startswith("_"):
-                info["why"] = "hidden character-length arg (by value)"
+                info["why"] = hidden_why
                 continue
             st = sym.type.strip_typedefs()
             ptr = _abi_arg_ptr(frame, idx)
@@ -1175,25 +1200,19 @@ def handle_entry_optimized(scheme, frame):
                 info["why"] = "null argument pointer (absent optional?)"
                 continue
             if is_character(st):
-                info["why"] = "character arg not captured in optimized mode"
+                info["why"] = "character arg not captured " + mode
                 continue
             if st.code == gdb.TYPE_CODE_ARRAY:
                 elem = _element_type(st)
                 if elem.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
                     info["why"] = "derived-type array not captured"
                     continue
-                if ":" in str(sym.type):
-                    # assumed shape: the argument is a descriptor pointer
-                    plan, err = _descriptor_plan(ptr, elem)
-                elif not getattr(st, "dynamic", False):
-                    plan, err = _static_shape_plan(ptr, st)
-                else:
-                    info["why"] = ("explicit-shape dummy with runtime "
-                                   "bounds not captured in optimized mode")
-                    continue
+                plan, why, skipped = plan_array(idx, sym, st, elem, ptr,
+                                                rec["args"])
                 if plan is None:
-                    info["kind"] = "error"
-                    info["why"] = err
+                    if not skipped:
+                        info["kind"] = "error"
+                    info["why"] = why
                     continue
                 _record_array(info, scheme, hit, name, plan)
             elif st.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
@@ -1212,6 +1231,123 @@ def handle_entry_optimized(scheme, frame):
             info["why"] = str(exc)
     MANIFEST["hits"].append(rec)
     return rec
+
+
+def _optimized_array_planner(frame, syms):
+    def plan_array(idx, sym, st, elem, ptr, rec_args):
+        if ":" in str(sym.type):
+            # assumed shape: the argument is a descriptor pointer
+            plan, err = _descriptor_plan(ptr, elem)
+        elif not getattr(st, "dynamic", False):
+            plan, err = _static_shape_plan(ptr, st)
+        else:
+            return None, ("explicit-shape dummy with runtime bounds not "
+                          "captured in optimized mode"), True
+        return plan, err, False
+    return plan_array
+
+
+def handle_entry_optimized(scheme, frame):
+    """Entry capture for an optimized binary: assumed-shape dummies are read
+    through the gfortran descriptors their ABI slots point to."""
+    return _handle_entry_raw(scheme, frame, _optimized_array_planner,
+                             "in optimized mode",
+                             "hidden character-length arg (by value)")
+
+
+# --------------------------------------------------------------------------
+# nvhpc/nvfortran raw-entry capture
+#
+# Reverse-engineered from nvhpc 25.9, x86_64, -O0. An assumed-shape dummy's
+# ABI slot holds a raw data pointer; its descriptor is a hidden argument,
+# one per assumed-shape dummy in declaration order, appended after all
+# declared dummies (then normal System V register/stack allocation).
+#
+# Descriptor layout (byte offsets):
+#   rank                    @ 0x08
+#   dimension d, 0x30 bytes each from 0x50:
+#     lower_bound           @ +0x00
+#     upper_bound           @ +0x08
+#     stride (elements)     @ +0x20
+# Element addresses come from the ABI data pointer, not the descriptor's
+# pointer field @ 0x48. Other fields are not decoded.
+# --------------------------------------------------------------------------
+
+_NV_D_RANK = 0x08
+_NV_D_DIM0 = 0x50
+_NV_D_DIM = 0x30
+_NV_D_DIM_LB = 0x00
+_NV_D_DIM_UB = 0x08
+_NV_D_DIM_STRIDE = 0x20
+
+
+def _nvhpc_descriptor_plan(desc_addr, elem_type, base_ptr):
+    """array_plan()-shaped dict for an nvhpc assumed-shape dummy: bounds and
+    strides from the hidden descriptor `desc_addr`, base address from the
+    dummy's own data pointer `base_ptr`."""
+    dt = dtype_of(elem_type)
+    if dt is None:
+        return None, "unsupported element type: {}".format(elem_type)
+    if base_ptr == 0:
+        return None, "null data pointer"
+    rank = _read_i64(desc_addr + _NV_D_RANK)
+    if rank < 1 or rank > 7:
+        return None, "implausible nvhpc descriptor rank: {}".format(rank)
+    elsize = elem_type.sizeof
+    los, extents, strides = [], [], []
+    for d in range(rank):
+        blk = desc_addr + _NV_D_DIM0 + _NV_D_DIM * d
+        lb = _read_i64(blk + _NV_D_DIM_LB)
+        ub = _read_i64(blk + _NV_D_DIM_UB)
+        st_elems = _read_i64(blk + _NV_D_DIM_STRIDE)
+        los.append(lb)
+        extents.append(ub - lb + 1)
+        strides.append(st_elems * elsize)
+    if any(e < 0 for e in extents):
+        return None, "negative extent in nvhpc descriptor: {}".format(extents)
+    return {"addr": base_ptr, "elsize": elsize, "dtype": dt, "los": los,
+            "extents": extents, "strides": strides}, None
+
+
+def _nvhpc_hidden_descriptor_ptr(frame, assumed_shape_flags, idx):
+    """Hidden descriptor pointer for assumed-shape dummy `idx` (1-based).
+    `assumed_shape_flags[i]` is true when dummy i is assumed-shape (index 0
+    unused)."""
+    n_declared = len(assumed_shape_flags) - 1
+    ordinal = sum(1 for i in range(1, idx + 1) if assumed_shape_flags[i])
+    return _abi_arg_ptr(frame, n_declared + ordinal)
+
+
+def _nvhpc_array_planner(frame, syms):
+    # Classify shapes from the source declaration: nvhpc's DWARF gives
+    # placeholder bounds such as (1,1) for assumed-shape dummies.
+    decls = [None] + [_source_decl(frame, sym.name) for sym in syms]
+    assumed = [False] + [
+        decl is not None and bool(decl[0]) and all(d == ":" for d in decl[0])
+        for decl in decls[1:]]
+
+    def plan_array(idx, sym, st, elem, ptr, rec_args):
+        dims, attrs = decls[idx] if decls[idx] is not None else (None, "")
+        if not dims:
+            return None, "array dummy: no source declaration found", False
+        if assumed[idx]:
+            desc_ptr = _nvhpc_hidden_descriptor_ptr(frame, assumed, idx)
+            plan, err = _nvhpc_descriptor_plan(desc_ptr, elem, ptr)
+        elif any("*" in d for d in dims):
+            return None, ("assumed-size dummy (declared ({}))"
+                          .format(",".join(dims))), True
+        else:
+            plan, err = _declared_plan(ptr, sym.type, dims, attrs, rec_args)
+        return plan, err, False
+    return plan_array
+
+
+def handle_entry_nvhpc(scheme, frame):
+    """handle_entry_optimized for nvhpc: assumed-shape dummies are read
+    through their hidden descriptor."""
+    return _handle_entry_raw(scheme, frame, _nvhpc_array_planner,
+                             "under nvhpc",
+                             "hidden length/descriptor arg (by value)")
 
 
 def handle_entry(scheme, frame):
@@ -1334,6 +1470,73 @@ def handle_entry(scheme, frame):
     return rec
 
 
+_GPU_SYNC_RE = re.compile(r"^\s*!\$acc\s+update\s+self\s*\(", re.I)
+
+
+def _find_gpu_sync_target(frame):
+    """(file, line) just past the "!$acc update self(...)" lines that follow
+    `frame`'s position (within 20 lines), or None. Source text only."""
+    try:
+        sal = frame.find_sal()
+        fname = sal.symtab.fullname()
+        start_line = sal.line
+        with open(fname) as fh:
+            lines = fh.readlines()
+    except Exception:
+        return None
+    idx = start_line - 1
+    last_match = None
+    while idx < len(lines) and idx < start_line - 1 + 20:
+        if _GPU_SYNC_RE.match(lines[idx]):
+            last_match = idx
+            idx += 1
+            continue
+        if last_match is not None:
+            break
+        idx += 1
+    if last_match is None:
+        return None
+    return os.path.basename(fname), last_match + 2  # line after last match
+
+
+def _read_exit_values(rec):
+    for name, info in rec["args"].items():
+        try:
+            kind = info.get("kind")
+            if kind == "array":
+                data = read_array(info["plan"])
+                info["exit_file"] = write_blob(
+                    rec["scheme"], rec["hit"], name, "out", data)
+            elif kind == "scalar" and "addr" in info:
+                info["exit_value"] = read_scalar(
+                    info["addr"], info["dtype"])
+            elif kind == "char" and "addr" in info:
+                raw = bytes(gdb.selected_inferior().read_memory(
+                    info["addr"], info["len"]))
+                info["exit_value"] = raw.decode("latin-1").rstrip()
+        except Exception as exc:
+            info["exit_error"] = str(exc)
+    rec["complete"] = True
+    _write_manifest()
+
+
+class GpuSyncBP(gdb.Breakpoint):
+    """Reads exit values just past the caller's "!$acc update self(...)",
+    so device-resident outputs are read after the host copy is refreshed.
+    ExitBP fires before any caller code runs, and gdb refuses to resume
+    execution from inside its stop(), so a temporary breakpoint is set
+    instead."""
+
+    def __init__(self, spec, rec):
+        super(GpuSyncBP, self).__init__(
+            spec, internal=True, temporary=True)
+        self.rec = rec
+
+    def stop(self):
+        _read_exit_values(self.rec)
+        return False
+
+
 class ExitBP(gdb.FinishBreakpoint):
     """Re-reads entry-time addresses when the scheme returns."""
 
@@ -1343,23 +1546,19 @@ class ExitBP(gdb.FinishBreakpoint):
 
     def stop(self):
         rec = self.rec
-        for name, info in rec["args"].items():
+        target = _find_gpu_sync_target(gdb.newest_frame())
+        if target is not None:
+            spec = "{}:{}".format(*target)
             try:
-                kind = info.get("kind")
-                if kind == "array":
-                    data = read_array(info["plan"])
-                    info["exit_file"] = write_blob(
-                        rec["scheme"], rec["hit"], name, "out", data)
-                elif kind == "scalar" and "addr" in info:
-                    info["exit_value"] = read_scalar(
-                        info["addr"], info["dtype"])
-                elif kind == "char" and "addr" in info:
-                    raw = bytes(gdb.selected_inferior().read_memory(
-                        info["addr"], info["len"]))
-                    info["exit_value"] = raw.decode("latin-1").rstrip()
-            except Exception as exc:
-                info["exit_error"] = str(exc)
-        rec["complete"] = True
+                GpuSyncBP(spec, rec)
+                # Until it fires the hit is incomplete, so a run that dies
+                # first shows no exit values instead of stale host copies.
+                rec["gpu_sync"] = spec
+                return False
+            except gdb.error as exc:
+                note("GPU-sync breakpoint at {} failed: {}; reading exit "
+                     "values at return".format(spec, exc))
+        _read_exit_values(rec)
         return False
 
     def out_of_scope(self):
@@ -1529,6 +1728,40 @@ def _gnu_const_names(prefix, n):
     return names
 
 
+_NV_CHAR_DATA = 0x00     # within a deferred-length character: data pointer
+_NV_CHAR_LEN = 0x20      # and length (checked with 1/23/68-char values)
+
+
+def _nvhpc_const_names(prefix, n):
+    """CAM-SIMA constituent names under nvhpc, decoded from raw memory: gdb
+    can't follow %prop%var_std_name, and in OpenACC builds reads const_props'
+    bounds as empty although its address is right. Element size and component
+    offsets (var_std_name follows any parent components) come from gdb's type
+    info; const_props is assumed contiguous."""
+    base = int(gdb.parse_and_eval("&{}const_props".format(prefix)))
+    et = gdb.parse_and_eval("{}const_props".format(prefix)).type
+    et = et.strip_typedefs()
+    while et.code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_ARRAY):
+        et = et.target().strip_typedefs()
+    prop_off, prop_t = _field_offset(et, "prop")
+    vsn_off, _ = _field_offset(prop_t.strip_typedefs().target(),
+                               "var_std_name")
+    names = []
+    for i in range(n):
+        prop = _read_u64(base + i * et.sizeof + prop_off)
+        if prop == 0:
+            names.append("<null prop>")
+            continue
+        data_ptr = _read_u64(prop + vsn_off + _NV_CHAR_DATA)
+        length = _read_i64(prop + vsn_off + _NV_CHAR_LEN)
+        if data_ptr == 0 or not (0 < length <= 1024):
+            names.append("<unreadable: len={}>".format(length))
+            continue
+        raw = bytes(gdb.selected_inferior().read_memory(data_ptr, length))
+        names.append(raw.decode("latin-1").strip())
+    return names
+
+
 def dump_constituents():
     try:
         if ROLE == "cam":
@@ -1573,6 +1806,9 @@ def dump_constituents():
                 # gdb 8.2 can't index Intel's pointer-array descriptor; decode
                 # const_props from raw memory.
                 names = _intel_const_names(base, n)
+            elif NVHPC[0]:
+                # gdb can't follow %prop%var_std_name under nvhpc
+                names = _nvhpc_const_names(base, n)
             elif OPTIMIZED[0]:
                 # -O2 subscript evaluation can abort gdb; decode raw instead.
                 names = _gnu_const_names(base, n)
@@ -1693,9 +1929,10 @@ def setup():
                            lambda s=s: _qualified(s + "_run"))))
 
     probe_optimized([specs for _s, _t, specs in plans])
+    raw_entry = OPTIMIZED[0] or NVHPC[0]
     resolved = 0
     for s, target, specs in plans:
-        if OPTIMIZED[0]:
+        if raw_entry:
             bp = _make_entry_bp_optimized(specs, s, target)
         else:
             bp = _make_bp(EntryBP, specs, s, target)
@@ -1703,7 +1940,7 @@ def setup():
             MANIFEST["breakpoints"][s] = "missing"
         else:
             MANIFEST["breakpoints"][s] = "{} ({})".format(
-                bp.location, target) if OPTIMIZED[0] else bp.location
+                bp.location, target) if raw_entry else bp.location
             resolved += 1
     note("{}/{} scheme entry points resolved".format(resolved, len(SCHEMES)))
 
@@ -1750,14 +1987,16 @@ def main():
             except gdb.error:
                 pass
             break
-        elif OPTIMIZED[0]:
-            # Optimized binary: the breakpoint is at the raw entry
-            # instruction, the one PC where the ABI argument slots are
-            # guaranteed; capture immediately (no advance -- moving even one
-            # instruction may clobber the argument registers).
+        elif OPTIMIZED[0] or NVHPC[0]:
+            # Optimized binary, or nvhpc at any optimization level: the
+            # breakpoint is at the raw entry instruction, the one PC where
+            # the ABI argument slots (including nvhpc's hidden descriptor
+            # args) are guaranteed; capture immediately (no advance --
+            # moving even one instruction may clobber argument registers).
             frame = gdb.newest_frame()
             try:
-                rec = handle_entry_optimized(entry.scheme, frame)
+                rec = (handle_entry_nvhpc(entry.scheme, frame) if NVHPC[0]
+                       else handle_entry_optimized(entry.scheme, frame))
                 ExitBP(frame, rec)
             except Exception as exc:
                 note("entry capture failed for {}: {}".format(
@@ -1824,6 +2063,5 @@ def main():
 try:
     main()
 finally:
-    with open(os.path.join(OUT, "manifest.json"), "w") as f:
-        json.dump(MANIFEST, f, indent=1)
     note("manifest written: {} hits".format(len(MANIFEST["hits"])))
+    _write_manifest()
