@@ -1551,9 +1551,8 @@ class ExitBP(gdb.FinishBreakpoint):
             spec = "{}:{}".format(*target)
             try:
                 GpuSyncBP(spec, rec)
-                # Exit values are read there; until then the hit stays
-                # incomplete, so a run that dies first reports no exit
-                # values rather than stale host copies.
+                # Until it fires the hit is incomplete, so a run that dies
+                # first shows no exit values instead of stale host copies.
                 rec["gpu_sync"] = spec
                 return False
             except gdb.error as exc:
@@ -1803,9 +1802,7 @@ def dump_constituents():
                 # const_props from raw memory.
                 names = _intel_const_names(base, n)
             elif NVHPC[0]:
-                # GDB can't resolve the second-level %prop%var_std_name
-                # dereference under nvhpc; decode the deferred-length
-                # character raw instead.
+                # gdb can't follow %prop%var_std_name under nvhpc
                 names = _nvhpc_const_names(base, n)
             elif OPTIMIZED[0]:
                 # -O2 subscript evaluation can abort gdb; decode raw instead.
