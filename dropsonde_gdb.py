@@ -1733,30 +1733,25 @@ _NV_CHAR_LEN = 0x20      # and length (checked with 1/23/68-char values)
 
 
 def _nvhpc_const_names(prefix, n):
-    """CAM-SIMA constituent names under nvhpc. gdb resolves
-    const_props(i)%prop but not %prop%var_std_name, so the deferred-length
-    character is decoded from raw memory, at var_std_name's offset in the
-    properties type (after any parent components) from gdb's type info."""
+    """CAM-SIMA constituent names under nvhpc, decoded from raw memory: gdb
+    can't follow %prop%var_std_name, and in OpenACC builds reads const_props'
+    bounds as empty although its address is right. Element size and component
+    offsets (var_std_name follows any parent components) come from gdb's type
+    info; const_props is assumed contiguous."""
+    base = int(gdb.parse_and_eval("&{}const_props".format(prefix)))
+    et = gdb.parse_and_eval("{}const_props".format(prefix)).type
+    et = et.strip_typedefs()
+    while et.code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_ARRAY):
+        et = et.target().strip_typedefs()
+    prop_off, prop_t = _field_offset(et, "prop")
+    vsn_off, _ = _field_offset(prop_t.strip_typedefs().target(),
+                               "var_std_name")
     names = []
-    vsn_off = None
-    for i in range(1, n + 1):
-        try:
-            v = gdb.parse_and_eval("{}const_props({})%prop".format(prefix, i))
-            prop = int(v)
-        except gdb.error as exc:
-            names.append("<unreadable: {}>".format(exc))
-            continue
+    for i in range(n):
+        prop = _read_u64(base + i * et.sizeof + prop_off)
         if prop == 0:
             names.append("<null prop>")
             continue
-        if vsn_off is None:
-            try:
-                vsn_off, _ = _field_offset(v.type.strip_typedefs().target(),
-                                           "var_std_name")
-            except gdb.error as exc:
-                vsn_off = 0
-                note("nvhpc constituent names: no var_std_name offset in "
-                     "type info ({}); assuming 0".format(exc))
         data_ptr = _read_u64(prop + vsn_off + _NV_CHAR_DATA)
         length = _read_i64(prop + vsn_off + _NV_CHAR_LEN)
         if data_ptr == 0 or not (0 < length <= 1024):
