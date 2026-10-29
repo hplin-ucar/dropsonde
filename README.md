@@ -163,7 +163,8 @@ gdb/gfortran assumptions (gdb 16.2, gfortran 12, Derecho):
   `_<name>_length` member, not the DWARF type.
 - Use `module::var` spelling for globals.
 
-Intel assumptions (gdb 8.2, ifort 19.1, Izumi):
+Intel assumptions (ifort 19.1 + gdb 8.2, Izumi; ifx 2025 + gdb 14.2,
+Derecho):
 
 - Symbols are mangled `module_mp_<proc>_`; gdb demangles them to
   `module::<proc>`, which the bare name does not resolve to. Breakpoints
@@ -172,12 +173,23 @@ Intel assumptions (gdb 8.2, ifort 19.1, Izumi):
   scheme whose `_run` lives in a differently named module still resolves.
 - Dummies are live right at the entry breakpoint (no descriptor-setup
   prologue to skip); the body `advance` is harmless and still used.
-- gdb 8.2 misreads Intel's array descriptor for the module pointer-array
-  `cam_constituents::const_props` (bogus bounds), so the SIMA constituent
-  names are decoded from raw memory: descriptor `base_addr` `+0`,
-  `elem_len` `+8`; each element's `%prop` points to a properties type whose
-  `var_std_name` (`character(len=:),allocatable`) is laid out inline as
+- SIMA constituent names are captured by plain expression evaluation
+  (`const_props(i)%prop%var_std_name`) where gdb understands Intel
+  descriptors (ifx + gdb 14.2, Derecho); a raw-memory dope-vector walk
+  backs it up for gdb 8.2 + ifort (Izumi), which misreads the descriptor
+  bounds. Dope vector (same for ifort and ifx): `base_addr` `+0`,
+  `elem_len` `+8`, rank-1 dim triple (extent, byte distance, lbound) `+48`;
+  each element's `%prop` points to a properties type whose `var_std_name`
+  (`character(len=:),allocatable`) is laid out inline as
   `{char *data; size_t len}` (data at the component offset, length `+8`).
+  The dope vector is located by its linker symbol
+  (`cam_constituents_mp_const_props_`) or `info address` before trying
+  `&const_props` — newer gdb resolves the latter through DWARF
+  `data_location` to the array *data*, not the descriptor — and every
+  candidate is sanity-checked (plausible `elem_len`, extent ==
+  `num_constituents`). Captured names must look like identifiers, so a
+  silently wrong decode falls through to the next strategy instead of
+  passing for success.
 - The System V AMD64 ABI fallback is gfortran-descriptor-specific and so
   gfortran-only; under Intel it bails with a note rather than misreading a
   descriptor (Intel has not been observed to drop dummy locations).
@@ -429,7 +441,11 @@ optimized-binary mode is calibrated with the production flags plus `-g
 cal_run.sh` (on Derecho, `module load gcc/14.3.0` first — the default
 `gfortran` is an ncarcompilers wrapper that may dispatch to Intel). Passes
 clean under gfortran (Derecho, gdb 16.2; -O0 and -O2 modes, gcc 12.5 and
-14.3) and ifort 19.1 (Izumi, gdb 8.2). Under gfortran on gdb 8.2 the SIMA
+14.3), ifort 19.1 (Izumi, gdb 8.2), and ifx 2025.2 (Derecho, gdb 14.2;
+-O0 — ifx's DWARF producer string carries no optimization flags, so the
+optimization probe cannot detect an -O2 ifx binary and the raw-entry
+optimized mode never engages; optimized Intel is unsupported either way).
+Under gfortran on gdb 8.2 the SIMA
 constituent names read as `<unreadable>` (that gdb's gfortran deferred-
 length-character support is too old); the gdb 16.2 gfortran path is
 unaffected.

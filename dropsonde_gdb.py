@@ -1420,27 +1420,118 @@ def _field_offset(t, name):
     raise gdb.error("no component {!r} in {}".format(name, t))
 
 
-def _intel_const_names(prefix, n):
-    """SIMA constituent standard names under Intel. gdb 8.2 misreads Intel's
-    array descriptor for the module pointer-array const_props (it returns
-    bogus bounds), so const_props(i)%... cannot be evaluated by name; walk it
-    by hand instead.
+def _direct_const_names(prefix, n):
+    """SIMA constituent standard names by plain expression evaluation of
+    const_props(i)%prop%var_std_name. Works wherever gdb understands the
+    compiler's descriptors: gfortran debug builds, and ifx with gdb 14+
+    (Derecho). Unreadable elements degrade to placeholders so one bad entry
+    does not lose the rest."""
+    names = []
+    for i in range(1, n + 1):
+        try:
+            names.append(_string_at(
+                "{}const_props({})%prop%var_std_name".format(prefix, i)))
+        except Exception as exc:
+            names.append("<unreadable: {}>".format(exc))
+    return names
 
-    Intel array descriptor (LP64): base_addr at +0, element length at +8 (the
-    only two fields we rely on -- not the rank/dim header, whose offsets are
-    less stable). const_props is a rank-1 contiguous array of
+
+_CONST_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\??$")
+
+
+def _plausible_names(names):
+    """True when every entry looks like a real constituent standard name
+    (an identifier, optionally _string_at's heuristic '?'), so a silently
+    wrong decode -- e.g. array data mistaken for a dope vector -- cannot
+    pass for success. '<null prop>' placeholders are tolerated."""
+    real = [x for x in names if x != "<null prop>"]
+    return bool(real) and all(_CONST_NAME_RE.match(x) for x in real)
+
+
+def _try_const_strategies(strategies, prefix, n):
+    """Run constituent-name capture strategies in order; the first whose
+    result passes the plausibility check wins. A strategy may raise or
+    return per-element '<unreadable: ...>' placeholders; if none passes,
+    the result with the most plausible entries is kept so a partial capture
+    still reaches the report."""
+    results, errors = [], []
+    for strat in strategies:
+        try:
+            names = strat(prefix, n)
+        except Exception as exc:
+            errors.append("{}: {}".format(strat.__name__, exc))
+            continue
+        if _plausible_names(names):
+            if strat is not strategies[0]:
+                note("constituent names captured via fallback {}".format(
+                    strat.__name__))
+            return names
+        results.append(names)
+        errors.append("{}: implausible result, first entries {}".format(
+            strat.__name__, names[:3]))
+    if results:
+        note("constituent name plausibility check failed on every "
+             "strategy; keeping best-effort result ({})".format(
+                 "; ".join(errors)))
+        return max(results, key=lambda ns: sum(
+            1 for x in ns if _CONST_NAME_RE.match(x)))
+    raise gdb.error("; ".join(errors) or "no capture strategy applicable")
+
+
+def _intel_const_names(prefix, n):
+    """SIMA constituent standard names under Intel, decoded from the raw
+    dope vector. Used where gdb cannot evaluate const_props(i)%... by name
+    (gdb 8.2 misreads ifort's descriptor bounds and returns bogus values).
+
+    Intel dope vector (ifort classic and ifx, LP64): base_addr at +0,
+    element length at +8, rank-1 dim triple (extent, byte distance, lbound)
+    at +48; only base/elem_len are relied on, with the extent as a
+    cross-check. const_props is a rank-1 contiguous array of
     constituent_prop_ptr_t, so element i sits at base + i*elem_len and its
     %prop pointer is at the component's offset within that element. %prop
     points to a constituent-properties derived type whose var_std_name is
     character(len=:),allocatable, stored inline by Intel as
     {char *data; size_t len} -- data at the component's offset, length in the
-    next 8-byte word. Component offsets come from gdb's type info."""
-    desc_addr = int(gdb.parse_and_eval("&{}const_props".format(prefix)))
-    base = _read_u64(desc_addr)
-    elem_len = _read_i64(desc_addr + 8)
-    if base == 0 or elem_len <= 0:
-        raise gdb.error("implausible const_props descriptor: base={:#x} "
-                        "elem_len={}".format(base, elem_len))
+    next 8-byte word. Component offsets come from gdb's type info.
+
+    The dope vector itself must be located carefully: gdb 8.2 returns it
+    for &const_props, but gdb 14.2 follows the DWARF data_location to the
+    array DATA instead (whose first words are prop pointers, not
+    base/elem_len). Prefer the linker symbol (modname_mp_varname_), then
+    'info address', then &const_props, keeping the first candidate whose
+    decoded fields are sane."""
+    cands = []
+    for sym in ("cam_constituents_mp_const_props_",
+                "{}const_props".format(prefix)):
+        a = _static_addr(sym)
+        if a is not None:
+            cands.append(a)
+    try:
+        cands.append(int(gdb.parse_and_eval("&{}const_props".format(prefix))))
+    except gdb.error:
+        pass
+    base = elem_len = None
+    fallback = None
+    for desc_addr in dict.fromkeys(cands):   # dedupe, keep order
+        try:
+            b = _read_u64(desc_addr)
+            el = _read_i64(desc_addr + 8)
+            if b == 0 or not (0 < el <= 4096):
+                continue
+            gdb.selected_inferior().read_memory(b, 8)  # base must be mapped
+            extent = _read_i64(desc_addr + 48)
+        except gdb.MemoryError:
+            continue
+        if extent == n:
+            base, elem_len = b, el
+            break
+        if fallback is None:
+            fallback = (b, el)
+    if base is None and fallback is not None:
+        base, elem_len = fallback
+    if base is None:
+        raise gdb.error("no plausible const_props dope vector among {} "
+                        "candidate address(es)".format(len(set(cands))))
     # peel pointer/array layers to the constituent_prop_ptr_t element type
     et = gdb.parse_and_eval("{}const_props".format(prefix)).type.strip_typedefs()
     while et.code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_ARRAY):
@@ -1570,21 +1661,20 @@ def dump_constituents():
                 raise gdb.error(
                     "num_constituents not found by any spelling")
             if compiler() == "intel":
-                # gdb 8.2 can't index Intel's pointer-array descriptor; decode
-                # const_props from raw memory.
-                names = _intel_const_names(base, n)
+                # Direct expression evaluation works for ifx + gdb 14
+                # (Derecho); gdb 8.2 misreads ifort descriptors (Izumi), so
+                # the raw dope-vector walk backs it up. Optimized builds
+                # avoid the subscript path first, as it can abort gdb (see
+                # _gnu_const_names for the gfortran precedent).
+                strategies = ([_intel_const_names, _direct_const_names]
+                              if OPTIMIZED[0] else
+                              [_direct_const_names, _intel_const_names])
             elif OPTIMIZED[0]:
-                # -O2 subscript evaluation can abort gdb; decode raw instead.
-                names = _gnu_const_names(base, n)
+                # -O2 subscript evaluation can abort gdb; decode raw only.
+                strategies = [_gnu_const_names]
             else:
-                names = []
-                for i in range(1, n + 1):
-                    try:
-                        names.append(_string_at(
-                            "{}const_props({})%prop%var_std_name".format(
-                                base, i)))
-                    except Exception as exc:
-                        names.append("<unreadable: {}>".format(exc))
+                strategies = [_direct_const_names, _gnu_const_names]
+            names = _try_const_strategies(strategies, base, n)
         MANIFEST["constituents"] = names
         note("captured {} constituent names".format(len(names)))
     except Exception as exc:
